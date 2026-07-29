@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "AgentPulse 默认权限",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "notification:default"
+  ]
+}
