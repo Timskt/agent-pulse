@@ -60,7 +60,7 @@ impl Default for AppConfig {
             ],
             resume_prompt: "请继续完成刚才未完成的任务，不要重新开始。".to_string(),
             auto_resume_enabled: true,
-            enabled_adapters: vec!["claude-code".to_string(), "codex".to_string()],
+            enabled_adapters: vec!["claude-code".to_string(), "codex".to_string(), "opencode".to_string()],
         }
     }
 }

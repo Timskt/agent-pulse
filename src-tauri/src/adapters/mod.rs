@@ -1,5 +1,6 @@
 pub mod claude_code;
 pub mod codex;
+pub mod opencode;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -80,5 +81,6 @@ pub fn all_adapters() -> Vec<Box<dyn AgentAdapter>> {
     vec![
         Box::new(claude_code::ClaudeCodeAdapter::new()),
         Box::new(codex::CodexAdapter),
+        Box::new(opencode::OpenCodeAdapter),
     ]
 }

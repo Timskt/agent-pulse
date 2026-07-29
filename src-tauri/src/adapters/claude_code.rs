@@ -186,15 +186,38 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
 
-        // 关联会话文件：将最新的 session 文件分配给会话
-        let session_files = self.find_latest_session_file();
-        if let (Some(session), Some(file)) = (sessions.first_mut(), session_files.first()) {
-            session.session_file = Some(file.to_string_lossy().to_string());
-            if let Ok(meta) = fs::metadata(file) {
-                if let Ok(modified) = meta.modified() {
-                    let datetime: chrono::DateTime<Local> = modified.into();
-                    session.last_activity =
-                        datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+        // 多实例关联：按工作目录匹配对应的会话文件
+        // Claude Code 将会话存储在 ~/.claude/projects/<encoded-cwd>/ 下
+        // encoded-cwd = 工作目录的 / 替换为 -
+        for session in &mut sessions {
+            if session.working_dir.is_empty() {
+                continue;
+            }
+            let encoded_dir = session.working_dir.replace('/', "-");
+            let project_dir = self.claude_dir.join("projects").join(&encoded_dir);
+
+            if project_dir.exists() {
+                // 找到该项目目录下最新的 .jsonl 文件
+                let pattern = format!("{}/**/*.jsonl", project_dir.display());
+                let mut files: Vec<PathBuf> = glob::glob(&pattern)
+                    .map(|paths| paths.filter_map(|p| p.ok()).collect())
+                    .unwrap_or_default();
+
+                files.sort_by(|a, b| {
+                    let ta = fs::metadata(a).and_then(|m| m.modified()).ok();
+                    let tb = fs::metadata(b).and_then(|m| m.modified()).ok();
+                    tb.cmp(&ta)
+                });
+
+                if let Some(latest) = files.first() {
+                    session.session_file = Some(latest.to_string_lossy().to_string());
+                    if let Ok(meta) = fs::metadata(latest) {
+                        if let Ok(modified) = meta.modified() {
+                            let datetime: chrono::DateTime<Local> = modified.into();
+                            session.last_activity =
+                                datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+                        }
+                    }
                 }
             }
         }

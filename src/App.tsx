@@ -108,7 +108,7 @@ export default function App() {
                   监控会话列表
                 </h2>
                 <span className="text-[10px] text-gray-600">
-                  支持: Claude Code · Codex CLI
+                  支持: Claude Code · Codex CLI · OpenCode
                 </span>
               </div>
               <SessionList />

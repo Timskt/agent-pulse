@@ -46,7 +46,7 @@ function SessionRow({
     <div className="flex items-center gap-3 rounded-xl border border-gray-800 bg-gray-900/80 px-4 py-3 transition-colors hover:border-gray-700">
       {/* Agent 图标 */}
       <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gray-800 text-lg">
-        {session.adapter_id === "claude-code" ? "🤖" : "🧠"}
+        {session.adapter_id === "claude-code" ? "🤖" : session.adapter_id === "opencode" ? "🧑‍💻" : "🧠"}
       </div>
 
       {/* 会话信息 */}
