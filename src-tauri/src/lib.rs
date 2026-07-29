@@ -110,7 +110,7 @@ async fn update_config(state: State<'_, AppState>, config: AppConfig) -> Result<
 
 /// 手动对指定会话触发续跑
 #[tauri::command]
-async fn manual_resume(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+async fn manual_resume(state: State<'_, AppState>, session_id: String, use_goal_prompt: Option<bool>) -> Result<String, String> {
     let session = {
         let s = state.engine.state.lock().await;
         s.sessions
@@ -122,7 +122,7 @@ async fn manual_resume(state: State<'_, AppState>, session_id: String) -> Result
 
     let config = state.config_manager.get();
     let resumer = resumer::Resumer::new(config);
-    let result = resumer.resume(&session).await?;
+    let result = resumer.resume(&session, use_goal_prompt.unwrap_or(false)).await?;
 
     state
         .engine

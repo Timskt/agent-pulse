@@ -26,8 +26,12 @@ pub struct AppConfig {
     pub custom_keywords: Vec<String>,
     /// 完成标记列表（出现则不触发续跑）
     pub completion_markers: Vec<String>,
-    /// 续跑提示词
+    /// 续跑提示词（通用）
     pub resume_prompt: String,
+    /// Goal 恢复专用提示词（检测到活跃 goal 时使用）
+    pub goal_resume_prompt: String,
+    /// Goal 相关关键词（检测到这些词表示有活跃 goal 需要恢复）
+    pub goal_keywords: Vec<String>,
     /// 是否启用自动续跑（关闭则仅通知）
     pub auto_resume_enabled: bool,
     /// 监控的 agent 类型
@@ -59,6 +63,18 @@ impl Default for AppConfig {
                 "completed successfully".to_string(),
             ],
             resume_prompt: "请继续完成刚才未完成的任务，不要重新开始。".to_string(),
+            goal_resume_prompt: "你之前有一个活跃的 goal 目标还未完成，请立即恢复并继续执行。不要重新规划，直接从上次中断的地方继续。".to_string(),
+            goal_keywords: vec![
+                "goal".to_string(),
+                "objective".to_string(),
+                "Goal completed".to_string(),
+                "goal paused".to_string(),
+                "goal blocked".to_string(),
+                "updateGoal".to_string(),
+                "createGoal".to_string(),
+                "turn_budget".to_string(),
+                "Turns remaining".to_string(),
+            ],
             auto_resume_enabled: true,
             enabled_adapters: vec!["claude-code".to_string(), "codex".to_string(), "opencode".to_string()],
         }

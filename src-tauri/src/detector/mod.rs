@@ -18,6 +18,8 @@ pub struct DetectionResult {
     pub has_completion_marker: bool,
     /// 匹配到的完成标记
     pub matched_marker: Option<String>,
+    /// 是否检测到活跃 Goal（用于智能选择续跑提示词）
+    pub has_active_goal: bool,
     /// 判定结论
     pub verdict: Verdict,
     /// 检测时间
@@ -77,6 +79,7 @@ impl Detector {
         let mut signals = Vec::new();
         let mut has_completion_marker = false;
         let mut matched_marker: Option<String> = None;
+        let mut has_active_goal = false;
 
         // 策略 1: 进程存活检测
         let process_alive = self.check_process_alive(session.pid);
@@ -124,6 +127,14 @@ impl Detector {
                         break; // 一个关键词足够
                     }
                 }
+
+                // 检测活跃 Goal 状态（用于智能续跑提示词选择）
+                for goal_kw in &self.config.goal_keywords {
+                    if output.contains(goal_kw.as_str()) {
+                        has_active_goal = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -153,6 +164,7 @@ impl Detector {
             signals,
             has_completion_marker,
             matched_marker,
+            has_active_goal,
             verdict,
             detected_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         }

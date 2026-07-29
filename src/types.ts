@@ -61,6 +61,8 @@ export interface AppConfig {
   custom_keywords: string[];
   completion_markers: string[];
   resume_prompt: string;
+  goal_resume_prompt: string;
+  goal_keywords: string[];
   auto_resume_enabled: boolean;
   enabled_adapters: string[];
 }

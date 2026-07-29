@@ -11,12 +11,13 @@ body {
   min-height: 100vh;
   overflow: hidden;
   user-select: none;
+  background: #030712;
 }
 
 /* 自定义滚动条 */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-track {
@@ -24,30 +25,86 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #374151;
+  background: #1f2937;
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+  background: #374151;
 }
 
 /* 日志面板 */
 .log-panel {
   font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: 11px;
+  line-height: 1.7;
 }
 
-/* 状态脉冲动画 */
+/* ===== 动画 ===== */
+
+/* 状态脉冲 */
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 currentColor; }
+  50% { opacity: 0.5; box-shadow: 0 0 6px 2px currentColor; }
 }
 
 .animate-pulse-dot {
   animation: pulse-dot 2s ease-in-out infinite;
 }
+
+/* 呼吸光晕 */
+@keyframes glow-breathe {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.animate-glow {
+  animation: glow-breathe 3s ease-in-out infinite;
+}
+
+/* 淡入上移 */
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 日志条目滑入 */
+@keyframes log-slide {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-log-slide {
+  animation: log-slide 0.25s ease-out both;
+}
+
+/* 扫描旋转 */
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 2s linear infinite;
+}
+
+/* 顶部渐变流光 */
+@keyframes gradient-flow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.animate-gradient-flow {
+  background-size: 200% 200%;
+  animation: gradient-flow 6s ease infinite;
+}
+
+/* ===== 组件样式 ===== */
 
 /* 窗口拖拽区域 */
 .titlebar-drag {
@@ -56,4 +113,30 @@ body {
 
 .titlebar-no-drag {
   -webkit-app-region: no-drag;
+}
+
+/* 玻璃卡片 */
+.glass-card {
+  background: linear-gradient(135deg, rgba(17, 24, 39, 0.9), rgba(3, 7, 18, 0.8));
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(55, 65, 81, 0.5);
+}
+
+/* 渐变边框卡片 */
+.gradient-border {
+  position: relative;
+  border: 1px solid transparent;
+  background: linear-gradient(#0d1117, #0d1117) padding-box,
+    linear-gradient(135deg, rgba(99, 102, 241, 0.4), rgba(168, 85, 247, 0.2), rgba(16, 185, 129, 0.3)) border-box;
+}
+
+/* 数字跳动 */
+@keyframes number-pop {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+
+.animate-number-pop {
+  animation: number-pop 0.3s ease-out;
 }

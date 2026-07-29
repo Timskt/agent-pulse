@@ -208,7 +208,7 @@ impl MonitorEngine {
         }
 
         // 4. 根据检测结果更新状态 & 触发续跑
-        let mut resume_actions: Vec<AgentSession> = Vec::new();
+        let mut resume_actions: Vec<(AgentSession, bool)> = Vec::new();
 
         for (session, detection) in &detections {
             match detection.verdict {
@@ -232,7 +232,7 @@ impl MonitorEngine {
                     // 检查冷却时间
                     let can_resume = self.check_cooldown(session);
                     if can_resume && self.config.auto_resume_enabled {
-                        resume_actions.push(session.clone());
+                        resume_actions.push((session.clone(), detection.has_active_goal));
                     } else if !can_resume {
                         self.push_event(EngineEvent::new(
                             LogLevel::Info,
@@ -285,7 +285,7 @@ impl MonitorEngine {
                 }
 
                 // 更新续跑计数
-                if resume_actions.iter().any(|r| r.id == session.id) {
+                if resume_actions.iter().any(|(r, _)| r.id == session.id) {
                     session.resume_count += 1;
                     session.last_resume_at =
                         Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
@@ -312,15 +312,16 @@ impl MonitorEngine {
             state.sessions = all_sessions;
         }
 
-        // 6. 执行续跑动作
-        for session in &resume_actions {
+        // 6. 执行续跑动作（智能选择提示词）
+        for (session, use_goal_prompt) in &resume_actions {
             let resumer = Resumer::new(self.config.clone());
-            match resumer.resume(session).await {
+            let prompt_type = if *use_goal_prompt { "Goal恢复" } else { "通用" };
+            match resumer.resume(session, *use_goal_prompt).await {
                 Ok(msg) => {
                     self.push_event(EngineEvent::new(
                         LogLevel::Success,
                         Some(session.id.clone()),
-                        format!("已触发续跑 (第{}次): {}", session.resume_count + 1, msg),
+                        format!("已触发续跑[{}模式] (第{}次): {}", prompt_type, session.resume_count + 1, msg),
                     ))
                     .await;
                 }

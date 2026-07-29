@@ -9,8 +9,9 @@ export function ConfigPanel() {
 
   if (!config) {
     return (
-      <div className="flex h-64 items-center justify-center text-gray-500">
-        加载配置中...
+      <div className="flex h-64 flex-col items-center justify-center gap-3 text-gray-500">
+        <span className="h-6 w-6 animate-spin rounded-full border-2 border-gray-700 border-t-indigo-500" />
+        <span className="text-sm">加载配置中...</span>
       </div>
     );
   }
@@ -26,10 +27,9 @@ export function ConfigPanel() {
   };
 
   return (
-    <div className="space-y-6">
-      {/* 基础设置 */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
-        <h3 className="mb-4 text-sm font-semibold text-gray-200">检测设置</h3>
+    <div className="mx-auto max-w-3xl space-y-5">
+      {/* 检测设置 */}
+      <Section title="检测设置" icon="🔬" desc="控制中断检测的灵敏度与轮询频率">
         <div className="grid grid-cols-2 gap-4">
           <NumberField
             label="轮询间隔（秒）"
@@ -67,12 +67,11 @@ export function ConfigPanel() {
             onChange={(v) => set("resume_cooldown_secs", v)}
           />
         </div>
-      </section>
+      </Section>
 
-      {/* 开关设置 */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
-        <h3 className="mb-4 text-sm font-semibold text-gray-200">行为设置</h3>
-        <div className="space-y-3">
+      {/* 行为设置 */}
+      <Section title="行为设置" icon="🎛️" desc="控制检测到中断后的自动行为">
+        <div className="space-y-2.5">
           <ToggleField
             label="自动续跑"
             desc="检测到中断后自动发送续跑指令（关闭则仅记录通知）"
@@ -98,20 +97,52 @@ export function ConfigPanel() {
             onChange={(v) => set("heartbeat_log", v)}
           />
         </div>
-      </section>
+      </Section>
 
-      {/* 关键词设置 */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
-        <h3 className="mb-4 text-sm font-semibold text-gray-200">
-          关键词触发
-        </h3>
+      {/* 续跑提示词 */}
+      <Section title="续跑提示词" icon="💬" desc="检测到中断后自动发送给 Agent 的指令">
         <div className="space-y-4">
           <div>
-            <label className="mb-1 block text-xs text-gray-400">
+            <label className="mb-1.5 block text-xs font-medium text-gray-400">
+              通用续跑提示词
+            </label>
+            <textarea
+              className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2.5 text-sm text-gray-200 outline-none transition-colors focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/20 resize-none"
+              rows={2}
+              value={config.resume_prompt}
+              onChange={(e) => set("resume_prompt", e.target.value)}
+            />
+          </div>
+          <div className="rounded-lg border border-purple-500/20 bg-purple-500/5 p-3">
+            <label className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-purple-300">
+              🎯 Goal 恢复专用提示词
+              <span className="rounded bg-purple-400/10 px-1.5 py-0.5 text-[9px] text-purple-400">
+                检测到活跃 Goal 时自动使用
+              </span>
+            </label>
+            <textarea
+              className="w-full rounded-lg border border-purple-500/20 bg-gray-800/60 px-3 py-2.5 text-sm text-gray-200 outline-none transition-colors focus:border-purple-500/60 focus:ring-1 focus:ring-purple-500/20 resize-none"
+              rows={2}
+              value={config.goal_resume_prompt}
+              onChange={(e) => set("goal_resume_prompt", e.target.value)}
+            />
+            <p className="mt-1.5 text-[10px] leading-relaxed text-gray-500">
+              当 Agent 输出中检测到 goal / objective / turn_budget 等关键词时，
+              判定存在活跃 Goal，续跑时将使用此专用提示词确保目标被主动恢复
+            </p>
+          </div>
+        </div>
+      </Section>
+
+      {/* 关键词设置 */}
+      <Section title="关键词触发" icon="🏷️" desc="自定义中断检测与完成判定的关键词">
+        <div className="space-y-4">
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-gray-400">
               中断触发关键词（逗号分隔）
             </label>
             <textarea
-              className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 outline-none focus:border-pulse-500 resize-none"
+              className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2.5 text-sm text-gray-200 outline-none transition-colors focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/20 resize-none"
               rows={2}
               value={config.custom_keywords.join(", ")}
               onChange={(e) =>
@@ -129,11 +160,11 @@ export function ConfigPanel() {
             </p>
           </div>
           <div>
-            <label className="mb-1 block text-xs text-gray-400">
+            <label className="mb-1.5 block text-xs font-medium text-gray-400">
               完成标记（逗号分隔）
             </label>
             <textarea
-              className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 outline-none focus:border-pulse-500 resize-none"
+              className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2.5 text-sm text-gray-200 outline-none transition-colors focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/20 resize-none"
               rows={2}
               value={config.completion_markers.join(", ")}
               onChange={(e) =>
@@ -150,37 +181,73 @@ export function ConfigPanel() {
               出现完成标记时不会触发续跑，防止重复执行
             </p>
           </div>
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-gray-400">
+              Goal 检测关键词（逗号分隔）
+            </label>
+            <textarea
+              className="w-full rounded-lg border border-purple-500/20 bg-gray-800/60 px-3 py-2.5 text-sm text-gray-200 outline-none transition-colors focus:border-purple-500/60 focus:ring-1 focus:ring-purple-500/20 resize-none"
+              rows={2}
+              value={config.goal_keywords.join(", ")}
+              onChange={(e) =>
+                set(
+                  "goal_keywords",
+                  e.target.value
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                )
+              }
+            />
+            <p className="mt-1 text-[10px] text-gray-600">
+              匹配到这些关键词时判定存在活跃 Goal，使用 Goal 专用提示词续跑
+            </p>
+          </div>
         </div>
-      </section>
-
-      {/* 续跑提示词 */}
-      <section className="rounded-xl border border-gray-800 bg-gray-900/80 p-5">
-        <h3 className="mb-4 text-sm font-semibold text-gray-200">续跑提示词</h3>
-        <textarea
-          className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 outline-none focus:border-pulse-500 resize-none"
-          rows={3}
-          value={config.resume_prompt}
-          onChange={(e) => set("resume_prompt", e.target.value)}
-        />
-        <p className="mt-1 text-[10px] text-gray-600">
-          检测到中断后，自动发送给 Agent 的续跑指令内容
-        </p>
-      </section>
+      </Section>
 
       {/* 保存按钮 */}
-      <div className="flex justify-end">
+      <div className="flex justify-end pb-4">
         <button
           onClick={handleSave}
-          className={`rounded-lg px-6 py-2.5 text-sm font-medium text-white transition-all ${
+          className={`flex items-center gap-2 rounded-xl px-7 py-2.5 text-sm font-medium text-white shadow-lg transition-all duration-300 active:scale-95 ${
             saved
-              ? "bg-emerald-600"
-              : "bg-pulse-600 hover:bg-pulse-500"
+              ? "bg-gradient-to-r from-emerald-600 to-teal-600 shadow-emerald-500/25"
+              : "bg-gradient-to-r from-indigo-600 to-purple-600 shadow-indigo-500/25 hover:shadow-indigo-500/40 hover:brightness-110"
           }`}
         >
           {saved ? "✓ 已保存" : "保存配置"}
         </button>
       </div>
     </div>
+  );
+}
+
+/** 配置区块容器 */
+function Section({
+  title,
+  icon,
+  desc,
+  children,
+}: {
+  title: string;
+  icon: string;
+  desc: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-xl border border-gray-800/60 bg-gray-900/70 p-5 backdrop-blur transition-colors hover:border-gray-700/50">
+      <div className="mb-4 flex items-center gap-2.5">
+        <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gray-800/80 text-sm">
+          {icon}
+        </span>
+        <div>
+          <h3 className="text-sm font-semibold text-gray-200">{title}</h3>
+          <p className="text-[10px] text-gray-500">{desc}</p>
+        </div>
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -199,14 +266,16 @@ function NumberField({
 }) {
   return (
     <div>
-      <label className="mb-1 block text-xs text-gray-400">{label}</label>
+      <label className="mb-1.5 block text-xs font-medium text-gray-400">
+        {label}
+      </label>
       <input
         type="number"
         min={min}
         max={max}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-200 outline-none focus:border-pulse-500"
+        className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2.5 text-sm tabular-nums text-gray-200 outline-none transition-colors focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/20"
       />
     </div>
   );
@@ -224,19 +293,21 @@ function ToggleField({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <div className="flex items-center justify-between rounded-lg border border-gray-800 bg-gray-800/40 px-4 py-3">
+    <div className="flex items-center justify-between rounded-lg border border-gray-800/50 bg-gray-800/30 px-4 py-3 transition-colors hover:bg-gray-800/50">
       <div>
-        <span className="text-sm text-gray-200">{label}</span>
+        <span className="text-sm font-medium text-gray-200">{label}</span>
         <p className="mt-0.5 text-[10px] text-gray-500">{desc}</p>
       </div>
       <button
         onClick={() => onChange(!checked)}
-        className={`relative h-6 w-11 rounded-full transition-colors ${
-          checked ? "bg-pulse-600" : "bg-gray-700"
+        className={`relative h-6 w-11 shrink-0 rounded-full transition-all duration-300 ${
+          checked
+            ? "bg-gradient-to-r from-indigo-600 to-purple-600 shadow-md shadow-indigo-500/30"
+            : "bg-gray-700"
         }`}
       >
         <span
-          className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+          className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-300 ${
             checked ? "translate-x-[22px]" : "translate-x-0.5"
           }`}
         />

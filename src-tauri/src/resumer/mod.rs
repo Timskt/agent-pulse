@@ -23,8 +23,13 @@ impl Resumer {
     }
 
     /// 执行续跑
-    pub async fn resume(&self, session: &AgentSession) -> Result<String, String> {
-        let prompt = &self.config.resume_prompt;
+    /// `use_goal_prompt`: 是否使用 Goal 专用提示词（检测到活跃 goal 时为 true）
+    pub async fn resume(&self, session: &AgentSession, use_goal_prompt: bool) -> Result<String, String> {
+        let prompt = if use_goal_prompt {
+            &self.config.goal_resume_prompt
+        } else {
+            &self.config.resume_prompt
+        };
 
         #[cfg(target_os = "macos")]
         {
