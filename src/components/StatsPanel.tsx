@@ -1,164 +1,168 @@
-import { useEffect } from "react";
-import { useAppStore } from "../stores/useAppStore";
+import { useEffect, useMemo } from "react";
+import { useI18n } from "../i18n";
+import { formatShortTime } from "../lib/utils";
+import {
+  selectDailyStats,
+  selectResumeHistory,
+  selectTotals,
+  useAppStore,
+} from "../stores/useAppStore";
+import {
+  Badge,
+  BarChart,
+  Card,
+  CardBody,
+  CardHeader,
+  EmptyState,
+  LegendDot,
+  type BarDatum,
+} from "./ui";
 
-/** 统计分析面板 */
+/** 与 store 里 `get_stats { days: 30 }` / `get_resume_history { limit: 50 }` 保持一致 */
+const DAYS = 30;
+const HISTORY_LIMIT = 50;
+
+/**
+ * 统计页
+ *
+ * 图表以前是空白的：外层 `flex items-end` 里柱子写 `height: N%`，
+ * 没有确定的父高度可参照就被解析成 0。现在统一交给 `BarChart`，
+ * 这一页只负责把 `DailyStats` 翻成 `BarDatum`。
+ */
 export function StatsPanel() {
-  const { dailyStats, resumeHistory, totals, fetchStats } = useAppStore();
+  const { t } = useI18n();
+  const dailyStats = useAppStore(selectDailyStats);
+  const resumeHistory = useAppStore(selectResumeHistory);
+  const totals = useAppStore(selectTotals);
+  const fetchStats = useAppStore((s) => s.fetchStats);
 
   useEffect(() => {
-    fetchStats();
+    void fetchStats();
   }, [fetchStats]);
 
-  const [totalDetections, totalResumes, successfulResumes] = totals ?? [0, 0, 0];
-  const successRate =
-    totalResumes > 0
-      ? Math.round((successfulResumes / totalResumes) * 100)
-      : 0;
+  const [detections, resumes, successful] = totals ?? [0, 0, 0];
+  const successRate = resumes > 0 ? Math.round((successful / resumes) * 100) : 0;
+
+  const bars = useMemo<BarDatum[]>(
+    () =>
+      dailyStats.map((day) => ({
+        key: day.date,
+        value: day.total_detections + day.total_resumes,
+        overlay: day.successful_resumes,
+        tooltip: t("stats.bar_tooltip", {
+          date: day.date,
+          detections: day.total_detections,
+          resumes: day.total_resumes,
+          successful: day.successful_resumes,
+        }),
+      })),
+    [dailyStats, t]
+  );
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
-      {/* 总览卡片 */}
-      <div className="grid grid-cols-4 gap-3">
-        <StatCard label="中断检测" value={totalDetections} />
-        <StatCard label="自动续跑" value={totalResumes} />
-        <StatCard label="续跑成功" value={successfulResumes} />
-        <StatCard label="成功率" value={`${successRate}%`} />
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <StatCard label={t("stats.detections")} value={detections} />
+        <StatCard label={t("stats.resumes")} value={resumes} />
+        <StatCard label={t("stats.successful")} value={successful} />
+        <StatCard label={t("stats.success_rate")} value={`${successRate}%`} />
       </div>
 
-      {/* 30 天趋势图 */}
-      <section className="rounded-lg border border-neutral-200 bg-white p-5">
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <h3 className="text-xs font-semibold text-neutral-800">30-Day Activity</h3>
-            <p className="mt-0.5 text-[10px] text-neutral-400">每日检测与续跑统计</p>
-          </div>
-          <div className="flex items-center gap-3 text-[9px] text-neutral-400">
-            <span className="flex items-center gap-1">
-              <span className="h-2 w-2 rounded-sm bg-neutral-800" /> Total
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="h-2 w-2 rounded-sm bg-emerald-500" /> Success
-            </span>
-          </div>
-        </div>
-
-        {dailyStats.length === 0 ? (
-          <div className="flex h-32 items-center justify-center text-[11px] text-neutral-300">
-            暂无历史数据，开始监控后将自动记录
-          </div>
-        ) : (
-          <div className="flex h-32 items-end gap-[2px] overflow-x-auto pb-1">
-            {dailyStats.map((day) => {
-              const maxVal = Math.max(
-                ...dailyStats.map((d) => d.total_resumes + d.total_detections),
-                1
-              );
-              const height = Math.max(
-                ((day.total_resumes + day.total_detections) / maxVal) * 100,
-                4
-              );
-              return (
-                <div
-                  key={day.date}
-                  className="group relative flex min-w-[8px] flex-1 flex-col items-center justify-end"
-                  title={`${day.date}: 检测 ${day.total_detections} / 续跑 ${day.total_resumes}`}
-                >
-                  <div
-                    className="w-full rounded-t-sm bg-neutral-800/80 transition-colors group-hover:bg-neutral-900"
-                    style={{ height: `${height}%` }}
-                  />
-                  {day.successful_resumes > 0 && (
-                    <div
-                      className="absolute bottom-0 w-full rounded-t-sm bg-emerald-500/60"
-                      style={{
-                        height: `${(day.successful_resumes / maxVal) * 100}%`,
-                      }}
-                    />
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </section>
-
-      {/* 续跑历史 */}
-      <section className="rounded-lg border border-neutral-200 bg-white p-5">
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <h3 className="text-xs font-semibold text-neutral-800">Resume History</h3>
-            <p className="mt-0.5 text-[10px] text-neutral-400">最近 50 条续跑操作</p>
-          </div>
-          <span className="text-[10px] tabular-nums text-neutral-300">
-            {resumeHistory.length} records
-          </span>
-        </div>
-
-        {resumeHistory.length === 0 ? (
-          <div className="flex h-24 items-center justify-center text-[11px] text-neutral-300">
-            暂无续跑记录
-          </div>
-        ) : (
-          <div className="max-h-64 divide-y divide-neutral-50 overflow-y-auto">
-            {resumeHistory.map((record) => (
-              <div
-                key={record.id}
-                className="flex items-center gap-3 px-1 py-2.5 transition-colors hover:bg-neutral-50/50"
-              >
-                <span
-                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium ${
-                    record.success
-                      ? "bg-emerald-50 text-emerald-600"
-                      : "bg-red-50 text-red-500"
-                  }`}
-                >
-                  {record.success ? "✓" : "✗"}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-medium text-neutral-700">
-                      {record.agent_name}
-                    </span>
-                    <span
-                      className={`rounded px-1.5 py-0.5 text-[9px] font-medium ${
-                        record.prompt_type === "goal"
-                          ? "bg-violet-50 text-violet-600"
-                          : "bg-neutral-100 text-neutral-500"
-                      }`}
-                    >
-                      {record.prompt_type === "goal" ? "Goal" : "Normal"}
-                    </span>
-                  </div>
-                  <p className="truncate text-[10px] text-neutral-400">
-                    {record.working_dir}
-                  </p>
-                </div>
-                <span className="shrink-0 text-[10px] tabular-nums text-neutral-300">
-                  {formatTime(record.created_at)}
-                </span>
+      <Card>
+        <CardBody>
+          <CardHeader
+            className="mb-4"
+            title={t("stats.activity", { days: DAYS })}
+            desc={t("stats.activity_desc")}
+            aside={
+              <div className="flex items-center gap-3">
+                <LegendDot>{t("stats.legend_total")}</LegendDot>
+                <LegendDot className="bg-emerald-500">{t("stats.legend_success")}</LegendDot>
               </div>
-            ))}
-          </div>
-        )}
-      </section>
+            }
+          />
+          {bars.length === 0 ? (
+            <EmptyState title={t("stats.no_activity")} />
+          ) : (
+            <BarChart
+              data={bars}
+              axis={
+                <>
+                  <span>{shortDate(dailyStats[0].date)}</span>
+                  <span>{shortDate(dailyStats[dailyStats.length - 1].date)}</span>
+                </>
+              }
+            />
+          )}
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardBody>
+          <CardHeader
+            className="mb-3"
+            title={t("stats.history")}
+            desc={t("stats.history_desc", { limit: HISTORY_LIMIT })}
+            aside={
+              <span className="text-[10px] tabular-nums text-neutral-400">
+                {t("stats.records", { count: resumeHistory.length })}
+              </span>
+            }
+          />
+          {resumeHistory.length === 0 ? (
+            <EmptyState title={t("stats.no_history")} className="py-6" />
+          ) : (
+            <div className="max-h-72 divide-y divide-neutral-100 overflow-y-auto">
+              {resumeHistory.map((record) => (
+                <div key={record.id} className="flex items-center gap-3 py-2.5">
+                  <span
+                    className={
+                      record.success
+                        ? "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-[10px] text-emerald-600"
+                        : "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-red-50 text-[10px] text-red-500"
+                    }
+                  >
+                    {record.success ? "✓" : "✗"}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate text-xs font-medium text-neutral-700">
+                        {record.agent_name}
+                      </span>
+                      <Badge tone={record.prompt_type === "goal" ? "violet" : "neutral"}>
+                        {record.prompt_type === "goal"
+                          ? t("stats.prompt_goal")
+                          : t("stats.prompt_generic")}
+                      </Badge>
+                    </div>
+                    {/* 成功的那条不用解释，失败的才需要看后端那句话 */}
+                    <p className="truncate text-[10px] text-neutral-400">
+                      {record.success ? record.working_dir : record.message || record.working_dir}
+                    </p>
+                  </div>
+                  <span className="shrink-0 text-[10px] tabular-nums text-neutral-300">
+                    {formatShortTime(record.created_at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardBody>
+      </Card>
     </div>
   );
 }
 
 function StatCard({ label, value }: { label: string; value: number | string }) {
   return (
-    <div className="rounded-lg border border-neutral-200 bg-white px-4 py-3.5">
+    <Card className="px-4 py-3.5">
       <p className="text-2xl font-semibold tabular-nums text-neutral-900">{value}</p>
-      <p className="mt-0.5 text-[11px] text-neutral-400">{label}</p>
-    </div>
+      <p className="mt-0.5 truncate text-[11px] text-neutral-400">{label}</p>
+    </Card>
   );
 }
 
-function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
-  } catch {
-    return iso;
-  }
+/** `2026-07-30` → `07-30`；坐标轴上年份是噪音 */
+function shortDate(date: string): string {
+  return date.length >= 10 ? date.slice(5) : date;
 }

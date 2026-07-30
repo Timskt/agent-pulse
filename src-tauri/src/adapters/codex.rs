@@ -44,6 +44,7 @@ impl AgentAdapter for CodexAdapter {
                 status: SessionStatus::Active,
                 resume_count: 0,
                 last_resume_at: None,
+                ..Default::default()
             });
         }
 

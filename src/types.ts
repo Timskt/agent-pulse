@@ -1,11 +1,30 @@
-/** 与 Rust 后端对应的类型定义 */
+/**
+ * 与 Rust 后端一一对应的类型
+ *
+ * 字段名就是 serde 序列化后的名字（snake_case），所以这里刻意不做
+ * camelCase 转换——多一层映射就多一处能对不上的地方。
+ *
+ * 显示用的文案一律不放在这里：状态名走 i18n 的 `status.*`，
+ * 注意力级别走 `attention.*`。以前 `STATUS_LABELS` 把中文写死在类型文件里，
+ * 切英文时就露馅了。
+ */
 
-export type SessionStatus =
-  | "active"
-  | "suspended"
-  | "interrupted"
-  | "completed"
-  | "exited";
+export type SessionStatus = "active" | "suspended" | "interrupted" | "completed" | "exited";
+
+/** 注意力分级（v1.1）：这个会话现在要不要叫人 */
+export type AttentionLevel = "none" | "needs_input" | "completed" | "rate_limited" | "error";
+
+/** 用量汇总，可用于单会话、单项目或单日 */
+export interface UsageSnapshot {
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  /** 含缓存部分，即真实上下文规模 */
+  total_tokens: number;
+  cost_usd: number;
+  requests: number;
+}
 
 export interface AgentSession {
   id: string;
@@ -20,6 +39,12 @@ export interface AgentSession {
   status: SessionStatus;
   resume_count: number;
   last_resume_at: string | null;
+  attention: AttentionLevel;
+  attention_detail: string | null;
+  /** 所在终端的 TTY，如 `/dev/ttys003`——多标签页时靠它认人 */
+  tty: string | null;
+  terminal_app: string | null;
+  usage: UsageSnapshot | null;
 }
 
 export type LogLevel = "info" | "warn" | "error" | "success";
@@ -36,10 +61,13 @@ export interface EngineStatus {
   sessions_total: number;
   sessions_active: number;
   sessions_interrupted: number;
+  /** 需要人介入的会话数，也就是托盘角标上的数字 */
+  pending_attention: number;
   total_resumes: number;
   total_detections: number;
   last_scan_at: string | null;
   uptime_secs: number;
+  cost_today: number;
 }
 
 export interface MonitorState {
@@ -49,12 +77,28 @@ export interface MonitorState {
   status: EngineStatus;
 }
 
-// ===== v0.3.0 / v1.0.0 新增类型 =====
+/** 后端推过来的提醒事件（`attention-alert`） */
+export interface AttentionAlert {
+  session_id: string;
+  /** 注意力级别，另有预算告警用的 `budget` */
+  level: Exclude<AttentionLevel, "none"> | "budget";
+  title: string;
+  body: string;
+  /** 要不要响一声，由后端读配置决定，前端不再自己判断 */
+  sound: boolean;
+  volume: number;
+}
+
+// ===== 配置 =====
+
+export type WebhookProvider = "slack" | "discord" | "ntfy" | "bark" | "custom";
 
 export interface WebhookConfig {
   enabled: boolean;
   url: string;
-  provider: string;
+  provider: WebhookProvider;
+  /** ntfy 的主题名 / Bark 的设备 Key；留空则直接 POST `url` */
+  topic: string;
   template: string;
   notify_on_interrupt: boolean;
   notify_on_resume: boolean;
@@ -73,6 +117,47 @@ export interface CustomAdapterConfig {
   name: string;
   process_pattern: string;
   session_file_pattern: string;
+}
+
+export interface NotificationConfig {
+  enabled: boolean;
+  on_needs_input: boolean;
+  on_completed: boolean;
+  on_rate_limited: boolean;
+  on_error: boolean;
+  on_resumed: boolean;
+  sound_enabled: boolean;
+  sound_volume: number;
+  /** 同一会话同一状态的最小通知间隔，防刷屏 */
+  throttle_secs: number;
+  tray_badge: boolean;
+}
+
+/** 单个模型的价格覆盖（美元 / 每百万 token） */
+export interface ModelPriceOverride {
+  model: string;
+  input: number;
+  output: number;
+  cache_write: number | null;
+  cache_read: number | null;
+}
+
+export interface CostConfig {
+  enabled: boolean;
+  daily_budget_usd: number;
+  session_budget_usd: number;
+  alert_at_percent: number;
+  rate_limit_window_hours: number;
+  rate_limit_token_budget: number;
+  price_overrides: ModelPriceOverride[];
+}
+
+export interface RemoteConfig {
+  enabled: boolean;
+  port: number;
+  /** true 时监听 0.0.0.0，同网段拿到令牌即可查看——只在可信网络里开 */
+  bind_all: boolean;
+  token: string;
 }
 
 export interface AppConfig {
@@ -95,9 +180,15 @@ export interface AppConfig {
   ai_judge: AiJudgeConfig;
   language: string;
   custom_adapters: CustomAdapterConfig[];
+  input_keywords: string[];
+  rate_limit_keywords: string[];
+  error_keywords: string[];
+  notification: NotificationConfig;
+  cost: CostConfig;
+  remote: RemoteConfig;
 }
 
-// ===== 统计类型 =====
+// ===== 统计与花费 =====
 
 export interface DailyStats {
   date: string;
@@ -113,10 +204,51 @@ export interface ResumeRecord {
   session_id: string;
   agent_name: string;
   working_dir: string;
+  /** `generic` | `goal` */
   prompt_type: string;
   success: boolean;
   message: string;
   created_at: string;
+}
+
+export interface DailyCost {
+  date: string;
+  total_tokens: number;
+  cost_usd: number;
+  requests: number;
+}
+
+export interface ProjectCost {
+  project: string;
+  total_tokens: number;
+  cost_usd: number;
+  requests: number;
+}
+
+export interface RateLimitForecast {
+  window_hours: number;
+  used_tokens: number;
+  /** 0 表示没配额度，无法预测 */
+  budget_tokens: number;
+  used_percent: number;
+  tokens_per_min: number;
+  minutes_to_limit: number | null;
+}
+
+export interface SessionHistoryEntry {
+  session_key: string;
+  session_id: string;
+  agent_name: string;
+  working_dir: string;
+  session_file: string;
+  tty: string;
+  terminal_app: string;
+  first_seen: string;
+  last_seen: string;
+  last_status: string;
+  resume_count: number;
+  total_tokens: number;
+  cost_usd: number;
 }
 
 export interface AiVerdict {
@@ -125,19 +257,3 @@ export interface AiVerdict {
   reasoning: string;
   suggested_prompt: string | null;
 }
-
-export const STATUS_LABELS: Record<SessionStatus, string> = {
-  active: "运行中",
-  suspended: "疑似中断",
-  interrupted: "已中断",
-  completed: "已完成",
-  exited: "已退出",
-};
-
-export const STATUS_COLORS: Record<SessionStatus, string> = {
-  active: "text-emerald-600 bg-emerald-50",
-  suspended: "text-amber-600 bg-amber-50",
-  interrupted: "text-red-600 bg-red-50",
-  completed: "text-blue-600 bg-blue-50",
-  exited: "text-neutral-500 bg-neutral-100",
-};

@@ -1,609 +1,813 @@
-import { useState } from "react";
-import { useAppStore } from "../stores/useAppStore";
-import type { AppConfig, WebhookConfig, AiJudgeConfig, CustomAdapterConfig } from "../types";
+import { useEffect, useState } from "react";
+import { useI18n } from "../i18n";
+import { useNotice, type Notice } from "../lib/useNotice";
+import { cn } from "../lib/utils";
+import { selectConfig, useAppStore } from "../stores/useAppStore";
+import type {
+  AiJudgeConfig,
+  AppConfig,
+  CostConfig,
+  CustomAdapterConfig,
+  NotificationConfig,
+  RemoteConfig,
+  WebhookConfig,
+  WebhookProvider,
+} from "../types";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  Chip,
+  CommaListInput,
+  EmptyState,
+  Field,
+  NumberInput,
+  Select,
+  Slider,
+  TextArea,
+  TextInput,
+  ToggleRow,
+  type SelectOption,
+} from "./ui";
 
-/** 配置面板 */
+/**
+ * 设置页
+ *
+ * 三处返工：文案全部走 i18n（原来一半标题是英文、说明是中文，最土的搭配都在这一页）；
+ * 控件全部换成基元（本文件曾自带 Section / NumberField / ToggleField / NotifyToggle
+ * 四个私有版本）；补上 v1.1–v1.3 新增的提醒、花费、手机看板和三组关键词字段。
+ */
+
+type Setter = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
+
+interface SectionProps {
+  config: AppConfig;
+  set: Setter;
+}
+
+const LANGUAGES: readonly SelectOption<string>[] = [
+  { value: "zh", label: "中文" },
+  { value: "en", label: "English" },
+];
+
 export function ConfigPanel() {
-  const { config, updateConfig } = useAppStore();
-  const [saved, setSaved] = useState(false);
+  const { t } = useI18n();
+  const config = useAppStore(selectConfig);
+  const updateConfig = useAppStore((s) => s.updateConfig);
+  const { notice, show } = useNotice(5000);
+  const [saving, setSaving] = useState(false);
 
-  if (!config) {
-    return (
-      <div className="flex h-64 flex-col items-center justify-center gap-3 text-neutral-400">
-        <span className="h-5 w-5 animate-spin rounded-full border-2 border-neutral-200 border-t-neutral-500" />
-        <span className="text-xs">Loading configuration...</span>
-      </div>
-    );
-  }
+  if (!config) return <EmptyState className="h-64" title={t("common.loading")} />;
 
-  const handleSave = async () => {
-    await updateConfig(config);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-  };
-
-  const set = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => {
+  // 改动先落在 store 里：切到别的标签页再回来不会丢，按保存才写盘
+  const set: Setter = (key, value) =>
     useAppStore.setState({ config: { ...config, [key]: value } });
+
+  const save = async () => {
+    setSaving(true);
+    const result = await updateConfig(config);
+    setSaving(false);
+    // 写盘失败时把后端那句话原样显示，界面不能装作已保存
+    show({ ok: result.ok, message: result.ok ? t("common.saved") : result.message });
   };
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
-      {/* 检测设置 */}
-      <Section title="Detection" desc="中断检测的灵敏度与轮询频率">
+      <Section title={t("cfg.detection")} desc={t("cfg.detection.desc")}>
         <div className="grid grid-cols-2 gap-4">
-          <NumberField
-            label="轮询间隔（秒）"
-            value={config.poll_interval_secs}
-            min={3}
-            max={300}
-            onChange={(v) => set("poll_interval_secs", v)}
-          />
-          <NumberField
-            label="空闲超时判定（秒）"
-            value={config.idle_timeout_secs}
-            min={10}
-            max={600}
-            onChange={(v) => set("idle_timeout_secs", v)}
-          />
-          <NumberField
-            label="连续无活动阈值（次）"
-            value={config.idle_threshold}
-            min={1}
-            max={10}
-            onChange={(v) => set("idle_threshold", v)}
-          />
-          <NumberField
-            label="最大续跑次数"
-            value={config.max_resume_count}
-            min={1}
-            max={20}
-            onChange={(v) => set("max_resume_count", v)}
-          />
-          <NumberField
-            label="续跑冷却时间（秒）"
-            value={config.resume_cooldown_secs}
-            min={5}
-            max={600}
-            onChange={(v) => set("resume_cooldown_secs", v)}
-          />
+          <Field label={t("cfg.poll_interval")}>
+            <NumberInput
+              value={config.poll_interval_secs}
+              min={3}
+              max={300}
+              onValueChange={(v) => set("poll_interval_secs", v)}
+            />
+          </Field>
+          <Field label={t("cfg.idle_timeout")}>
+            <NumberInput
+              value={config.idle_timeout_secs}
+              min={10}
+              max={600}
+              onValueChange={(v) => set("idle_timeout_secs", v)}
+            />
+          </Field>
+          <Field label={t("cfg.idle_threshold")}>
+            <NumberInput
+              value={config.idle_threshold}
+              min={1}
+              max={10}
+              onValueChange={(v) => set("idle_threshold", v)}
+            />
+          </Field>
+          <Field label={t("cfg.max_resume")}>
+            <NumberInput
+              value={config.max_resume_count}
+              min={1}
+              max={20}
+              onValueChange={(v) => set("max_resume_count", v)}
+            />
+          </Field>
+          <Field label={t("cfg.cooldown")}>
+            <NumberInput
+              value={config.resume_cooldown_secs}
+              min={5}
+              max={600}
+              onValueChange={(v) => set("resume_cooldown_secs", v)}
+            />
+          </Field>
         </div>
       </Section>
 
-      {/* 行为设置 */}
-      <Section title="Behavior" desc="检测到中断后的自动行为">
-        <div className="space-y-2">
-          <ToggleField
-            label="自动续跑"
-            desc="检测到中断后自动发送续跑指令（关闭则仅记录通知）"
+      <Section title={t("cfg.behavior")} desc={t("cfg.behavior.desc")}>
+        <div className="space-y-1.5">
+          <ToggleRow
+            label={t("cfg.auto_resume")}
+            desc={t("cfg.auto_resume.desc")}
             checked={config.auto_resume_enabled}
-            onChange={(v) => set("auto_resume_enabled", v)}
+            onCheckedChange={(v) => set("auto_resume_enabled", v)}
           />
-          <ToggleField
-            label="启动时立即扫描"
-            desc="应用启动后自动开始监控"
+          <ToggleRow
+            label={t("cfg.startup_scan")}
+            desc={t("cfg.startup_scan.desc")}
             checked={config.check_on_startup}
-            onChange={(v) => set("check_on_startup", v)}
+            onCheckedChange={(v) => set("check_on_startup", v)}
           />
-          <ToggleField
-            label="自动跟随最新会话"
-            desc="多窗口时慎用，可能误触发非目标任务"
+          <ToggleRow
+            label={t("cfg.follow_latest")}
+            desc={t("cfg.follow_latest.desc")}
             checked={config.auto_follow_latest}
-            onChange={(v) => set("auto_follow_latest", v)}
+            onCheckedChange={(v) => set("auto_follow_latest", v)}
           />
-          <ToggleField
-            label="心跳日志"
-            desc="每次轮询输出心跳日志，用于诊断检测问题"
+          <ToggleRow
+            label={t("cfg.heartbeat")}
+            desc={t("cfg.heartbeat.desc")}
             checked={config.heartbeat_log}
-            onChange={(v) => set("heartbeat_log", v)}
+            onCheckedChange={(v) => set("heartbeat_log", v)}
           />
         </div>
       </Section>
 
-      {/* 系统设置 */}
-      <Section title="System" desc="系统托盘、开机自启与语言">
-        <div className="space-y-2">
-          <div className="flex items-center justify-between rounded-lg border border-neutral-100 bg-neutral-50/50 px-4 py-3">
-            <div>
-              <span className="text-xs font-medium text-neutral-700">系统托盘常驻</span>
-              <p className="mt-0.5 text-[10px] text-neutral-400">
-                关闭窗口时最小化到托盘，右键托盘图标可控制监控
-              </p>
-            </div>
-            <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[10px] font-medium text-emerald-600">
-              Enabled
-            </span>
-          </div>
-          <div className="flex items-center justify-between rounded-lg border border-neutral-100 bg-neutral-50/50 px-4 py-3">
-            <div>
-              <span className="text-xs font-medium text-neutral-700">开机自启</span>
-              <p className="mt-0.5 text-[10px] text-neutral-400">
-                系统登录时自动启动 AgentPulse（通过系统设置管理）
-              </p>
-            </div>
-            <span className="rounded-full bg-neutral-100 px-2.5 py-1 text-[10px] font-medium text-neutral-500">
-              OS Settings
-            </span>
-          </div>
-          <div className="flex items-center justify-between rounded-lg border border-neutral-100 bg-neutral-50/50 px-4 py-3">
-            <div>
-              <span className="text-xs font-medium text-neutral-700">界面语言</span>
-              <p className="mt-0.5 text-[10px] text-neutral-400">切换应用界面显示语言</p>
-            </div>
-            <select
-              value={config.language}
-              onChange={(e) => set("language", e.target.value)}
-              className="rounded-md border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-            >
-              <option value="zh">中文</option>
-              <option value="en">English</option>
-            </select>
-          </div>
-        </div>
-      </Section>
-
-      {/* 续跑提示词 */}
-      <Section title="Resume Prompts" desc="检测到中断后自动发送给 Agent 的指令">
+      <NotifySection config={config} set={set} onNotice={show} />
+      <CostSection config={config} set={set} />
+      <Section title={t("cfg.prompts")} desc={t("cfg.prompts.desc")}>
         <div className="space-y-4">
-          <div>
-            <label className="mb-1.5 block text-[11px] font-medium text-neutral-500">
-              通用续跑提示词
-            </label>
-            <textarea
-              className="w-full resize-none rounded-lg border border-neutral-200 bg-white px-3 py-2.5 text-xs leading-relaxed text-neutral-700 outline-none transition-colors focus:border-neutral-400"
-              rows={2}
+          <Field label={t("cfg.generic_prompt")}>
+            <TextArea
               value={config.resume_prompt}
               onChange={(e) => set("resume_prompt", e.target.value)}
             />
-          </div>
-          <div className="rounded-lg border border-neutral-200 bg-neutral-50/50 p-3">
-            <label className="mb-1.5 flex items-center gap-2 text-[11px] font-medium text-neutral-500">
-              Goal 恢复专用提示词
-              <span className="rounded bg-neutral-100 px-1.5 py-0.5 text-[9px] text-neutral-400">
-                检测到活跃 Goal 时自动使用
-              </span>
-            </label>
-            <textarea
-              className="w-full resize-none rounded-lg border border-neutral-200 bg-white px-3 py-2.5 text-xs leading-relaxed text-neutral-700 outline-none transition-colors focus:border-neutral-400"
-              rows={2}
-              value={config.goal_resume_prompt}
-              onChange={(e) => set("goal_resume_prompt", e.target.value)}
-            />
-            <p className="mt-1.5 text-[10px] leading-relaxed text-neutral-400">
-              当 Agent 输出中检测到 goal / objective / turn_budget 等关键词时，
-              判定存在活跃 Goal，续跑时将使用此专用提示词确保目标被主动恢复
-            </p>
+          </Field>
+          <div className="rounded-lg border border-neutral-100 bg-neutral-50/60 p-3">
+            <Field
+              label={
+                <span className="flex items-center gap-2">
+                  {t("cfg.goal_prompt")}
+                  <Badge tone="violet">{t("cfg.goal_badge")}</Badge>
+                </span>
+              }
+              hint={t("cfg.goal_prompt.hint")}
+            >
+              <TextArea
+                value={config.goal_resume_prompt}
+                onChange={(e) => set("goal_resume_prompt", e.target.value)}
+              />
+            </Field>
           </div>
         </div>
       </Section>
 
-      {/* 关键词设置 */}
-      <Section title="Keywords" desc="自定义中断检测与完成判定的关键词">
+      <Section title={t("cfg.keywords")} desc={t("cfg.keywords.desc")}>
         <div className="space-y-4">
-          <div>
-            <label className="mb-1.5 block text-[11px] font-medium text-neutral-500">
-              中断触发关键词（逗号分隔）
-            </label>
-            <textarea
-              className="w-full resize-none rounded-lg border border-neutral-200 bg-white px-3 py-2.5 text-xs leading-relaxed text-neutral-700 outline-none transition-colors focus:border-neutral-400"
-              rows={2}
-              value={config.custom_keywords.join(", ")}
-              onChange={(e) =>
-                set(
-                  "custom_keywords",
-                  e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
-                )
-              }
+          <Field label={t("cfg.kw_interrupt")} hint={t("cfg.kw_interrupt.hint")}>
+            <CommaListInput
+              value={config.custom_keywords}
+              onValueChange={(v) => set("custom_keywords", v)}
             />
-            <p className="mt-1 text-[10px] text-neutral-400">
-              输出中出现这些关键词且没有完成标记时，触发续跑
-            </p>
-          </div>
-          <div>
-            <label className="mb-1.5 block text-[11px] font-medium text-neutral-500">
-              完成标记（逗号分隔）
-            </label>
-            <textarea
-              className="w-full resize-none rounded-lg border border-neutral-200 bg-white px-3 py-2.5 text-xs leading-relaxed text-neutral-700 outline-none transition-colors focus:border-neutral-400"
-              rows={2}
-              value={config.completion_markers.join(", ")}
-              onChange={(e) =>
-                set(
-                  "completion_markers",
-                  e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
-                )
-              }
+          </Field>
+          <Field label={t("cfg.kw_completion")} hint={t("cfg.kw_completion.hint")}>
+            <CommaListInput
+              value={config.completion_markers}
+              onValueChange={(v) => set("completion_markers", v)}
             />
-            <p className="mt-1 text-[10px] text-neutral-400">
-              出现完成标记时不会触发续跑，防止重复执行
-            </p>
-          </div>
-          <div>
-            <label className="mb-1.5 block text-[11px] font-medium text-neutral-500">
-              Goal 检测关键词（逗号分隔）
-            </label>
-            <textarea
-              className="w-full resize-none rounded-lg border border-neutral-200 bg-white px-3 py-2.5 text-xs leading-relaxed text-neutral-700 outline-none transition-colors focus:border-neutral-400"
-              rows={2}
-              value={config.goal_keywords.join(", ")}
-              onChange={(e) =>
-                set(
-                  "goal_keywords",
-                  e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
-                )
-              }
+          </Field>
+          <Field label={t("cfg.kw_goal")} hint={t("cfg.kw_goal.hint")}>
+            <CommaListInput
+              value={config.goal_keywords}
+              onValueChange={(v) => set("goal_keywords", v)}
             />
-            <p className="mt-1 text-[10px] text-neutral-400">
-              匹配到这些关键词时判定存在活跃 Goal，使用 Goal 专用提示词续跑
-            </p>
+          </Field>
+          {/* 下面三组决定注意力分级怎么判，v1.1 新增 */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <Field label={t("cfg.kw_input")}>
+              <CommaListInput
+                rows={3}
+                value={config.input_keywords}
+                onValueChange={(v) => set("input_keywords", v)}
+              />
+            </Field>
+            <Field label={t("cfg.kw_rate_limit")}>
+              <CommaListInput
+                rows={3}
+                value={config.rate_limit_keywords}
+                onValueChange={(v) => set("rate_limit_keywords", v)}
+              />
+            </Field>
+            <Field label={t("cfg.kw_error")}>
+              <CommaListInput
+                rows={3}
+                value={config.error_keywords}
+                onValueChange={(v) => set("error_keywords", v)}
+              />
+            </Field>
           </div>
         </div>
       </Section>
 
-      {/* Webhook 通知 */}
-      <Section title="Webhook" desc="中断/续跑事件推送到 Slack、Discord 或自定义端点">
-        <WebhookSection config={config} set={set} />
-      </Section>
+      <WebhookSection config={config} set={set} onNotice={show} />
+      <AiSection config={config} set={set} />
+      <RemoteSection config={config} set={set} />
+      <AdapterSection config={config} set={set} />
 
-      {/* AI 智能判断 */}
-      <Section title="AI Judge" desc="使用 LLM 分析 Agent 输出，减少误判">
-        <AiJudgeSection config={config} set={set} />
+      <Section title={t("cfg.system")} desc={t("cfg.system.desc")}>
+        <div className="space-y-1.5">
+          <ToggleRow
+            label={t("cfg.tray")}
+            desc={t("cfg.tray.desc")}
+            aside={<Badge tone="green">{t("cfg.on")}</Badge>}
+          />
+          <ToggleRow
+            label={t("cfg.autostart")}
+            desc={t("cfg.autostart.desc")}
+            aside={<Badge>{t("cfg.os_managed")}</Badge>}
+          />
+          <ToggleRow
+            label={t("cfg.language")}
+            desc={t("cfg.language.desc")}
+            aside={
+              <Select
+                className="w-28"
+                value={config.language}
+                options={LANGUAGES}
+                onValueChange={(v) => set("language", v)}
+              />
+            }
+          />
+        </div>
       </Section>
-
-      {/* 自定义适配器 */}
-      <Section title="Custom Adapters" desc="添加自定义 Agent 进程匹配规则">
-        <CustomAdapterSection config={config} set={set} />
-      </Section>
-
-      {/* 保存按钮 */}
-      <div className="flex justify-end pb-4">
-        <button
-          onClick={handleSave}
-          className={`rounded-lg px-6 py-2 text-xs font-medium transition-all active:scale-[0.98] ${
-            saved
-              ? "bg-emerald-600 text-white"
-              : "bg-neutral-900 text-white hover:bg-neutral-700"
-          }`}
-        >
-          {saved ? "Saved" : "Save Changes"}
-        </button>
+      {/* 保存条贴在底部：这一页很长，滚到哪儿都能存 */}
+      <div className="sticky bottom-0 -mx-1 flex items-center justify-end gap-3 border-t border-neutral-100 bg-white/90 px-1 py-3 backdrop-blur">
+        {notice && (
+          <span
+            className={cn(
+              "truncate text-[11px]",
+              notice.ok ? "text-emerald-600" : "text-red-500"
+            )}
+          >
+            {notice.message}
+          </span>
+        )}
+        <Button size="lg" variant="primary" disabled={saving} onClick={save}>
+          {t("common.save")}
+        </Button>
       </div>
     </div>
   );
 }
 
-/** 配置区块容器 */
+/** 配置分区：卡片 + 标题 + 说明，全站一个样子 */
 function Section({
   title,
   desc,
   children,
 }: {
-  title: string;
-  desc: string;
+  title: React.ReactNode;
+  desc?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-lg border border-neutral-200 bg-white p-5">
-      <div className="mb-4">
-        <h3 className="text-xs font-semibold text-neutral-800">{title}</h3>
-        <p className="mt-0.5 text-[10px] text-neutral-400">{desc}</p>
-      </div>
+    <Card>
+      <CardBody>
+        <CardHeader className="mb-4" title={title} desc={desc} />
+        {children}
+      </CardBody>
+    </Card>
+  );
+}
+
+/** 分区里的次级容器，用来放「开关打开后才出现」的一组字段 */
+function Nested({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="space-y-3 rounded-lg border border-neutral-100 bg-neutral-50/60 p-3">
       {children}
-    </section>
-  );
-}
-
-function NumberField({
-  label,
-  value,
-  min,
-  max,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  onChange: (v: number) => void;
-}) {
-  return (
-    <div>
-      <label className="mb-1.5 block text-[11px] font-medium text-neutral-500">
-        {label}
-      </label>
-      <input
-        type="number"
-        min={min}
-        max={max}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs tabular-nums text-neutral-700 outline-none transition-colors focus:border-neutral-400"
-      />
     </div>
   );
 }
+/** 提醒（v1.1 感知层的开关都在这里） */
+function NotifySection({
+  config,
+  set,
+  onNotice,
+}: SectionProps & { onNotice: (notice: Notice) => void }) {
+  const { t } = useI18n();
+  const testNotify = useAppStore((s) => s.testNotify);
+  const n = config.notification;
+  const setN = (partial: Partial<NotificationConfig>) => set("notification", { ...n, ...partial });
 
-function ToggleField({
-  label,
-  desc,
-  checked,
-  onChange,
-}: {
-  label: string;
-  desc: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
+  // 逐条写死而不是拿字段名拼，是为了让 TS 真的检查这些字段存在
+  const events = [
+    {
+      label: t("cfg.notify_needs_input"),
+      on: n.on_needs_input,
+      toggle: () => setN({ on_needs_input: !n.on_needs_input }),
+    },
+    {
+      label: t("cfg.notify_completed"),
+      on: n.on_completed,
+      toggle: () => setN({ on_completed: !n.on_completed }),
+    },
+    {
+      label: t("cfg.notify_rate_limited"),
+      on: n.on_rate_limited,
+      toggle: () => setN({ on_rate_limited: !n.on_rate_limited }),
+    },
+    {
+      label: t("cfg.notify_error"),
+      on: n.on_error,
+      toggle: () => setN({ on_error: !n.on_error }),
+    },
+    {
+      label: t("cfg.notify_resumed"),
+      on: n.on_resumed,
+      toggle: () => setN({ on_resumed: !n.on_resumed }),
+    },
+  ];
+
   return (
-    <div className="flex items-center justify-between rounded-lg border border-neutral-100 bg-neutral-50/50 px-4 py-3 transition-colors hover:bg-neutral-50">
-      <div>
-        <span className="text-xs font-medium text-neutral-700">{label}</span>
-        <p className="mt-0.5 text-[10px] text-neutral-400">{desc}</p>
-      </div>
-      <button
-        onClick={() => onChange(!checked)}
-        className={`relative h-5 w-9 shrink-0 rounded-full transition-colors duration-200 ${
-          checked ? "bg-neutral-900" : "bg-neutral-200"
-        }`}
-      >
-        <span
-          className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-            checked ? "translate-x-[18px]" : "translate-x-0.5"
-          }`}
+    <Section title={t("cfg.notify")} desc={t("cfg.notify.desc")}>
+      <div className="space-y-3">
+        <ToggleRow
+          label={t("cfg.notify_enabled")}
+          desc={t("cfg.notify_enabled.desc")}
+          checked={n.enabled}
+          onCheckedChange={(v) => setN({ enabled: v })}
         />
-      </button>
-    </div>
+        {n.enabled && (
+          <Nested>
+            <div className="flex flex-wrap gap-2">
+              {events.map((event) => (
+                <Chip key={event.label} active={event.on} onClick={event.toggle}>
+                  {event.label}
+                </Chip>
+              ))}
+            </div>
+            <ToggleRow
+              label={t("cfg.notify_sound")}
+              desc={t("cfg.notify_sound.desc")}
+              checked={n.sound_enabled}
+              onCheckedChange={(v) => setN({ sound_enabled: v })}
+            />
+            {n.sound_enabled && (
+              <Field label={t("cfg.notify_volume", { value: n.sound_volume })}>
+                <Slider
+                  value={n.sound_volume}
+                  min={0}
+                  max={100}
+                  onValueChange={(v) => setN({ sound_volume: v })}
+                />
+              </Field>
+            )}
+            <ToggleRow
+              label={t("cfg.notify_badge")}
+              desc={t("cfg.notify_badge.desc")}
+              checked={n.tray_badge}
+              onCheckedChange={(v) => setN({ tray_badge: v })}
+            />
+            <Field label={t("cfg.notify_throttle")}>
+              <NumberInput
+                value={n.throttle_secs}
+                min={0}
+                max={3600}
+                onValueChange={(v) => setN({ throttle_secs: v })}
+              />
+            </Field>
+            <Button
+              size="sm"
+              onClick={async () => {
+                const result = await testNotify();
+                if (result.message) onNotice(result);
+              }}
+            >
+              {t("cfg.notify_test")}
+            </Button>
+          </Nested>
+        )}
+      </div>
+    </Section>
+  );
+}
+/** 花费与预算（v1.2 洞察层） */
+function CostSection({ config, set }: SectionProps) {
+  const { t } = useI18n();
+  const c = config.cost;
+  const setC = (partial: Partial<CostConfig>) => set("cost", { ...c, ...partial });
+
+  return (
+    <Section title={t("cfg.cost")} desc={t("cfg.cost.desc")}>
+      <div className="space-y-3">
+        <ToggleRow
+          label={t("cfg.cost_enabled")}
+          desc={t("cfg.cost_enabled.desc")}
+          checked={c.enabled}
+          onCheckedChange={(v) => setC({ enabled: v })}
+        />
+        {c.enabled && (
+          <Nested>
+            <div className="grid grid-cols-2 gap-4">
+              <Field label={t("cfg.daily_budget")}>
+                <NumberInput
+                  value={c.daily_budget_usd}
+                  min={0}
+                  max={10_000}
+                  step={1}
+                  onValueChange={(v) => setC({ daily_budget_usd: v })}
+                />
+              </Field>
+              <Field label={t("cfg.session_budget")}>
+                <NumberInput
+                  value={c.session_budget_usd}
+                  min={0}
+                  max={1_000}
+                  step={0.5}
+                  onValueChange={(v) => setC({ session_budget_usd: v })}
+                />
+              </Field>
+              <Field label={t("cfg.alert_percent")}>
+                <NumberInput
+                  value={c.alert_at_percent}
+                  min={10}
+                  max={100}
+                  onValueChange={(v) => setC({ alert_at_percent: v })}
+                />
+              </Field>
+              <Field label={t("cfg.rate_window")}>
+                <NumberInput
+                  value={c.rate_limit_window_hours}
+                  min={1}
+                  max={24}
+                  onValueChange={(v) => setC({ rate_limit_window_hours: v })}
+                />
+              </Field>
+              <Field label={t("cfg.rate_budget")} className="col-span-2">
+                <NumberInput
+                  value={c.rate_limit_token_budget}
+                  min={0}
+                  step={100_000}
+                  onValueChange={(v) => setC({ rate_limit_token_budget: v })}
+                />
+              </Field>
+            </div>
+          </Nested>
+        )}
+      </div>
+    </Section>
   );
 }
 
-/** Webhook 配置区 */
+/** 各渠道的地址示例。URL 不是文案，两种语言下都长这样，所以不进 i18n 表 */
+const WEBHOOK_URL_HINT: Record<WebhookProvider, string> = {
+  slack: "https://hooks.slack.com/services/…",
+  discord: "https://discord.com/api/webhooks/…",
+  ntfy: "https://ntfy.sh",
+  bark: "https://api.day.app",
+  custom: "https://example.com/hook",
+};
+
+/** 外部推送（v1.3 P0：ntfy / Bark 让人在手机上也收得到） */
 function WebhookSection({
   config,
   set,
-}: {
-  config: AppConfig;
-  set: <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
-}) {
-  const { testWebhook } = useAppStore();
-  const [testResult, setTestResult] = useState<string | null>(null);
+  onNotice,
+}: SectionProps & { onNotice: (notice: Notice) => void }) {
+  const { t } = useI18n();
+  const testWebhook = useAppStore((s) => s.testWebhook);
   const wh = config.webhook;
+  const setWh = (partial: Partial<WebhookConfig>) => set("webhook", { ...wh, ...partial });
+  const [testing, setTesting] = useState(false);
 
-  const setWh = (partial: Partial<WebhookConfig>) => {
-    set("webhook", { ...wh, ...partial });
-  };
+  const providers: readonly SelectOption<WebhookProvider>[] = [
+    { value: "slack", label: "Slack" },
+    { value: "discord", label: "Discord" },
+    { value: "ntfy", label: "ntfy" },
+    { value: "bark", label: "Bark" },
+    { value: "custom", label: t("cfg.webhook_custom") },
+  ];
+  // 这两家是「主题 / 设备 Key + 服务器」的形式，其余只有一个完整 URL
+  const usesTopic = wh.provider === "ntfy" || wh.provider === "bark";
+
+  const events = [
+    {
+      label: t("cfg.webhook_on_interrupt"),
+      on: wh.notify_on_interrupt,
+      toggle: () => setWh({ notify_on_interrupt: !wh.notify_on_interrupt }),
+    },
+    {
+      label: t("cfg.webhook_on_resume"),
+      on: wh.notify_on_resume,
+      toggle: () => setWh({ notify_on_resume: !wh.notify_on_resume }),
+    },
+    {
+      label: t("cfg.webhook_on_complete"),
+      on: wh.notify_on_complete,
+      toggle: () => setWh({ notify_on_complete: !wh.notify_on_complete }),
+    },
+  ];
 
   return (
-    <div className="space-y-3">
-      <ToggleField
-        label="启用 Webhook"
-        desc="检测到中断/续跑时发送 HTTP 通知"
-        checked={wh.enabled}
-        onChange={(v) => setWh({ enabled: v })}
-      />
-      {wh.enabled && (
-        <div className="space-y-3 rounded-lg border border-neutral-100 bg-neutral-50/50 p-3">
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1 block text-[10px] font-medium text-neutral-400">
-                Webhook URL
-              </label>
-              <input
-                type="url"
-                placeholder="https://hooks.slack.com/..."
-                value={wh.url}
-                onChange={(e) => setWh({ url: e.target.value })}
-                className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none focus:border-neutral-400"
+    <Section title={t("cfg.webhook")} desc={t("cfg.webhook.desc")}>
+      <div className="space-y-3">
+        <ToggleRow
+          label={t("cfg.webhook_enabled")}
+          desc={t("cfg.webhook_enabled.desc")}
+          checked={wh.enabled}
+          onCheckedChange={(v) => setWh({ enabled: v })}
+        />
+        {wh.enabled && (
+          <Nested>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label={t("cfg.webhook_provider")}>
+                <Select
+                  value={wh.provider}
+                  options={providers}
+                  onValueChange={(v) => setWh({ provider: v })}
+                />
+              </Field>
+              <Field label={t("cfg.webhook_url")}>
+                <TextInput
+                  value={wh.url}
+                  placeholder={WEBHOOK_URL_HINT[wh.provider]}
+                  onChange={(e) => setWh({ url: e.target.value })}
+                />
+              </Field>
+            </div>
+            {usesTopic && (
+              <Field label={t("cfg.webhook_topic")} hint={t("cfg.webhook_topic.hint")}>
+                <TextInput
+                  value={wh.topic}
+                  onChange={(e) => setWh({ topic: e.target.value })}
+                />
+              </Field>
+            )}
+            <Field label={t("cfg.webhook_template")} hint={t("cfg.webhook_template.hint")}>
+              <TextArea
+                value={wh.template}
+                onChange={(e) => setWh({ template: e.target.value })}
               />
+            </Field>
+            <div className="flex flex-wrap gap-2">
+              {events.map((event) => (
+                <Chip key={event.label} active={event.on} onClick={event.toggle}>
+                  {event.label}
+                </Chip>
+              ))}
             </div>
-            <div>
-              <label className="mb-1 block text-[10px] font-medium text-neutral-400">
-                通知类型
-              </label>
-              <select
-                value={wh.provider}
-                onChange={(e) => setWh({ provider: e.target.value })}
-                className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-              >
-                <option value="slack">Slack</option>
-                <option value="discord">Discord</option>
-                <option value="custom">自定义</option>
-              </select>
-            </div>
-          </div>
-          <div>
-            <label className="mb-1 block text-[10px] font-medium text-neutral-400">
-              消息模板（支持 {'{agent_name}'} {'{session_id}'} {'{message}'}）
-            </label>
-            <textarea
-              rows={2}
-              value={wh.template}
-              onChange={(e) => setWh({ template: e.target.value })}
-              className="w-full resize-none rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-            />
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <NotifyToggle label="中断时通知" checked={wh.notify_on_interrupt} onChange={(v) => setWh({ notify_on_interrupt: v })} />
-            <NotifyToggle label="续跑时通知" checked={wh.notify_on_resume} onChange={(v) => setWh({ notify_on_resume: v })} />
-            <NotifyToggle label="完成时通知" checked={wh.notify_on_complete} onChange={(v) => setWh({ notify_on_complete: v })} />
-          </div>
-          <button
-            onClick={async () => {
-              const res = await testWebhook();
-              setTestResult(res);
-              setTimeout(() => setTestResult(null), 3000);
-            }}
-            className="rounded-md border border-neutral-200 px-3 py-1.5 text-[10px] font-medium text-neutral-600 transition-colors hover:bg-neutral-100"
-          >
-            Test Send
-          </button>
-          {testResult && (
-            <p className="text-[10px] text-neutral-400">{testResult}</p>
-          )}
-        </div>
-      )}
-    </div>
+            <Button
+              size="sm"
+              disabled={testing}
+              onClick={async () => {
+                setTesting(true);
+                const result = await testWebhook();
+                setTesting(false);
+                // 后端已经按当前语言给好文案，成功失败都原样显示
+                if (result.message) onNotice(result);
+              }}
+            >
+              {t("cfg.webhook_test")}
+            </Button>
+          </Nested>
+        )}
+      </div>
+    </Section>
   );
 }
-
-function NotifyToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      onClick={() => onChange(!checked)}
-      className={`rounded-full border px-2.5 py-1 text-[10px] font-medium transition-colors ${
-        checked
-          ? "border-emerald-200 bg-emerald-50 text-emerald-600"
-          : "border-neutral-200 bg-white text-neutral-400"
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-/** AI 智能判断配置区 */
-function AiJudgeSection({
-  config,
-  set,
-}: {
-  config: AppConfig;
-  set: <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
-}) {
+/** AI 辅助判断：关键词判不准时才调一次模型 */
+function AiSection({ config, set }: SectionProps) {
+  const { t } = useI18n();
   const ai = config.ai_judge;
-  const setAi = (partial: Partial<AiJudgeConfig>) => {
-    set("ai_judge", { ...ai, ...partial });
-  };
+  const setAi = (partial: Partial<AiJudgeConfig>) => set("ai_judge", { ...ai, ...partial });
 
   return (
-    <div className="space-y-3">
-      <ToggleField
-        label="启用 AI 辅助判断"
-        desc="使用 LLM 分析 Agent 输出，降低误判率（需配置 API Key）"
-        checked={ai.enabled}
-        onChange={(v) => setAi({ enabled: v })}
-      />
-      {ai.enabled && (
-        <div className="space-y-3 rounded-lg border border-neutral-100 bg-neutral-50/50 p-3">
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1 block text-[10px] font-medium text-neutral-400">API 端点</label>
-              <input
-                type="url"
-                value={ai.api_url}
-                onChange={(e) => setAi({ api_url: e.target.value })}
-                className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-              />
+    <Section title={t("cfg.ai")} desc={t("cfg.ai.desc")}>
+      <div className="space-y-3">
+        <ToggleRow
+          label={t("cfg.ai_enabled")}
+          desc={t("cfg.ai_enabled.desc")}
+          checked={ai.enabled}
+          onCheckedChange={(v) => setAi({ enabled: v })}
+        />
+        {ai.enabled && (
+          <Nested>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label={t("cfg.ai_endpoint")}>
+                <TextInput
+                  value={ai.api_url}
+                  onChange={(e) => setAi({ api_url: e.target.value })}
+                />
+              </Field>
+              <Field label={t("cfg.ai_model")}>
+                <TextInput value={ai.model} onChange={(e) => setAi({ model: e.target.value })} />
+              </Field>
             </div>
-            <div>
-              <label className="mb-1 block text-[10px] font-medium text-neutral-400">模型</label>
-              <input
-                value={ai.model}
-                onChange={(e) => setAi({ model: e.target.value })}
-                className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none focus:border-neutral-400"
+            {/* 密钥用 password 输入框，截图和录屏时不至于直接漏出去 */}
+            <Field label={t("cfg.ai_key")}>
+              <TextInput
+                type="password"
+                autoComplete="off"
+                value={ai.api_key}
+                placeholder="sk-…"
+                onChange={(e) => setAi({ api_key: e.target.value })}
               />
+            </Field>
+            <Field
+              label={t("cfg.ai_confidence", { value: ai.confidence_threshold })}
+              hint={t("cfg.ai_confidence.hint")}
+            >
+              <Slider
+                value={ai.confidence_threshold}
+                min={50}
+                max={99}
+                onValueChange={(v) => setAi({ confidence_threshold: v })}
+              />
+            </Field>
+          </Nested>
+        )}
+      </div>
+    </Section>
+  );
+}
+/**
+ * 手机看板（v1.3 P1）
+ *
+ * 默认只听 127.0.0.1，并且必须带令牌才返回数据。打开「允许局域网访问」
+ * 等于换成 0.0.0.0，同一网络里拿到令牌的人就能读你的会话——开关旁边的
+ * 说明文字把这件事写明白了，两种语言都写。
+ */
+function RemoteSection({ config, set }: SectionProps) {
+  const { t } = useI18n();
+  const r = config.remote;
+  const setR = (partial: Partial<RemoteConfig>) => set("remote", { ...r, ...partial });
+
+  return (
+    <Section title={t("cfg.remote")} desc={t("cfg.remote.desc")}>
+      <div className="space-y-3">
+        <ToggleRow
+          label={t("cfg.remote_enabled")}
+          desc={t("cfg.remote_enabled.desc")}
+          checked={r.enabled}
+          onCheckedChange={(v) => setR({ enabled: v })}
+        />
+        {r.enabled && (
+          <Nested>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label={t("cfg.remote_port")}>
+                <NumberInput
+                  value={r.port}
+                  min={1024}
+                  max={65_535}
+                  onValueChange={(v) => setR({ port: v })}
+                />
+              </Field>
+              <Field label={t("cfg.remote_token")} hint={t("cfg.remote_token.hint")}>
+                <TextInput
+                  type="password"
+                  autoComplete="off"
+                  value={r.token}
+                  onChange={(e) => setR({ token: e.target.value })}
+                />
+              </Field>
             </div>
-          </div>
-          <div>
-            <label className="mb-1 block text-[10px] font-medium text-neutral-400">API Key</label>
-            <input
-              type="password"
-              placeholder="sk-..."
-              value={ai.api_key}
-              onChange={(e) => setAi({ api_key: e.target.value })}
-              className="w-full rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-700 outline-none focus:border-neutral-400"
+            <ToggleRow
+              label={t("cfg.remote_bind_all")}
+              desc={t("cfg.remote_bind_all.desc")}
+              checked={r.bind_all}
+              onCheckedChange={(v) => setR({ bind_all: v })}
             />
-          </div>
-          <div>
-            <label className="mb-1 block text-[10px] font-medium text-neutral-400">
-              置信度阈值: {ai.confidence_threshold}%
-            </label>
-            <input
-              type="range"
-              min={50}
-              max={99}
-              value={ai.confidence_threshold}
-              onChange={(e) => setAi({ confidence_threshold: Number(e.target.value) })}
-              className="w-full accent-neutral-900"
-            />
-            <p className="mt-1 text-[10px] text-neutral-400">
-              AI 判断中断概率超过此值才触发续跑，越高越保守
-            </p>
-          </div>
-        </div>
-      )}
-    </div>
+            {/* 地址只显示不带令牌的部分：设置页是会被截图的，令牌走剪贴板 */}
+            <Field
+              label={t("cfg.remote_url")}
+              hint={r.bind_all ? t("cfg.remote_url.lan") : undefined}
+            >
+              <div className="flex items-center gap-2">
+                <p className="font-mono text-[11px] text-neutral-500">
+                  http://127.0.0.1:{r.port}/
+                </p>
+                {r.token && <CopyLink url={`http://127.0.0.1:${r.port}/?token=${r.token}`} />}
+              </div>
+            </Field>
+          </Nested>
+        )}
+      </div>
+    </Section>
+  );
+}
+/**
+ * 复制看板链接
+ *
+ * 链接里带令牌，所以只进剪贴板、不上屏：设置页截图发出去也不会连门钥匙一起送。
+ */
+function CopyLink({ url }: { url: string }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  return (
+    <Button
+      size="xs"
+      onClick={() => {
+        void navigator.clipboard?.writeText(url).then(() => setCopied(true));
+      }}
+    >
+      {copied ? t("common.copied") : t("cfg.remote_copy_link")}
+    </Button>
   );
 }
 
-/** 自定义适配器配置区 */
-function CustomAdapterSection({
-  config,
-  set,
-}: {
-  config: AppConfig;
-  set: <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
-}) {
+/** 自定义适配器：内置三家之外的 CLI 在这里加 */
+function AdapterSection({ config, set }: SectionProps) {
+  const { t } = useI18n();
   const adapters = config.custom_adapters;
 
-  const addAdapter = () => {
-    set("custom_adapters", [
-      ...adapters,
-      { name: "", process_pattern: "", session_file_pattern: "" },
-    ]);
-  };
-
-  const updateAdapter = (idx: number, partial: Partial<CustomAdapterConfig>) => {
-    const updated = adapters.map((a, i) => (i === idx ? { ...a, ...partial } : a));
-    set("custom_adapters", updated);
-  };
-
-  const removeAdapter = (idx: number) => {
-    set("custom_adapters", adapters.filter((_, i) => i !== idx));
-  };
+  const update = (index: number, partial: Partial<CustomAdapterConfig>) =>
+    set(
+      "custom_adapters",
+      adapters.map((adapter, i) => (i === index ? { ...adapter, ...partial } : adapter))
+    );
 
   return (
-    <div className="space-y-3">
-      {adapters.length === 0 && (
-        <p className="text-[11px] text-neutral-400">
-          暂无自定义适配器，内置支持 Claude Code / Codex CLI / OpenCode
-        </p>
-      )}
-      {adapters.map((adapter, idx) => (
-        <div key={idx} className="space-y-2 rounded-lg border border-neutral-100 bg-neutral-50/50 p-3">
-          <div className="flex items-center gap-2">
-            <input
-              placeholder="适配器名称"
-              value={adapter.name}
-              onChange={(e) => updateAdapter(idx, { name: e.target.value })}
-              className="flex-1 rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-            />
-            <button
-              onClick={() => removeAdapter(idx)}
-              className="rounded-md px-2 py-1.5 text-xs text-red-500 transition-colors hover:bg-red-50"
-            >
-              Remove
-            </button>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <input
-              placeholder="进程匹配（如 aider）"
-              value={adapter.process_pattern}
-              onChange={(e) => updateAdapter(idx, { process_pattern: e.target.value })}
-              className="rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-            />
-            <input
-              placeholder="会话文件路径模式（可选）"
-              value={adapter.session_file_pattern}
-              onChange={(e) => updateAdapter(idx, { session_file_pattern: e.target.value })}
-              className="rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-xs text-neutral-700 outline-none focus:border-neutral-400"
-            />
-          </div>
-        </div>
-      ))}
-      <button
-        onClick={addAdapter}
-        className="w-full rounded-lg border border-dashed border-neutral-200 py-2 text-[11px] text-neutral-400 transition-colors hover:border-neutral-400 hover:text-neutral-600"
-      >
-        + Add Adapter
-      </button>
-    </div>
+    <Section title={t("cfg.adapters")} desc={t("cfg.adapters.desc")}>
+      <div className="space-y-3">
+        {adapters.length === 0 ? (
+          <EmptyState className="py-6" title={t("cfg.adapters.empty")} />
+        ) : (
+          adapters.map((adapter, index) => (
+            // 用下标当 key 没问题：输入框的值全部来自 config，自己不存 state，
+            // 删掉中间一行也不会把内容串到别的行上
+            <Nested key={index}>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <Field label={t("cfg.adapter_name")}>
+                  <TextInput
+                    value={adapter.name}
+                    onChange={(e) => update(index, { name: e.target.value })}
+                  />
+                </Field>
+                <Field label={t("cfg.adapter_process")}>
+                  <TextInput
+                    value={adapter.process_pattern}
+                    onChange={(e) => update(index, { process_pattern: e.target.value })}
+                  />
+                </Field>
+              </div>
+              <Field label={t("cfg.adapter_session")}>
+                <TextInput
+                  value={adapter.session_file_pattern}
+                  onChange={(e) => update(index, { session_file_pattern: e.target.value })}
+                />
+              </Field>
+              <div className="flex justify-end">
+                <Button
+                  size="xs"
+                  variant="danger"
+                  onClick={() =>
+                    set(
+                      "custom_adapters",
+                      adapters.filter((_, i) => i !== index)
+                    )
+                  }
+                >
+                  {t("common.remove")}
+                </Button>
+              </div>
+            </Nested>
+          ))
+        )}
+        <Button
+          className="w-full border-dashed"
+          onClick={() =>
+            set("custom_adapters", [
+              ...adapters,
+              { name: "", process_pattern: "", session_file_pattern: "" },
+            ])
+          }
+        >
+          {t("cfg.adapter_add")}
+        </Button>
+      </div>
+    </Section>
   );
 }
