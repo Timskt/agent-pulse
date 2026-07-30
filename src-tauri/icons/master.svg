@@ -1,0 +1,35 @@
+<!--
+  AgentPulse 图标母版（1024×1024，满幅）
+
+  这份 SVG 是所有位图图标的唯一来源：`.png` / `.icns` / `.ico` 全部由它渲染，
+  改图标只改这里，再跑 `scripts/gen-icons.sh` 重出一套。
+  旧图标的毛边就是因为手上最大的资源只有 256px，缩放全靠位图重采样。
+
+  两条硬约束：
+  1. 16px 下要还认得出来 —— 所以只有一条粗折线，没有细节、没有文字。
+  2. 颜色跟界面同源 —— 蓝色取自 tailwind 里的 `pulse` 色阶（#338eff / #1b6ef5），
+     不再用界面上根本不存在的紫色。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5aa9ff"/>
+      <stop offset="0.55" stop-color="#2f83f5"/>
+      <stop offset="1" stop-color="#1449c8"/>
+    </linearGradient>
+    <!-- 左上一点柔光，避免大尺寸下像一块死板的色卡 -->
+    <radialGradient id="sheen" cx="0.28" cy="0.2" r="0.75">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 圆角方块：rx 取 224（21.9%），跟 macOS/Windows 现在的图标语言一致 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#sheen)"/>
+
+  <!-- 心跳折线：AgentPulse 的「pulse」。stroke 80 在 16px 下还剩 1.25px，不会糊掉 -->
+  <path d="M 160 512 H 330 L 420 330 L 556 706 L 640 512 H 864"
+        fill="none" stroke="#ffffff" stroke-width="80"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

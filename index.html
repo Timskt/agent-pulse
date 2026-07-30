@@ -1,12 +1,16 @@
 <!doctype html>
-<html lang="zh-CN" class="dark">
+<!--
+  首屏底色写死成 #fafafa：界面早就换成浅色了，这里以前还留着 `class="dark"`
+  和 `bg-gray-950`，于是 React 挂载前会先闪一下深色，且底部露白的地方是黑的。
+-->
+<html lang="zh-CN" style="background: #fafafa">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AgentPulse - AI Agent 守护工具</title>
   </head>
-  <body class="bg-gray-950 text-gray-100">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

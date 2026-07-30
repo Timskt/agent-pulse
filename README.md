@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="112" alt="AgentPulse">
+</p>
+
 # AgentPulse ⚡
 
 **AI Coding Agent 守护与自动续跑工具** — 跨平台监控 Claude Code / Codex CLI 等 AI 编程助手的会话状态，自动检测中断并发送续跑指令，无需人工干预。
@@ -17,7 +21,9 @@
 
 - **多策略检测引擎** — 进程状态 + 会话文件监听 + 关键词匹配 + 心跳超时，多信号融合判定
 - **智能双重校验** — 中断信号存在 AND 完成标记不存在，才触发续跑，防止重复执行
-- **跨平台续跑** — macOS AppleScript 直发终端 (iTerm2/Terminal/VS Code/Cursor)
+- **跨平台静默续跑** — macOS (AppleScript) / Windows (PowerShell + Win32) / Linux (xdotool·ydotool)，覆盖 iTerm2、Terminal、Windows Terminal、cmd·conhost，以及 VS Code / Cursor / Windsurf / JetBrains 全家桶里的内置终端
+- **提示词走剪贴板，不走合成按键** — 中文提示词经系统剪贴板 + 一次 ASCII 粘贴键投递，绕开输入法，不会再打出「啊啊啊啊」这类拼音残留
+- **定位不到就不敲** — 认不出会话属于哪个窗口时宁可放弃续跑，也不往别人的窗口里回车（想要兜底可在设置里打开「跟随最新会话」）
 - **插件式适配器** — Claude Code / Codex CLI，可扩展支持更多 Agent
 - **安全机制** — 最大续跑次数限制、冷却时间、手动/自动模式切换
 - **实时可观测** — 结构化日志流、状态面板、事件时间线

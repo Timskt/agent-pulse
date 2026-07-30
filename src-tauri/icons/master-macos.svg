@@ -1,0 +1,28 @@
+<!--
+  AgentPulse 图标母版 · macOS 版（1024×1024，内容 824×824）
+
+  跟 `master.svg` 是同一张图，只是按苹果的图标网格把内容缩到 824 并居中：
+  macOS 的 Dock 会把图标画满给定框，满幅的方块摆在一排系统图标里会明显偏大。
+  Windows / Linux 用满幅那份。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="100" y1="100" x2="924" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5aa9ff"/>
+      <stop offset="0.55" stop-color="#2f83f5"/>
+      <stop offset="1" stop-color="#1449c8"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.28" cy="0.2" r="0.75">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <g transform="translate(100 100) scale(0.8046875)">
+    <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#sheen)"/>
+    <path d="M 160 512 H 330 L 420 330 L 556 706 L 640 512 H 864"
+          fill="none" stroke="#ffffff" stroke-width="80"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
