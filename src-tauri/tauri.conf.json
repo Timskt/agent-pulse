@@ -35,5 +35,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Timskt/agent-pulse/releases/latest/download/latest.json"
+      ],
+      "dialog": false
+    }
   }
 }
