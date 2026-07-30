@@ -1,25 +1,41 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AppConfig, EngineEvent, MonitorState } from "../types";
+import type {
+  AppConfig,
+  EngineEvent,
+  MonitorState,
+  DailyStats,
+  ResumeRecord,
+  AiVerdict,
+} from "../types";
+
+export type TabId = "dashboard" | "stats" | "config";
 
 interface AppStore {
   // 状态
   monitorState: MonitorState;
   config: AppConfig | null;
   localEvents: EngineEvent[];
-  activeTab: "dashboard" | "config";
+  activeTab: TabId;
   loading: boolean;
+  // 统计数据
+  dailyStats: DailyStats[];
+  resumeHistory: ResumeRecord[];
+  totals: [number, number, number] | null;
 
   // 动作
-  setActiveTab: (tab: "dashboard" | "config") => void;
+  setActiveTab: (tab: TabId) => void;
   fetchState: () => Promise<void>;
   fetchConfig: () => Promise<void>;
+  fetchStats: () => Promise<void>;
   startMonitoring: () => Promise<void>;
   stopMonitoring: () => Promise<void>;
   scanNow: () => Promise<void>;
   updateConfig: (config: AppConfig) => Promise<void>;
-  manualResume: (sessionId: string) => Promise<void>;
+  manualResume: (sessionId: string, useGoalPrompt?: boolean) => Promise<void>;
+  testWebhook: () => Promise<string>;
+  aiAnalyze: (sessionId: string) => Promise<AiVerdict>;
   initEventListeners: () => Promise<() => void>;
 }
 
@@ -45,6 +61,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   localEvents: [],
   activeTab: "dashboard",
   loading: false,
+  dailyStats: [],
+  resumeHistory: [],
+  totals: null,
 
   setActiveTab: (tab) => set({ activeTab: tab }),
 
@@ -63,6 +82,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
       set({ config });
     } catch (e) {
       console.error("获取配置失败:", e);
+    }
+  },
+
+  fetchStats: async () => {
+    try {
+      const [dailyStats, resumeHistory, totals] = await Promise.all([
+        invoke<DailyStats[]>("get_stats", { days: 30 }),
+        invoke<ResumeRecord[]>("get_resume_history", { limit: 50 }),
+        invoke<[number, number, number]>("get_totals"),
+      ]);
+      set({ dailyStats, resumeHistory, totals });
+    } catch (e) {
+      console.error("获取统计失败:", e);
     }
   },
 
@@ -111,13 +143,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  manualResume: async (sessionId) => {
+  manualResume: async (sessionId, useGoalPrompt = false) => {
     try {
-      await invoke("manual_resume", { sessionId });
+      await invoke("manual_resume", { sessionId, useGoalPrompt });
       await get().fetchState();
     } catch (e) {
       console.error("手动续跑失败:", e);
     }
+  },
+
+  testWebhook: async () => {
+    try {
+      return await invoke<string>("test_webhook");
+    } catch (e) {
+      return `错误: ${e}`;
+    }
+  },
+
+  aiAnalyze: async (sessionId) => {
+    return await invoke<AiVerdict>("ai_analyze", { sessionId });
   },
 
   initEventListeners: async () => {

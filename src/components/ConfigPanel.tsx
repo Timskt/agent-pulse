@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useAppStore } from "../stores/useAppStore";
-import type { AppConfig } from "../types";
+import type { AppConfig, WebhookConfig, AiJudgeConfig, CustomAdapterConfig } from "../types";
 
 /** 配置面板 */
 export function ConfigPanel() {
@@ -100,7 +100,7 @@ export function ConfigPanel() {
       </Section>
 
       {/* 系统设置 */}
-      <Section title="系统设置" icon="🖥️" desc="系统托盘与开机自启">
+      <Section title="系统设置" icon="🖥️" desc="系统托盘、开机自启与语言">
         <div className="space-y-2.5">
           <div className="flex items-center justify-between rounded-lg border border-gray-800/50 bg-gray-800/30 px-4 py-3">
             <div>
@@ -126,14 +126,19 @@ export function ConfigPanel() {
           </div>
           <div className="flex items-center justify-between rounded-lg border border-gray-800/50 bg-gray-800/30 px-4 py-3">
             <div>
-              <span className="text-sm font-medium text-gray-200">跨平台续跑</span>
+              <span className="text-sm font-medium text-gray-200">界面语言</span>
               <p className="mt-0.5 text-[10px] text-gray-500">
-                macOS (AppleScript) · Windows (PowerShell) · Linux (xdotool)
+                切换应用界面显示语言
               </p>
             </div>
-            <span className="rounded-full bg-purple-400/10 px-2.5 py-1 text-[10px] font-medium text-purple-400">
-              v0.2.0 新增
-            </span>
+            <select
+              value={config.language}
+              onChange={(e) => set("language", e.target.value)}
+              className="rounded-lg border border-gray-700/60 bg-gray-800/80 px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500/60"
+            >
+              <option value="zh">🇨🇳 中文</option>
+              <option value="en">🇺🇸 English</option>
+            </select>
           </div>
         </div>
       </Section>
@@ -245,6 +250,21 @@ export function ConfigPanel() {
         </div>
       </Section>
 
+      {/* Webhook 通知 */}
+      <Section title="Webhook 通知" icon="🔔" desc="中断/续跑事件推送到 Slack、Discord 或自定义端点">
+        <WebhookSection config={config} set={set} />
+      </Section>
+
+      {/* AI 智能判断 */}
+      <Section title="AI 智能判断" icon="🧠" desc="使用 LLM 分析 Agent 输出，减少误判">
+        <AiJudgeSection config={config} set={set} />
+      </Section>
+
+      {/* 自定义适配器 */}
+      <Section title="自定义适配器" icon="🔌" desc="添加自定义 Agent 进程匹配规则">
+        <CustomAdapterSection config={config} set={set} />
+      </Section>
+
       {/* 保存按钮 */}
       <div className="flex justify-end pb-4">
         <button
@@ -350,6 +370,255 @@ function ToggleField({
             checked ? "translate-x-[22px]" : "translate-x-0.5"
           }`}
         />
+      </button>
+    </div>
+  );
+}
+
+/** Webhook 配置区 */
+function WebhookSection({
+  config,
+  set,
+}: {
+  config: AppConfig;
+  set: <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
+}) {
+  const { testWebhook } = useAppStore();
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const wh = config.webhook;
+
+  const setWh = (partial: Partial<WebhookConfig>) => {
+    set("webhook", { ...wh, ...partial });
+  };
+
+  return (
+    <div className="space-y-3">
+      <ToggleField
+        label="启用 Webhook"
+        desc="检测到中断/续跑时发送 HTTP 通知"
+        checked={wh.enabled}
+        onChange={(v) => setWh({ enabled: v })}
+      />
+      {wh.enabled && (
+        <div className="space-y-3 rounded-lg border border-gray-800/40 bg-gray-800/20 p-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-[10px] font-medium text-gray-500">Webhook URL</label>
+              <input
+                type="url"
+                placeholder="https://hooks.slack.com/..."
+                value={wh.url}
+                onChange={(e) => setWh({ url: e.target.value })}
+                className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2 text-xs text-gray-200 outline-none focus:border-indigo-500/60"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-[10px] font-medium text-gray-500">通知类型</label>
+              <select
+                value={wh.provider}
+                onChange={(e) => setWh({ provider: e.target.value })}
+                className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2 text-xs text-gray-200 outline-none focus:border-indigo-500/60"
+              >
+                <option value="slack">Slack</option>
+                <option value="discord">Discord</option>
+                <option value="custom">自定义</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-medium text-gray-500">
+              消息模板（支持 {'{agent_name}'} {'{session_id}'} {'{message}'}）
+            </label>
+            <textarea
+              rows={2}
+              value={wh.template}
+              onChange={(e) => setWh({ template: e.target.value })}
+              className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2 text-xs text-gray-200 outline-none focus:border-indigo-500/60 resize-none"
+            />
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <NotifyToggle label="中断时通知" checked={wh.notify_on_interrupt} onChange={(v) => setWh({ notify_on_interrupt: v })} />
+            <NotifyToggle label="续跑时通知" checked={wh.notify_on_resume} onChange={(v) => setWh({ notify_on_resume: v })} />
+            <NotifyToggle label="完成时通知" checked={wh.notify_on_complete} onChange={(v) => setWh({ notify_on_complete: v })} />
+          </div>
+          <button
+            onClick={async () => {
+              const res = await testWebhook();
+              setTestResult(res);
+              setTimeout(() => setTestResult(null), 3000);
+            }}
+            className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-1.5 text-[10px] font-medium text-indigo-400 transition-colors hover:bg-indigo-500/20"
+          >
+            📤 测试发送
+          </button>
+          {testResult && (
+            <p className="text-[10px] text-gray-400">{testResult}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotifyToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      onClick={() => onChange(!checked)}
+      className={`rounded-full px-2.5 py-1 text-[10px] font-medium transition-all ${
+        checked
+          ? "bg-emerald-400/10 text-emerald-400 border border-emerald-400/30"
+          : "bg-gray-800/60 text-gray-500 border border-gray-700/50"
+      }`}
+    >
+      {checked ? "✓ " : ""}{label}
+    </button>
+  );
+}
+
+/** AI 智能判断配置区 */
+function AiJudgeSection({
+  config,
+  set,
+}: {
+  config: AppConfig;
+  set: <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
+}) {
+  const ai = config.ai_judge;
+  const setAi = (partial: Partial<AiJudgeConfig>) => {
+    set("ai_judge", { ...ai, ...partial });
+  };
+
+  return (
+    <div className="space-y-3">
+      <ToggleField
+        label="启用 AI 辅助判断"
+        desc="使用 LLM 分析 Agent 输出，降低误判率（需配置 API Key）"
+        checked={ai.enabled}
+        onChange={(v) => setAi({ enabled: v })}
+      />
+      {ai.enabled && (
+        <div className="space-y-3 rounded-lg border border-purple-500/20 bg-purple-500/5 p-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-[10px] font-medium text-gray-500">API 端点</label>
+              <input
+                type="url"
+                value={ai.api_url}
+                onChange={(e) => setAi({ api_url: e.target.value })}
+                className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2 text-xs text-gray-200 outline-none focus:border-purple-500/60"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-[10px] font-medium text-gray-500">模型</label>
+              <input
+                value={ai.model}
+                onChange={(e) => setAi({ model: e.target.value })}
+                className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2 text-xs text-gray-200 outline-none focus:border-purple-500/60"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-medium text-gray-500">API Key</label>
+            <input
+              type="password"
+              placeholder="sk-..."
+              value={ai.api_key}
+              onChange={(e) => setAi({ api_key: e.target.value })}
+              className="w-full rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-2 text-xs text-gray-200 outline-none focus:border-purple-500/60"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-[10px] font-medium text-gray-500">
+              置信度阈值: {ai.confidence_threshold}%
+            </label>
+            <input
+              type="range"
+              min={50}
+              max={99}
+              value={ai.confidence_threshold}
+              onChange={(e) => setAi({ confidence_threshold: Number(e.target.value) })}
+              className="w-full accent-purple-500"
+            />
+            <p className="mt-1 text-[10px] text-gray-600">
+              AI 判断中断概率超过此值才触发续跑，越高越保守
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 自定义适配器配置区 */
+function CustomAdapterSection({
+  config,
+  set,
+}: {
+  config: AppConfig;
+  set: <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => void;
+}) {
+  const adapters = config.custom_adapters;
+
+  const addAdapter = () => {
+    set("custom_adapters", [
+      ...adapters,
+      { name: "", process_pattern: "", session_file_pattern: "" },
+    ]);
+  };
+
+  const updateAdapter = (idx: number, partial: Partial<CustomAdapterConfig>) => {
+    const updated = adapters.map((a, i) => (i === idx ? { ...a, ...partial } : a));
+    set("custom_adapters", updated);
+  };
+
+  const removeAdapter = (idx: number) => {
+    set("custom_adapters", adapters.filter((_, i) => i !== idx));
+  };
+
+  return (
+    <div className="space-y-3">
+      {adapters.length === 0 && (
+        <p className="text-xs text-gray-600">
+          暂无自定义适配器，内置支持 Claude Code / Codex CLI / OpenCode
+        </p>
+      )}
+      {adapters.map((adapter, idx) => (
+        <div key={idx} className="rounded-lg border border-gray-800/40 bg-gray-800/20 p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <input
+              placeholder="适配器名称"
+              value={adapter.name}
+              onChange={(e) => updateAdapter(idx, { name: e.target.value })}
+              className="flex-1 rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500/60"
+            />
+            <button
+              onClick={() => removeAdapter(idx)}
+              className="rounded-lg px-2 py-1.5 text-xs text-red-400 transition-colors hover:bg-red-400/10"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <input
+              placeholder="进程匹配（如 aider）"
+              value={adapter.process_pattern}
+              onChange={(e) => updateAdapter(idx, { process_pattern: e.target.value })}
+              className="rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500/60"
+            />
+            <input
+              placeholder="会话文件路径模式（可选）"
+              value={adapter.session_file_pattern}
+              onChange={(e) => updateAdapter(idx, { session_file_pattern: e.target.value })}
+              className="rounded-lg border border-gray-700/60 bg-gray-800/60 px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500/60"
+            />
+          </div>
+        </div>
+      ))}
+      <button
+        onClick={addAdapter}
+        className="w-full rounded-lg border border-dashed border-gray-700/60 py-2 text-xs text-gray-500 transition-colors hover:border-indigo-500/40 hover:text-indigo-400"
+      >
+        + 添加自定义适配器
       </button>
     </div>
   );

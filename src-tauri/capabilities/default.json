@@ -6,6 +6,7 @@
     "core:default",
     "shell:allow-open",
     "notification:default",
-    "autostart:default"
+    "autostart:default",
+    "updater:default"
   ]
 }

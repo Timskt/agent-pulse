@@ -4,6 +4,7 @@ import { StatusCards } from "./components/StatusCards";
 import { SessionList } from "./components/SessionList";
 import { LogPanel } from "./components/LogPanel";
 import { ConfigPanel } from "./components/ConfigPanel";
+import { StatsPanel } from "./components/StatsPanel";
 
 export default function App() {
   const {
@@ -61,6 +62,7 @@ export default function App() {
           {(
             [
               ["dashboard", "监控面板", "📡"],
+              ["stats", "统计分析", "📊"],
               ["config", "配置", "⚙️"],
             ] as const
           ).map(([tab, label, icon]) => (
@@ -136,6 +138,10 @@ export default function App() {
             {/* 日志面板 */}
             <LogPanel />
           </div>
+        ) : activeTab === "stats" ? (
+          <div className="animate-fade-in-up">
+            <StatsPanel />
+          </div>
         ) : (
           <div className="animate-fade-in-up">
             <ConfigPanel />
@@ -148,9 +154,9 @@ export default function App() {
         <div className="flex items-center gap-2">
           <span className="font-medium text-gray-500">AgentPulse</span>
           <span className="rounded bg-gray-800/80 px-1.5 py-0.5 font-mono text-[9px] text-gray-400">
-            v0.2.0
+            v1.0.0
           </span>
-          <span>跨平台</span>
+          <span>跨平台 · AI 智能判断</span>
         </div>
         <div className="flex items-center gap-3">
           {monitorState.running ? (
