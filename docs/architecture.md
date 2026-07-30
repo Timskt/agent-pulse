@@ -135,7 +135,7 @@ JSON 文件持久化配置，位于平台标准配置目录：
 
 ## 版本规划
 
-- **v0.1.0**: 核心引擎 + Claude Code 适配器 + macOS 续跑 + Dashboard UI
+- **v0.1.0** ✅: 核心引擎 + Claude Code 适配器 + macOS 续跑 + Dashboard UI
 - **v0.2.0** ✅: Windows/Linux 续跑 + 系统托盘常驻 + 开机自启 + Goal 智能恢复
-- **v0.3.0**: SQLite 统计持久化 + Webhook 通知 + 自定义适配器 UI
-- **v1.0.0**: AI 智能判断（LLM 分析是否真中断）+ i18n + 自动更新
+- **v0.3.0** ✅: SQLite 统计持久化 + Webhook 通知 + 自定义适配器 UI
+- **v1.0.0** ✅: AI 智能判断（LLM 分析是否真中断）+ i18n + 自动更新 + 统计面板

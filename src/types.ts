@@ -49,6 +49,32 @@ export interface MonitorState {
   status: EngineStatus;
 }
 
+// ===== v0.3.0 / v1.0.0 新增类型 =====
+
+export interface WebhookConfig {
+  enabled: boolean;
+  url: string;
+  provider: string;
+  template: string;
+  notify_on_interrupt: boolean;
+  notify_on_resume: boolean;
+  notify_on_complete: boolean;
+}
+
+export interface AiJudgeConfig {
+  enabled: boolean;
+  api_url: string;
+  api_key: string;
+  model: string;
+  confidence_threshold: number;
+}
+
+export interface CustomAdapterConfig {
+  name: string;
+  process_pattern: string;
+  session_file_pattern: string;
+}
+
 export interface AppConfig {
   poll_interval_secs: number;
   idle_timeout_secs: number;
@@ -65,6 +91,39 @@ export interface AppConfig {
   goal_keywords: string[];
   auto_resume_enabled: boolean;
   enabled_adapters: string[];
+  webhook: WebhookConfig;
+  ai_judge: AiJudgeConfig;
+  language: string;
+  custom_adapters: CustomAdapterConfig[];
+}
+
+// ===== 统计类型 =====
+
+export interface DailyStats {
+  date: string;
+  total_scans: number;
+  total_detections: number;
+  total_resumes: number;
+  successful_resumes: number;
+  failed_resumes: number;
+}
+
+export interface ResumeRecord {
+  id: number;
+  session_id: string;
+  agent_name: string;
+  working_dir: string;
+  prompt_type: string;
+  success: boolean;
+  message: string;
+  created_at: string;
+}
+
+export interface AiVerdict {
+  is_interrupted: boolean;
+  confidence: number;
+  reasoning: string;
+  suggested_prompt: string | null;
 }
 
 export const STATUS_LABELS: Record<SessionStatus, string> = {

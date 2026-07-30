@@ -2,13 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use crate::webhook::WebhookConfig;
+use crate::ai_judge::AiJudgeConfig;
+
+/// 自定义适配器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomAdapterConfig {
+    /// 适配器名称
+    pub name: String,
+    /// 进程匹配关键词
+    pub process_pattern: String,
+    /// 会话文件路径模式（可选）
+    pub session_file_pattern: String,
+}
 
 /// 应用全局配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// 轮询间隔（秒）
     pub poll_interval_secs: u64,
-    /// 无活动超时判定（秒），超过此时间无输出视为疑似中断
+    /// 无活动超时判定（秒）
     pub idle_timeout_secs: u64,
     /// 连续多少次无活动判定为中断
     pub idle_threshold: u32,
@@ -22,20 +35,36 @@ pub struct AppConfig {
     pub auto_follow_latest: bool,
     /// 是否启用心跳日志
     pub heartbeat_log: bool,
-    /// 自定义触发关键词（多个用逗号分隔）
+    /// 自定义触发关键词
     pub custom_keywords: Vec<String>,
-    /// 完成标记列表（出现则不触发续跑）
+    /// 完成标记列表
     pub completion_markers: Vec<String>,
     /// 续跑提示词（通用）
     pub resume_prompt: String,
-    /// Goal 恢复专用提示词（检测到活跃 goal 时使用）
+    /// Goal 恢复专用提示词
     pub goal_resume_prompt: String,
-    /// Goal 相关关键词（检测到这些词表示有活跃 goal 需要恢复）
+    /// Goal 相关关键词
     pub goal_keywords: Vec<String>,
-    /// 是否启用自动续跑（关闭则仅通知）
+    /// 是否启用自动续跑
     pub auto_resume_enabled: bool,
     /// 监控的 agent 类型
     pub enabled_adapters: Vec<String>,
+    /// Webhook 通知配置
+    #[serde(default)]
+    pub webhook: WebhookConfig,
+    /// AI 智能判断配置
+    #[serde(default)]
+    pub ai_judge: AiJudgeConfig,
+    /// 界面语言 ("zh" | "en")
+    #[serde(default = "default_lang")]
+    pub language: String,
+    /// 自定义适配器列表
+    #[serde(default)]
+    pub custom_adapters: Vec<CustomAdapterConfig>,
+}
+
+fn default_lang() -> String {
+    "zh".to_string()
 }
 
 impl Default for AppConfig {
@@ -77,6 +106,10 @@ impl Default for AppConfig {
             ],
             auto_resume_enabled: true,
             enabled_adapters: vec!["claude-code".to_string(), "codex".to_string(), "opencode".to_string()],
+            webhook: WebhookConfig::default(),
+            ai_judge: AiJudgeConfig::default(),
+            language: "zh".to_string(),
+            custom_adapters: vec![],
         }
     }
 }

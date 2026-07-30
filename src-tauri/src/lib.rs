@@ -1,9 +1,13 @@
 pub mod adapters;
+pub mod ai_judge;
 pub mod config;
 pub mod detector;
+pub mod i18n;
 pub mod monitor;
 pub mod notify;
 pub mod resumer;
+pub mod storage;
+pub mod webhook;
 
 use config::{AppConfig, ConfigManager};
 use monitor::{EngineEvent, EngineStatus, LogLevel, MonitorEngine, MonitorState};
@@ -16,6 +20,7 @@ use tauri::menu::{Menu, MenuItem};
 pub struct AppState {
     pub engine: Arc<MonitorEngine>,
     pub config_manager: ConfigManager,
+    pub storage: storage::Storage,
 }
 
 // ==================== Tauri Commands ====================
@@ -152,6 +157,58 @@ async fn get_platform_info() -> Result<String, String> {
     Ok(format!("{} ({})", os, arch))
 }
 
+/// 获取统计数据
+#[tauri::command]
+async fn get_stats(state: State<'_, AppState>, days: Option<u32>) -> Result<Vec<storage::DailyStats>, String> {
+    Ok(state.storage.get_stats(days.unwrap_or(30)))
+}
+
+/// 获取最近续跑记录
+#[tauri::command]
+async fn get_resume_history(state: State<'_, AppState>, limit: Option<u32>) -> Result<Vec<storage::ResumeRecord>, String> {
+    Ok(state.storage.get_recent_resumes(limit.unwrap_or(50)))
+}
+
+/// 获取总体统计
+#[tauri::command]
+async fn get_totals(state: State<'_, AppState>) -> Result<(u32, u32, u32), String> {
+    Ok(state.storage.get_totals())
+}
+
+/// 测试 Webhook 连接
+#[tauri::command]
+async fn test_webhook(state: State<'_, AppState>) -> Result<String, String> {
+    let config = state.config_manager.get();
+    let notifier = webhook::WebhookNotifier::new(config.webhook);
+    notifier.test().await
+}
+
+/// AI 分析指定会话
+#[tauri::command]
+async fn ai_analyze(state: State<'_, AppState>, session_id: String) -> Result<ai_judge::AiVerdict, String> {
+    let config = state.config_manager.get();
+    let judge = ai_judge::AiJudge::new(config.ai_judge);
+
+    let session = {
+        let s = state.engine.state.lock().await;
+        s.sessions.iter().find(|sess| sess.id == session_id).cloned()
+            .ok_or_else(|| format!("未找到会话: {session_id}"))?
+    };
+
+    // 获取最近输出
+    let output = session.command.clone(); // 简化：使用 command 作为上下文
+    judge.analyze(&session.agent_name, &output).await
+}
+
+/// 获取 i18n 翻译
+#[tauri::command]
+async fn get_translations(state: State<'_, AppState>) -> Result<std::collections::HashMap<&'static str, &'static str>, String> {
+    let config = state.config_manager.get();
+    let lang = i18n::Lang::from_code(&config.language);
+    let i18n = i18n::I18n::new(lang);
+    Ok(i18n.all())
+}
+
 // 为 MonitorEngine 添加公开的事件推送方法
 impl MonitorEngine {
     pub async fn push_event_public(&self, event: EngineEvent) {
@@ -181,9 +238,11 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             engine: engine.clone(),
             config_manager,
+            storage: storage::Storage::new(),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -196,6 +255,12 @@ pub fn run() {
             manual_resume,
             test_notify,
             get_platform_info,
+            get_stats,
+            get_resume_history,
+            get_totals,
+            test_webhook,
+            ai_analyze,
+            get_translations,
         ])
         .setup(move |app| {
             // ===== 系统托盘 =====
