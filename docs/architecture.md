@@ -60,9 +60,9 @@ AgentPulse 是一个跨平台桌面应用，用于监控 AI Coding Agent（Claud
 ### 3. Resumer (`src-tauri/src/resumer/`)
 
 平台适配的续跑执行器：
-- **macOS (v0.1.0)**: 通过进程父子关系识别终端应用（iTerm2/Terminal/VS Code/Cursor），使用 AppleScript 发送续跑 prompt
-- **Windows (v0.2.0)**: SendInput API / PowerShell SendKeys
-- **Linux (v0.2.0)**: xdotool / ydotool
+- **macOS**: 通过进程父子关系识别终端应用（iTerm2/Terminal/VS Code/Cursor/Warp），使用 AppleScript + TTY 精确匹配发送续跑 prompt
+- **Windows**: PowerShell + Win32 API（SetForegroundWindow + SendKeys），通过 PID 定位控制台窗口
+- **Linux**: xdotool（X11）通过 /proc/PID/stat 遍历父进程查找窗口，Wayland 回退到 ydotool
 
 安全机制：
 - `max_resume_count`: 单会话最大续跑次数
@@ -136,6 +136,6 @@ JSON 文件持久化配置，位于平台标准配置目录：
 ## 版本规划
 
 - **v0.1.0**: 核心引擎 + Claude Code 适配器 + macOS 续跑 + Dashboard UI
-- **v0.2.0**: Windows/Linux 续跑 + 系统托盘常驻 + 开机自启
+- **v0.2.0** ✅: Windows/Linux 续跑 + 系统托盘常驻 + 开机自启 + Goal 智能恢复
 - **v0.3.0**: SQLite 统计持久化 + Webhook 通知 + 自定义适配器 UI
 - **v1.0.0**: AI 智能判断（LLM 分析是否真中断）+ i18n + 自动更新

@@ -8,7 +8,9 @@ pub mod resumer;
 use config::{AppConfig, ConfigManager};
 use monitor::{EngineEvent, EngineStatus, LogLevel, MonitorEngine, MonitorState};
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::menu::{Menu, MenuItem};
 
 /// 应用全局状态
 pub struct AppState {
@@ -142,6 +144,14 @@ async fn test_notify() -> Result<String, String> {
     Ok("通知通道正常（本地测试）".to_string())
 }
 
+/// 获取当前平台信息
+#[tauri::command]
+async fn get_platform_info() -> Result<String, String> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    Ok(format!("{} ({})", os, arch))
+}
+
 // 为 MonitorEngine 添加公开的事件推送方法
 impl MonitorEngine {
     pub async fn push_event_public(&self, event: EngineEvent) {
@@ -167,6 +177,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .manage(AppState {
             engine: engine.clone(),
             config_manager,
@@ -181,9 +195,93 @@ pub fn run() {
             update_config,
             manual_resume,
             test_notify,
+            get_platform_info,
         ])
-        .setup(move |_app| {
-            // 如果配置了启动时检查，自动开始监控
+        .setup(move |app| {
+            // ===== 系统托盘 =====
+            let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let start_item = MenuItem::with_id(app, "start_monitor", "开始监控", true, None::<&str>)?;
+            let stop_item = MenuItem::with_id(app, "stop_monitor", "停止监控", true, None::<&str>)?;
+            let scan_item = MenuItem::with_id(app, "scan", "立即扫描", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出 AgentPulse", true, None::<&str>)?;
+
+            let tray_menu = Menu::with_items(
+                app,
+                &[&show_item, &start_item, &stop_item, &scan_item, &quit_item],
+            )?;
+
+            let engine_for_tray = engine.clone();
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("AgentPulse - AI Agent 守护")
+                .title("AgentPulse")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app_handle, event| {
+                    let engine = engine_for_tray.clone();
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "start_monitor" => {
+                            let app_clone = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                engine.start().await;
+                                let _ = app_clone.emit("engine-stopped", ());
+                            });
+                        }
+                        "stop_monitor" => {
+                            tauri::async_runtime::spawn(async move {
+                                engine.stop().await;
+                            });
+                        }
+                        "scan" => {
+                            tauri::async_runtime::spawn(async move {
+                                engine.scan_once().await;
+                            });
+                        }
+                        "quit" => {
+                            app_handle.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    // 双击托盘图标显示/隐藏窗口
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app_handle = tray.app_handle();
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            // ===== 窗口关闭时最小化到托盘 =====
+            let window = app.get_webview_window("main").unwrap();
+            let window_clone = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    // 隐藏窗口而不是关闭
+                    if let Some(w) = tauri::WebviewWindow::app_handle(&window_clone).get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                }
+            });
+
+            // ===== 启动时自动监控 =====
             if config.check_on_startup {
                 let engine_clone = engine.clone();
                 tauri::async_runtime::spawn(async move {
@@ -191,6 +289,7 @@ pub fn run() {
                     engine_clone.start().await;
                 });
             }
+
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -51,7 +51,7 @@ export default function App() {
               AgentPulse
             </h1>
             <p className="text-[10px] tracking-wider text-gray-500">
-              AI Agent 守护 · Goal 自动恢复 · 多窗口精准续跑
+              AI Agent 守护 · Goal 自动恢复 · 跨平台精准续跑
             </p>
           </div>
         </div>
@@ -148,9 +148,9 @@ export default function App() {
         <div className="flex items-center gap-2">
           <span className="font-medium text-gray-500">AgentPulse</span>
           <span className="rounded bg-gray-800/80 px-1.5 py-0.5 font-mono text-[9px] text-gray-400">
-            v0.1.0
+            v0.2.0
           </span>
-          <span>macOS</span>
+          <span>跨平台</span>
         </div>
         <div className="flex items-center gap-3">
           {monitorState.running ? (

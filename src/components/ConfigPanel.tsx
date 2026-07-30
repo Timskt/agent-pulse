@@ -99,6 +99,45 @@ export function ConfigPanel() {
         </div>
       </Section>
 
+      {/* 系统设置 */}
+      <Section title="系统设置" icon="🖥️" desc="系统托盘与开机自启">
+        <div className="space-y-2.5">
+          <div className="flex items-center justify-between rounded-lg border border-gray-800/50 bg-gray-800/30 px-4 py-3">
+            <div>
+              <span className="text-sm font-medium text-gray-200">系统托盘常驻</span>
+              <p className="mt-0.5 text-[10px] text-gray-500">
+                关闭窗口时最小化到托盘，右键托盘图标可控制监控
+              </p>
+            </div>
+            <span className="rounded-full bg-emerald-400/10 px-2.5 py-1 text-[10px] font-medium text-emerald-400">
+              ✓ 已启用
+            </span>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-gray-800/50 bg-gray-800/30 px-4 py-3">
+            <div>
+              <span className="text-sm font-medium text-gray-200">开机自启</span>
+              <p className="mt-0.5 text-[10px] text-gray-500">
+                系统登录时自动启动 AgentPulse（通过系统设置管理）
+              </p>
+            </div>
+            <span className="rounded-full bg-indigo-400/10 px-2.5 py-1 text-[10px] font-medium text-indigo-400">
+              系统设置中配置
+            </span>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-gray-800/50 bg-gray-800/30 px-4 py-3">
+            <div>
+              <span className="text-sm font-medium text-gray-200">跨平台续跑</span>
+              <p className="mt-0.5 text-[10px] text-gray-500">
+                macOS (AppleScript) · Windows (PowerShell) · Linux (xdotool)
+              </p>
+            </div>
+            <span className="rounded-full bg-purple-400/10 px-2.5 py-1 text-[10px] font-medium text-purple-400">
+              v0.2.0 新增
+            </span>
+          </div>
+        </div>
+      </Section>
+
       {/* 续跑提示词 */}
       <Section title="续跑提示词" icon="💬" desc="检测到中断后自动发送给 Agent 的指令">
         <div className="space-y-4">

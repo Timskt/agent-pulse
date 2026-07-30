@@ -363,15 +363,210 @@ return "vscode-window""#,
         String::new()
     }
 
-    /// Windows: 通过 PowerShell 发送按键 (v0.2.0)
+    /// Windows: 通过 PowerShell + Win32 API 定位终端窗口并发送续跑指令
+    ///
+    /// 策略：
+    /// 1. 通过 PID 获取进程所属的控制台窗口句柄
+    /// 2. 使用 SetForegroundWindow 激活目标窗口
+    /// 3. 通过 SendKeys 发送续跑提示词 + 回车
     #[cfg(target_os = "windows")]
-    async fn resume_windows(&self, _session: &AgentSession, _prompt: &str) -> Result<String, String> {
-        Err("Windows 平台支持将在 v0.2.0 中实现".to_string())
+    async fn resume_windows(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
+        // 转义 PowerShell 特殊字符
+        let escaped_prompt = prompt
+            .replace('`', "``")
+            .replace('"', "`\"")
+            .replace('{', "`{")
+            .replace('}', "`}")
+            .replace('+', "`+")
+            .replace('^', "`^")
+            .replace('%', "`%")
+            .replace('~', "`~")
+            .replace('(', "`(")
+            .replace(')', "`)");
+
+        let pid = session.pid;
+
+        // PowerShell 脚本：通过 PID 定位窗口并发送按键
+        let ps_script = format!(
+            r#"
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinAPI {{
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}}
+"@
+
+$pid_target = {pid}
+$proc = Get-Process -Id $pid_target -ErrorAction SilentlyContinue
+if (-not $proc) {{
+    # 尝试父进程
+    $procs = Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -eq $pid_target }}
+    if ($procs) {{
+        $parent = Get-Process -Id $procs.ParentProcessId -ErrorAction SilentlyContinue
+        if ($parent -and $parent.MainWindowHandle -ne [IntPtr]::Zero) {{
+            $proc = $parent
+        }}
+    }}
+}}
+
+if (-not $proc -or $proc.MainWindowHandle -eq [IntPtr]::Zero) {{
+    Write-Output "NO_WINDOW"
+    exit 1
+}}
+
+$hwnd = $proc.MainWindowHandle
+[WinAPI]::ShowWindow($hwnd, 9)  # SW_RESTORE
+Start-Sleep -Milliseconds 300
+[WinAPI]::SetForegroundWindow($hwnd)
+Start-Sleep -Milliseconds 500
+
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait("{escaped_prompt}")
+Start-Sleep -Milliseconds 200
+[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+
+Write-Output "SENT_TO_$($proc.ProcessName)"
+"#
+        );
+
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+            .output()
+            .map_err(|e| format!("执行 PowerShell 失败: {e}"))?;
+
+        if output.status.success() {
+            let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(format!("已通过 Windows 发送续跑指令 ({result})"))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.contains("NO_WINDOW") {
+                Err(format!("未找到 PID {} 对应的终端窗口", pid))
+            } else {
+                Err(format!("Windows 续跑失败: {stderr}"))
+            }
+        }
     }
 
-    /// Linux: 通过 xdotool 发送按键 (v0.2.0)
+    /// Linux: 通过 xdotool 定位终端窗口并发送续跑指令
+    ///
+    /// 策略：
+    /// 1. 使用 xdotool search --pid 查找目标进程窗口
+    /// 2. 如果找不到，向上遍历父进程
+    /// 3. windowactivate + type + Return
+    /// 4. Wayland 回退到 ydotool
     #[cfg(target_os = "linux")]
-    async fn resume_linux(&self, _session: &AgentSession, _prompt: &str) -> Result<String, String> {
-        Err("Linux 平台支持将在 v0.2.0 中实现".to_string())
+    async fn resume_linux(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
+        let pid = session.pid;
+
+        // 尝试通过 xdotool 查找窗口
+        let window_id = self.find_x11_window_for_pid(pid);
+
+        match window_id {
+            Some(wid) => {
+                // 激活窗口
+                let _ = Command::new("xdotool")
+                    .args(["windowactivate", "--sync", &wid])
+                    .output();
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
+                // 输入提示词
+                let type_result = Command::new("xdotool")
+                    .args(["type", "--clearmodifiers", "--delay", "20", prompt])
+                    .output()
+                    .map_err(|e| format!("xdotool type 失败: {e}"))?;
+
+                if !type_result.status.success() {
+                    return Err("xdotool 输入失败".to_string());
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                // 发送回车
+                let _ = Command::new("xdotool")
+                    .args(["key", "Return"])
+                    .output();
+
+                Ok(format!("已通过 xdotool 发送续跑指令 (window: {wid})"))
+            }
+            None => {
+                // 回退到 ydotool（Wayland 环境）
+                self.resume_linux_ydotool(prompt).await
+            }
+        }
+    }
+
+    /// Linux X11: 通过 PID 查找窗口 ID（向上遍历父进程）
+    #[cfg(target_os = "linux")]
+    fn find_x11_window_for_pid(&self, pid: u32) -> Option<String> {
+        let mut current_pid = pid;
+
+        for _ in 0..6 {
+            // xdotool search --pid <pid>
+            let output = Command::new("xdotool")
+                .args(["search", "--pid", &current_pid.to_string()])
+                .output()
+                .ok()?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                // 取第一个窗口 ID
+                let wid = stdout.lines().next()?.to_string();
+                if !wid.is_empty() {
+                    return Some(wid);
+                }
+            }
+
+            // 向上查找父进程
+            let ppid_output = std::fs::read_to_string(format!("/proc/{}/stat", current_pid)).ok()?;
+            // stat 格式: pid (comm) state ppid ...
+            let after_comm = ppid_output.rsplit(')').next()?;
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            // fields[0] = state, fields[1] = ppid
+            let ppid: u32 = fields.get(1)?.parse().ok()?;
+            if ppid <= 1 {
+                break;
+            }
+            current_pid = ppid;
+        }
+
+        None
+    }
+
+    /// Linux Wayland: 通过 ydotool 发送按键（回退方案）
+    #[cfg(target_os = "linux")]
+    async fn resume_linux_ydotool(&self, prompt: &str) -> Result<String, String> {
+        // 检查 ydotool 是否可用
+        let check = Command::new("which")
+            .arg("ydotool")
+            .output();
+
+        if check.is_err() || !check.unwrap().status.success() {
+            return Err(
+                "未找到 xdotool 或 ydotool。请安装: sudo apt install xdotool 或 sudo apt install ydotool".to_string()
+            );
+        }
+
+        // ydotool type 输入文本
+        let type_result = Command::new("ydotool")
+            .args(["type", "--", prompt])
+            .output()
+            .map_err(|e| format!("ydotool type 失败: {e}"))?;
+
+        if !type_result.status.success() {
+            return Err("ydotool 输入失败".to_string());
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // ydotool key Enter (keycode 28)
+        let _ = Command::new("ydotool")
+            .args(["key", "28:1", "28:0"])
+            .output();
+
+        Ok("已通过 ydotool (Wayland) 发送续跑指令".to_string())
     }
 }
