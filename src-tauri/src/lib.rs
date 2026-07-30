@@ -20,7 +20,7 @@ use tauri::menu::{Menu, MenuItem};
 pub struct AppState {
     pub engine: Arc<MonitorEngine>,
     pub config_manager: ConfigManager,
-    pub storage: storage::Storage,
+    pub storage: Arc<storage::Storage>,
 }
 
 // ==================== Tauri Commands ====================
@@ -229,7 +229,8 @@ pub fn run() {
 
     let config_manager = ConfigManager::new();
     let config = config_manager.get();
-    let engine = Arc::new(MonitorEngine::new(config.clone()));
+    let storage = Arc::new(storage::Storage::new());
+    let engine = Arc::new(MonitorEngine::new(config.clone(), storage.clone()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -242,7 +243,7 @@ pub fn run() {
         .manage(AppState {
             engine: engine.clone(),
             config_manager,
-            storage: storage::Storage::new(),
+            storage,
         })
         .invoke_handler(tauri::generate_handler![
             get_state,

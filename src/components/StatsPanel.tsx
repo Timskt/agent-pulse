@@ -9,72 +9,45 @@ export function StatsPanel() {
     fetchStats();
   }, [fetchStats]);
 
-  const [totalScans, totalDetections, totalResumes] = totals ?? [0, 0, 0];
+  const [totalDetections, totalResumes, successfulResumes] = totals ?? [0, 0, 0];
   const successRate =
-    resumeHistory.length > 0
-      ? Math.round(
-          (resumeHistory.filter((r) => r.success).length /
-            resumeHistory.length) *
-            100
-        )
+    totalResumes > 0
+      ? Math.round((successfulResumes / totalResumes) * 100)
       : 0;
 
   return (
-    <div className="space-y-5">
+    <div className="mx-auto max-w-3xl space-y-4">
       {/* 总览卡片 */}
       <div className="grid grid-cols-4 gap-3">
-        <StatCard
-          label="总扫描次数"
-          value={totalScans}
-          icon="🔍"
-          color="text-indigo-400"
-          bg="from-indigo-500/10"
-        />
-        <StatCard
-          label="中断检测"
-          value={totalDetections}
-          icon="⚠️"
-          color="text-amber-400"
-          bg="from-amber-500/10"
-        />
-        <StatCard
-          label="自动续跑"
-          value={totalResumes}
-          icon="🚀"
-          color="text-emerald-400"
-          bg="from-emerald-500/10"
-        />
-        <StatCard
-          label="续跑成功率"
-          value={`${successRate}%`}
-          icon="📊"
-          color="text-purple-400"
-          bg="from-purple-500/10"
-        />
+        <StatCard label="中断检测" value={totalDetections} />
+        <StatCard label="自动续跑" value={totalResumes} />
+        <StatCard label="续跑成功" value={successfulResumes} />
+        <StatCard label="成功率" value={`${successRate}%`} />
       </div>
 
-      {/* 30 天趋势图（纯 CSS 柱状图） */}
-      <section className="rounded-xl border border-gray-800/60 bg-gray-900/70 p-5 backdrop-blur">
-        <div className="mb-4 flex items-center gap-2.5">
-          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gray-800/80 text-sm">
-            📈
-          </span>
+      {/* 30 天趋势图 */}
+      <section className="rounded-lg border border-neutral-200 bg-white p-5">
+        <div className="mb-4 flex items-center justify-between">
           <div>
-            <h3 className="text-sm font-semibold text-gray-200">
-              30 天活动趋势
-            </h3>
-            <p className="text-[10px] text-gray-500">
-              每日检测与续跑统计
-            </p>
+            <h3 className="text-xs font-semibold text-neutral-800">30-Day Activity</h3>
+            <p className="mt-0.5 text-[10px] text-neutral-400">每日检测与续跑统计</p>
+          </div>
+          <div className="flex items-center gap-3 text-[9px] text-neutral-400">
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-sm bg-neutral-800" /> Total
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-sm bg-emerald-500" /> Success
+            </span>
           </div>
         </div>
 
         {dailyStats.length === 0 ? (
-          <div className="flex h-32 items-center justify-center text-xs text-gray-600">
+          <div className="flex h-32 items-center justify-center text-[11px] text-neutral-300">
             暂无历史数据，开始监控后将自动记录
           </div>
         ) : (
-          <div className="flex h-36 items-end gap-[2px] overflow-x-auto pb-1">
+          <div className="flex h-32 items-end gap-[2px] overflow-x-auto pb-1">
             {dailyStats.map((day) => {
               const maxVal = Math.max(
                 ...dailyStats.map((d) => d.total_resumes + d.total_detections),
@@ -91,13 +64,12 @@ export function StatsPanel() {
                   title={`${day.date}: 检测 ${day.total_detections} / 续跑 ${day.total_resumes}`}
                 >
                   <div
-                    className="w-full rounded-t-sm bg-gradient-to-t from-indigo-600/80 to-purple-500/60 transition-all duration-200 group-hover:from-indigo-500 group-hover:to-purple-400"
+                    className="w-full rounded-t-sm bg-neutral-800/80 transition-colors group-hover:bg-neutral-900"
                     style={{ height: `${height}%` }}
                   />
-                  {/* 续跑成功部分 */}
                   {day.successful_resumes > 0 && (
                     <div
-                      className="absolute bottom-0 w-full rounded-t-sm bg-emerald-500/40"
+                      className="absolute bottom-0 w-full rounded-t-sm bg-emerald-500/60"
                       style={{
                         height: `${(day.successful_resumes / maxVal) * 100}%`,
                       }}
@@ -111,57 +83,57 @@ export function StatsPanel() {
       </section>
 
       {/* 续跑历史 */}
-      <section className="rounded-xl border border-gray-800/60 bg-gray-900/70 p-5 backdrop-blur">
-        <div className="mb-4 flex items-center gap-2.5">
-          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gray-800/80 text-sm">
-            📋
-          </span>
+      <section className="rounded-lg border border-neutral-200 bg-white p-5">
+        <div className="mb-4 flex items-center justify-between">
           <div>
-            <h3 className="text-sm font-semibold text-gray-200">续跑记录</h3>
-            <p className="text-[10px] text-gray-500">最近 50 条续跑操作</p>
+            <h3 className="text-xs font-semibold text-neutral-800">Resume History</h3>
+            <p className="mt-0.5 text-[10px] text-neutral-400">最近 50 条续跑操作</p>
           </div>
+          <span className="text-[10px] tabular-nums text-neutral-300">
+            {resumeHistory.length} records
+          </span>
         </div>
 
         {resumeHistory.length === 0 ? (
-          <div className="flex h-24 items-center justify-center text-xs text-gray-600">
+          <div className="flex h-24 items-center justify-center text-[11px] text-neutral-300">
             暂无续跑记录
           </div>
         ) : (
-          <div className="max-h-64 space-y-1.5 overflow-y-auto pr-1">
+          <div className="max-h-64 divide-y divide-neutral-50 overflow-y-auto">
             {resumeHistory.map((record) => (
               <div
                 key={record.id}
-                className="flex items-center gap-3 rounded-lg border border-gray-800/40 bg-gray-800/30 px-3 py-2 transition-colors hover:bg-gray-800/50"
+                className="flex items-center gap-3 px-1 py-2.5 transition-colors hover:bg-neutral-50/50"
               >
                 <span
-                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] ${
+                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium ${
                     record.success
-                      ? "bg-emerald-400/10 text-emerald-400"
-                      : "bg-red-400/10 text-red-400"
+                      ? "bg-emerald-50 text-emerald-600"
+                      : "bg-red-50 text-red-500"
                   }`}
                 >
                   {record.success ? "✓" : "✗"}
                 </span>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-medium text-gray-300">
+                    <span className="text-xs font-medium text-neutral-700">
                       {record.agent_name}
                     </span>
                     <span
                       className={`rounded px-1.5 py-0.5 text-[9px] font-medium ${
                         record.prompt_type === "goal"
-                          ? "bg-purple-400/10 text-purple-400"
-                          : "bg-indigo-400/10 text-indigo-400"
+                          ? "bg-violet-50 text-violet-600"
+                          : "bg-neutral-100 text-neutral-500"
                       }`}
                     >
-                      {record.prompt_type === "goal" ? "Goal恢复" : "通用"}
+                      {record.prompt_type === "goal" ? "Goal" : "Normal"}
                     </span>
                   </div>
-                  <p className="truncate text-[10px] text-gray-500">
+                  <p className="truncate text-[10px] text-neutral-400">
                     {record.working_dir}
                   </p>
                 </div>
-                <span className="shrink-0 text-[10px] tabular-nums text-gray-600">
+                <span className="shrink-0 text-[10px] tabular-nums text-neutral-300">
                   {formatTime(record.created_at)}
                 </span>
               </div>
@@ -173,30 +145,11 @@ export function StatsPanel() {
   );
 }
 
-function StatCard({
-  label,
-  value,
-  icon,
-  color,
-  bg,
-}: {
-  label: string;
-  value: number | string;
-  icon: string;
-  color: string;
-  bg: string;
-}) {
+function StatCard({ label, value }: { label: string; value: number | string }) {
   return (
-    <div
-      className={`relative overflow-hidden rounded-xl border border-gray-800/60 bg-gradient-to-br ${bg} to-transparent p-4 backdrop-blur transition-all duration-200 hover:border-gray-700/60`}
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-lg">{icon}</span>
-      </div>
-      <p className={`mt-2 text-2xl font-bold tabular-nums ${color}`}>
-        {value}
-      </p>
-      <p className="mt-0.5 text-[10px] text-gray-500">{label}</p>
+    <div className="rounded-lg border border-neutral-200 bg-white px-4 py-3.5">
+      <p className="text-2xl font-semibold tabular-nums text-neutral-900">{value}</p>
+      <p className="mt-0.5 text-[11px] text-neutral-400">{label}</p>
     </div>
   );
 }

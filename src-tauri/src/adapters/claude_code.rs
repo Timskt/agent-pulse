@@ -159,8 +159,9 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 .join(" ");
 
             let is_claude = proc_name == "claude"
-                || (proc_name.contains("node") && cmd.contains("claude"))
-                || proc_name.contains("claude-code");
+                || proc_name == "claude.exe"
+                || proc_name.starts_with("claude-code")
+                || (proc_name.contains("node") && cmd.contains("claude"));
 
             if !is_claude {
                 continue;
@@ -199,10 +200,21 @@ impl AgentAdapter for ClaudeCodeAdapter {
             if session.working_dir.is_empty() {
                 continue;
             }
-            let encoded_dir = session.working_dir.replace('/', "-");
-            let project_dir = self.claude_dir.join("projects").join(&encoded_dir);
+            // Claude Code 路径编码：/ 和 \ 都替换为 -
+            let encoded_dir = session.working_dir
+                .replace('\\', "-")
+                .replace('/', "-");
+            // 尝试多种编码格式（带/不带盘符前缀）
+            let candidates = vec![
+                self.claude_dir.join("projects").join(&encoded_dir),
+                // Windows: C:\Users\... → -C-Users-... 或 C-Users-...
+                self.claude_dir.join("projects").join(encoded_dir.trim_start_matches('-')),
+            ];
 
-            if project_dir.exists() {
+            for project_dir in &candidates {
+                if !project_dir.exists() {
+                    continue;
+                }
                 // 找到该项目目录下最新的 .jsonl 文件
                 let pattern = format!("{}/**/*.jsonl", project_dir.display());
                 let mut files: Vec<PathBuf> = glob::glob(&pattern)
@@ -225,6 +237,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                         }
                     }
                 }
+                break; // 找到匹配的目录就停止
             }
         }
 

@@ -2,6 +2,7 @@ use crate::adapters::{self, AgentSession, SessionStatus};
 use crate::config::AppConfig;
 use crate::detector::{Detector, DetectionResult, Verdict};
 use crate::resumer::Resumer;
+use crate::storage::Storage;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,14 +87,16 @@ pub struct MonitorEngine {
     pub state: Arc<Mutex<MonitorState>>,
     config: AppConfig,
     started_at: std::sync::Mutex<Option<std::time::Instant>>,
+    storage: Arc<Storage>,
 }
 
 impl MonitorEngine {
-    pub fn new(config: AppConfig) -> Self {
+    pub fn new(config: AppConfig, storage: Arc<Storage>) -> Self {
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
             config,
             started_at: std::sync::Mutex::new(None),
+            storage,
         }
     }
 
@@ -153,6 +156,9 @@ impl MonitorEngine {
 
     /// 执行一次完整扫描
     pub async fn scan_once(&self) {
+        // 记录扫描事件
+        self.storage.record_scan();
+
         let enabled = self.config.enabled_adapters.clone();
         let adapters = adapters::all_adapters();
         let mut all_sessions: Vec<AgentSession> = Vec::new();
@@ -213,6 +219,15 @@ impl MonitorEngine {
         for (session, detection) in &detections {
             match detection.verdict {
                 Verdict::ConfirmInterrupt => {
+                    // 记录检测事件到持久化存储
+                    self.storage.record_detection(
+                        &session.id,
+                        &session.agent_name,
+                        "ConfirmInterrupt",
+                        &detection.signals.iter().map(|s| s.description.as_str()).collect::<Vec<_>>().join("; "),
+                        detection.has_active_goal,
+                    );
+
                     self.push_event(EngineEvent::new(
                         LogLevel::Warn,
                         Some(session.id.clone()),
@@ -315,17 +330,35 @@ impl MonitorEngine {
         // 6. 执行续跑动作（智能选择提示词）
         for (session, use_goal_prompt) in &resume_actions {
             let resumer = Resumer::new(self.config.clone());
-            let prompt_type = if *use_goal_prompt { "Goal恢复" } else { "通用" };
+            let prompt_type = if *use_goal_prompt { "goal" } else { "generic" };
             match resumer.resume(session, *use_goal_prompt).await {
                 Ok(msg) => {
+                    // 记录续跑成功
+                    self.storage.record_resume(
+                        &session.id,
+                        &session.agent_name,
+                        &session.working_dir,
+                        prompt_type,
+                        true,
+                        &msg,
+                    );
                     self.push_event(EngineEvent::new(
                         LogLevel::Success,
                         Some(session.id.clone()),
-                        format!("已触发续跑[{}模式] (第{}次): {}", prompt_type, session.resume_count + 1, msg),
+                        format!("已触发续跑[{}模式] (第{}次): {}", if *use_goal_prompt { "Goal恢复" } else { "通用" }, session.resume_count + 1, msg),
                     ))
                     .await;
                 }
                 Err(e) => {
+                    // 记录续跑失败
+                    self.storage.record_resume(
+                        &session.id,
+                        &session.agent_name,
+                        &session.working_dir,
+                        prompt_type,
+                        false,
+                        &e,
+                    );
                     self.push_event(EngineEvent::new(
                         LogLevel::Error,
                         Some(session.id.clone()),

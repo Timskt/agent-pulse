@@ -135,9 +135,9 @@ export const STATUS_LABELS: Record<SessionStatus, string> = {
 };
 
 export const STATUS_COLORS: Record<SessionStatus, string> = {
-  active: "text-emerald-400 bg-emerald-400/10 border-emerald-400/30",
-  suspended: "text-amber-400 bg-amber-400/10 border-amber-400/30",
-  interrupted: "text-red-400 bg-red-400/10 border-red-400/30",
-  completed: "text-blue-400 bg-blue-400/10 border-blue-400/30",
-  exited: "text-gray-400 bg-gray-400/10 border-gray-400/30",
+  active: "text-emerald-600 bg-emerald-50",
+  suspended: "text-amber-600 bg-amber-50",
+  interrupted: "text-red-600 bg-red-50",
+  completed: "text-blue-600 bg-blue-50",
+  exited: "text-neutral-500 bg-neutral-100",
 };

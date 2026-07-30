@@ -225,19 +225,19 @@ impl Storage {
         .collect()
     }
 
-    /// 获取总体统计
+    /// 获取总体统计: (total_detections, total_resumes, successful_resumes)
     pub fn get_totals(&self) -> (u32, u32, u32) {
         let conn = self.conn.lock().unwrap();
+        let total_detections: u32 = conn
+            .query_row("SELECT COUNT(*) FROM detection_records", [], |r| r.get(0))
+            .unwrap_or(0);
         let total_resumes: u32 = conn
             .query_row("SELECT COUNT(*) FROM resume_records", [], |r| r.get(0))
             .unwrap_or(0);
         let success_resumes: u32 = conn
             .query_row("SELECT COUNT(*) FROM resume_records WHERE success = 1", [], |r| r.get(0))
             .unwrap_or(0);
-        let total_detections: u32 = conn
-            .query_row("SELECT COUNT(*) FROM detection_records", [], |r| r.get(0))
-            .unwrap_or(0);
-        (total_resumes, success_resumes, total_detections)
+        (total_detections, total_resumes, success_resumes)
     }
 }
 
