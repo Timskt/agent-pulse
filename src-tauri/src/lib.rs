@@ -243,7 +243,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             engine: engine.clone(),
             config_manager,
