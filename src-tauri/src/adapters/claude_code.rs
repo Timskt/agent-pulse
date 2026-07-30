@@ -201,9 +201,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 continue;
             }
             // Claude Code 路径编码：/ 和 \ 都替换为 -
-            let encoded_dir = session.working_dir
-                .replace('\\', "-")
-                .replace('/', "-");
+            let encoded_dir = session.working_dir.replace(['\\', '/'], "-");
             // 尝试多种编码格式（带/不带盘符前缀）
             let candidates = vec![
                 self.claude_dir.join("projects").join(&encoded_dir),
