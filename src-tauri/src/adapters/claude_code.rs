@@ -15,6 +15,12 @@ pub struct ClaudeCodeAdapter {
     claude_dir: PathBuf,
 }
 
+impl Default for ClaudeCodeAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeCodeAdapter {
     pub fn new() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
