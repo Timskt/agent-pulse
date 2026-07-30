@@ -1,9 +1,8 @@
-use super::{AgentAdapter, AgentSession, SessionStatus};
+use super::{to_glob_pattern, AgentAdapter, AgentSession, ProcessSnapshot, SessionStatus};
 use chrono::Local;
 use std::fs;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
-use sysinfo::System;
 
 /// Claude Code (claude CLI) 适配器
 ///
@@ -29,15 +28,40 @@ impl ClaudeCodeAdapter {
         }
     }
 
+    /// 生成工作目录的所有可能编码形式
+    ///
+    /// Claude Code 将 cwd 编码为目录名（分隔符替换为 -），
+    /// 但各平台/版本对盘符冒号的处理不一致，因此穷举常见变体：
+    /// - macOS/Linux: /Users/sky/code → -Users-sky-code
+    /// - Windows: C:\Users\sky → C:-Users-sky / C--Users-sky / C-Users-sky
+    fn encode_dir_candidates(working_dir: &str) -> Vec<String> {
+        let mut candidates = Vec::new();
+
+        // 变体 1: 仅替换路径分隔符，保留冒号
+        let v1 = working_dir.replace(['\\', '/'], "-");
+        // 变体 2: 冒号也替换为 -
+        let v2 = v1.replace(':', "-");
+        // 变体 3: 移除冒号
+        let v3 = v1.replace(':', "");
+
+        for v in [&v1, &v2, &v3] {
+            // 原始形式 + 去除前导 - 的形式
+            if !candidates.contains(v) {
+                candidates.push(v.clone());
+            }
+            let trimmed = v.trim_start_matches('-').to_string();
+            if !trimmed.is_empty() && !candidates.contains(&trimmed) {
+                candidates.push(trimmed);
+            }
+        }
+
+        candidates
+    }
+
     /// 查找最新的会话 JSONL 文件
     fn find_latest_session_file(&self) -> Vec<PathBuf> {
-        let pattern = self
-            .claude_dir
-            .join("projects")
-            .join("**")
-            .join("*.jsonl")
-            .to_string_lossy()
-            .to_string();
+        let base = self.claude_dir.join("projects");
+        let pattern = to_glob_pattern(&base, "/**/*.jsonl");
 
         let mut files: Vec<PathBuf> = glob::glob(&pattern)
             .map(|paths| paths.filter_map(|p| p.ok()).collect())
@@ -143,47 +167,33 @@ impl AgentAdapter for ClaudeCodeAdapter {
         "Claude Code"
     }
 
-    fn discover_sessions(&self) -> Vec<AgentSession> {
+    fn discover_sessions(&self, processes: &[ProcessSnapshot]) -> Vec<AgentSession> {
         let mut sessions = Vec::new();
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        // 扫描 claude 相关进程
-        let system = System::new_all();
-        for (pid, process) in system.processes() {
-            let proc_name = process.name().to_string_lossy().to_lowercase();
-            let cmd = process
-                .cmd()
-                .iter()
-                .map(|c| c.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-
-            let is_claude = proc_name == "claude"
-                || proc_name == "claude.exe"
-                || proc_name.starts_with("claude-code")
-                || (proc_name.contains("node") && cmd.contains("claude"));
+        // 从进程快照中查找 claude 相关进程
+        for proc in processes {
+            let is_claude = proc.name == "claude"
+                || proc.name == "claude.exe"
+                || proc.name.starts_with("claude-code")
+                || (proc.name.contains("node") && proc.cmd.contains("claude"));
 
             if !is_claude {
                 continue;
             }
 
             // 排除自身和 grep 类进程
-            if cmd.contains("agent-pulse") || cmd.contains("grep") {
+            if proc.cmd.contains("agent-pulse") || proc.cmd.contains("grep") {
                 continue;
             }
 
-            let cwd = process
-                .cwd()
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_default();
-
             sessions.push(AgentSession {
-                id: format!("cc-{}", pid.as_u32()),
+                id: format!("cc-{}", proc.pid),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
-                pid: pid.as_u32(),
-                command: cmd,
-                working_dir: cwd,
+                pid: proc.pid,
+                command: proc.cmd.clone(),
+                working_dir: proc.cwd.clone(),
                 session_file: None,
                 discovered_at: now.clone(),
                 last_activity: now.clone(),
@@ -195,26 +205,21 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
         // 多实例关联：按工作目录匹配对应的会话文件
         // Claude Code 将会话存储在 ~/.claude/projects/<encoded-cwd>/ 下
-        // encoded-cwd = 工作目录的 / 替换为 -
         for session in &mut sessions {
             if session.working_dir.is_empty() {
                 continue;
             }
-            // Claude Code 路径编码：/ 和 \ 都替换为 -
-            let encoded_dir = session.working_dir.replace(['\\', '/'], "-");
-            // 尝试多种编码格式（带/不带盘符前缀）
-            let candidates = vec![
-                self.claude_dir.join("projects").join(&encoded_dir),
-                // Windows: C:\Users\... → -C-Users-... 或 C-Users-...
-                self.claude_dir.join("projects").join(encoded_dir.trim_start_matches('-')),
-            ];
 
-            for project_dir in &candidates {
+            // 生成所有可能的编码目录名（兼容各平台编码差异）
+            let encoded_candidates = Self::encode_dir_candidates(&session.working_dir);
+
+            for encoded in &encoded_candidates {
+                let project_dir = self.claude_dir.join("projects").join(encoded);
                 if !project_dir.exists() {
                     continue;
                 }
                 // 找到该项目目录下最新的 .jsonl 文件
-                let pattern = format!("{}/**/*.jsonl", project_dir.display());
+                let pattern = to_glob_pattern(&project_dir, "/**/*.jsonl");
                 let mut files: Vec<PathBuf> = glob::glob(&pattern)
                     .map(|paths| paths.filter_map(|p| p.ok()).collect())
                     .unwrap_or_default();

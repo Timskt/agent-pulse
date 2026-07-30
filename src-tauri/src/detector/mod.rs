@@ -74,7 +74,9 @@ impl Detector {
     }
 
     /// 对单个会话执行全策略检测
-    pub fn detect(&self, session: &AgentSession, recent_output: Option<&str>) -> DetectionResult {
+    ///
+    /// `process_alive` 由调用方从进程快照中判定，避免每次检测重复枚举系统进程
+    pub fn detect(&self, session: &AgentSession, recent_output: Option<&str>, process_alive: bool) -> DetectionResult {
         let now = Local::now();
         let mut signals = Vec::new();
         let mut has_completion_marker = false;
@@ -82,7 +84,6 @@ impl Detector {
         let mut has_active_goal = false;
 
         // 策略 1: 进程存活检测
-        let process_alive = self.check_process_alive(session.pid);
         if !process_alive {
             signals.push(DetectionSignal {
                 kind: SignalKind::ProcessExited,
@@ -168,12 +169,6 @@ impl Detector {
             verdict,
             detected_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         }
-    }
-
-    /// 检查进程是否存活
-    fn check_process_alive(&self, pid: u32) -> bool {
-        let system = sysinfo::System::new_all();
-        system.process(sysinfo::Pid::from_u32(pid)).is_some()
     }
 
     /// 检查文件距上次修改的秒数

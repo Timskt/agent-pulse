@@ -160,26 +160,9 @@ impl MonitorEngine {
         self.storage.record_scan();
 
         let enabled = self.config.enabled_adapters.clone();
-        let adapters = adapters::all_adapters();
-        let mut all_sessions: Vec<AgentSession> = Vec::new();
+        let config = self.config.clone();
 
-        // 1. 通过适配器发现会话
-        for adapter in &adapters {
-            if !enabled.contains(&adapter.id().to_string()) {
-                continue;
-            }
-            let discovered = adapter.discover_sessions();
-            if !discovered.is_empty() {
-                tracing::debug!(
-                    "[AgentPulse] {} 发现 {} 个会话",
-                    adapter.name(),
-                    discovered.len()
-                );
-            }
-            all_sessions.extend(discovered);
-        }
-
-        // 2. 合并已有状态（保留 resume_count 等）
+        // 获取已有状态（用于合并）
         let existing: HashMap<String, AgentSession> = {
             let state = self.state.lock().await;
             state
@@ -189,29 +172,66 @@ impl MonitorEngine {
                 .collect()
         };
 
-        for session in &mut all_sessions {
-            if let Some(old) = existing.get(&session.id) {
-                session.resume_count = old.resume_count;
-                session.last_resume_at = old.last_resume_at.clone();
-                session.discovered_at = old.discovered_at.clone();
-                session.status = old.status.clone();
-            }
-        }
+        // 同步重活（进程枚举 + 文件 I/O）放入阻塞线程池，避免卡死 tokio 运行时
+        let sync_result = tokio::task::spawn_blocking(move || {
+            // 每次扫描只取一次轻量进程快照（仅 name/cmd/cwd）
+            let snapshot = adapters::take_process_snapshot();
+            let adapters = adapters::all_adapters();
+            let mut all_sessions: Vec<AgentSession> = Vec::new();
 
-        // 3. 对每个会话执行检测
-        let detector = Detector::new(self.config.clone());
-        let mut detections: Vec<(AgentSession, DetectionResult)> = Vec::new();
-
-        for adapter in &adapters {
-            for session in &all_sessions {
-                if session.adapter_id != adapter.id() {
+            // 1. 通过适配器发现会话
+            for adapter in &adapters {
+                if !enabled.contains(&adapter.id().to_string()) {
                     continue;
                 }
-                let output = adapter.recent_output(session);
-                let result = detector.detect(session, output.as_deref());
-                detections.push((session.clone(), result));
+                let discovered = adapter.discover_sessions(&snapshot);
+                if !discovered.is_empty() {
+                    tracing::debug!(
+                        "[AgentPulse] {} 发现 {} 个会话",
+                        adapter.name(),
+                        discovered.len()
+                    );
+                }
+                all_sessions.extend(discovered);
             }
-        }
+
+            // 2. 合并已有状态（保留 resume_count 等）
+            for session in &mut all_sessions {
+                if let Some(old) = existing.get(&session.id) {
+                    session.resume_count = old.resume_count;
+                    session.last_resume_at = old.last_resume_at.clone();
+                    session.discovered_at = old.discovered_at.clone();
+                    session.status = old.status.clone();
+                }
+            }
+
+            // 3. 对每个会话执行检测（进程存活状态直接从快照判定）
+            let detector = Detector::new(config);
+            let mut detections: Vec<(AgentSession, DetectionResult)> = Vec::new();
+
+            for adapter in &adapters {
+                for session in &all_sessions {
+                    if session.adapter_id != adapter.id() {
+                        continue;
+                    }
+                    let process_alive = snapshot.iter().any(|p| p.pid == session.pid);
+                    let output = adapter.recent_output(session);
+                    let result = detector.detect(session, output.as_deref(), process_alive);
+                    detections.push((session.clone(), result));
+                }
+            }
+
+            (all_sessions, detections)
+        })
+        .await;
+
+        let (mut all_sessions, detections) = match sync_result {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("[AgentPulse] 扫描任务失败: {e}");
+                return;
+            }
+        };
 
         // 4. 根据检测结果更新状态 & 触发续跑
         let mut resume_actions: Vec<(AgentSession, bool)> = Vec::new();

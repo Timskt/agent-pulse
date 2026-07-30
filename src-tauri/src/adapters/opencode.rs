@@ -1,7 +1,6 @@
-use super::{AgentAdapter, AgentSession, SessionStatus};
+use super::{AgentAdapter, AgentSession, ProcessSnapshot, SessionStatus};
 use chrono::Local;
 use std::path::PathBuf;
-use sysinfo::System;
 
 /// OpenCode 适配器
 ///
@@ -20,41 +19,27 @@ impl AgentAdapter for OpenCodeAdapter {
         "OpenCode"
     }
 
-    fn discover_sessions(&self) -> Vec<AgentSession> {
+    fn discover_sessions(&self, processes: &[ProcessSnapshot]) -> Vec<AgentSession> {
         let mut sessions = Vec::new();
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let system = System::new_all();
-        for (pid, process) in system.processes() {
-            let proc_name = process.name().to_string_lossy().to_lowercase();
-            let cmd = process
-                .cmd()
-                .iter()
-                .map(|c| c.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
+        for proc in processes {
+            // 匹配 opencode 进程（Go 编译的二进制，Windows 下为 opencode.exe）
+            let is_opencode = proc.name == "opencode"
+                || proc.name == "opencode.exe"
+                || proc.name.contains("opencode");
 
-            // 匹配 opencode 进程（Go 编译的二进制，进程名就是 opencode）
-            let is_opencode = proc_name == "opencode"
-                || proc_name.contains("opencode")
-                || (cmd.contains("opencode") && !cmd.contains("agent-pulse"));
-
-            if !is_opencode || cmd.contains("agent-pulse") || cmd.contains("grep") {
+            if !is_opencode || proc.cmd.contains("agent-pulse") || proc.cmd.contains("grep") {
                 continue;
             }
 
-            let cwd = process
-                .cwd()
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_default();
-
             sessions.push(AgentSession {
-                id: format!("oc-{}", pid.as_u32()),
+                id: format!("oc-{}", proc.pid),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
-                pid: pid.as_u32(),
-                command: cmd,
-                working_dir: cwd,
+                pid: proc.pid,
+                command: proc.cmd.clone(),
+                working_dir: proc.cwd.clone(),
                 session_file: None,
                 discovered_at: now.clone(),
                 last_activity: now.clone(),

@@ -4,6 +4,58 @@ pub mod opencode;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+/// 进程快照 — 一次扫描共享，避免每个适配器重复枚举进程
+#[derive(Debug, Clone)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    /// 小写进程名（Windows 含 .exe 后缀）
+    pub name: String,
+    /// 完整命令行
+    pub cmd: String,
+    /// 工作目录
+    pub cwd: String,
+}
+
+/// 获取当前所有进程的轻量快照（仅 name/cmd/cwd，不刷新 CPU/内存/磁盘）
+pub fn take_process_snapshot() -> Vec<ProcessSnapshot> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always),
+    );
+
+    system
+        .processes()
+        .iter()
+        .map(|(pid, process)| ProcessSnapshot {
+            pid: pid.as_u32(),
+            name: process.name().to_string_lossy().to_lowercase(),
+            cmd: process
+                .cmd()
+                .iter()
+                .map(|c| c.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            cwd: process
+                .cwd()
+                .map(|c| c.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// 将路径转为 glob 安全的模式串
+///
+/// glob crate 将 `\` 视为转义字符，Windows 反斜杠路径会导致匹配永远失败，
+/// 因此统一转为正斜杠（Windows API 同样接受正斜杠）。
+pub fn to_glob_pattern(path: &std::path::Path, suffix: &str) -> String {
+    format!("{}{}", path.to_string_lossy().replace('\\', "/"), suffix)
+}
 
 /// Agent 会话信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,8 +120,8 @@ pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &str;
     /// 显示名称
     fn name(&self) -> &str;
-    /// 扫描系统中正在运行的该类型 agent 进程
-    fn discover_sessions(&self) -> Vec<AgentSession>;
+    /// 从进程快照中发现该类型 agent 会话
+    fn discover_sessions(&self, processes: &[ProcessSnapshot]) -> Vec<AgentSession>;
     /// 获取会话文件路径（用于文件监听）
     fn session_files(&self) -> Vec<PathBuf>;
     /// 读取会话最近的输出内容（用于关键词匹配）

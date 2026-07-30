@@ -1,7 +1,6 @@
-use super::{AgentAdapter, AgentSession, SessionStatus};
+use super::{AgentAdapter, AgentSession, ProcessSnapshot, SessionStatus};
 use chrono::Local;
 use std::path::PathBuf;
-use sysinfo::System;
 
 /// OpenAI Codex CLI 适配器
 ///
@@ -19,39 +18,26 @@ impl AgentAdapter for CodexAdapter {
         "Codex CLI"
     }
 
-    fn discover_sessions(&self) -> Vec<AgentSession> {
+    fn discover_sessions(&self, processes: &[ProcessSnapshot]) -> Vec<AgentSession> {
         let mut sessions = Vec::new();
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let system = System::new_all();
-        for (pid, process) in system.processes() {
-            let proc_name = process.name().to_string_lossy().to_lowercase();
-            let cmd = process
-                .cmd()
-                .iter()
-                .map(|c| c.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
+        for proc in processes {
+            let is_codex = proc.name == "codex"
+                || proc.name == "codex.exe"
+                || (proc.name.contains("node") && proc.cmd.contains("codex"));
 
-            let is_codex = proc_name == "codex"
-                || (proc_name.contains("node") && cmd.contains("codex"));
-
-            if !is_codex || cmd.contains("agent-pulse") {
+            if !is_codex || proc.cmd.contains("agent-pulse") {
                 continue;
             }
 
-            let cwd = process
-                .cwd()
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_default();
-
             sessions.push(AgentSession {
-                id: format!("cx-{}", pid.as_u32()),
+                id: format!("cx-{}", proc.pid),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
-                pid: pid.as_u32(),
-                command: cmd,
-                working_dir: cwd,
+                pid: proc.pid,
+                command: proc.cmd.clone(),
+                working_dir: proc.cwd.clone(),
                 session_file: None,
                 discovered_at: now.clone(),
                 last_activity: now.clone(),

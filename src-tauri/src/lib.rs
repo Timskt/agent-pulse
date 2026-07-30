@@ -69,11 +69,15 @@ async fn start_monitoring(state: State<'_, AppState>, app: tauri::AppHandle) -> 
                 break;
             }
             if state.events.len() != last_len {
+                // 事件被截断时 last_len 可能越界，取 min 防止 panic
+                let start = last_len.min(state.events.len());
                 let new_events: Vec<EngineEvent> =
-                    state.events[last_len..].to_vec();
+                    state.events[start..].to_vec();
                 last_len = state.events.len();
                 drop(state);
-                let _ = app_for_events.emit("engine-events", new_events);
+                if !new_events.is_empty() {
+                    let _ = app_for_events.emit("engine-events", new_events);
+                }
             }
         }
     });
