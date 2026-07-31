@@ -493,8 +493,12 @@ impl Resumer {
         self.config.auto_follow_latest
     }
 
-    /// 把 AppleScript / 外部工具返回的结果码翻成人话
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    /// 把 AppleScript / PowerShell 返回的结果码翻成人话
+    ///
+    /// 只有 macOS 和 Windows 会返回结果码：Linux 那边 xdotool / ydotool 的两条路
+    /// 各自直接给出完整文案，没有中间码。cfg 必须跟调用点严格对齐——多挂一个平台，
+    /// 那个平台的 `-D warnings` 就会因为 dead_code 而红。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn outcome_text(&self, raw: &str) -> String {
         match raw {
             "matched" | "vscode-window" => self.i18n.t("resume.matched").to_string(),
