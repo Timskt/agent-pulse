@@ -1561,7 +1561,12 @@ mod tests {
 
     // ── 盲敲授权 ──
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// 只有 macOS 用得上这个 helper：它存在的意义是构造一个带盲敲授权的
+    /// `Resumer` 去调 `macos_script` / `title_matched_script`。Windows 的脚本
+    /// 生成器是个自由函数（`win_script` 直接调它），Linux 那边则没有可单测的
+    /// 纯字符串入口。cfg 必须跟调用点严格对齐——多挂一个平台，那个平台的
+    /// `-D warnings` 就会因为 dead_code 而红。
+    #[cfg(target_os = "macos")]
     fn resumer_with(auto_follow_latest: bool) -> Resumer {
         Resumer::new(AppConfig {
             auto_follow_latest,
@@ -1570,7 +1575,8 @@ mod tests {
         })
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// 盲敲默认必须是关的——三个平台都得验，跟 [`Resumer::allow_blind`] 同门
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]
     fn blind_typing_is_off_by_default() {
         assert!(!Resumer::new(AppConfig::default()).allow_blind());
