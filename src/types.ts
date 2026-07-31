@@ -257,3 +257,15 @@ export interface AiVerdict {
   reasoning: string;
   suggested_prompt: string | null;
 }
+
+/** 演练定位的确定性分级（与后端 LocateLevel serde snake_case 对齐） */
+export type LocateLevel = "exact" | "window" | "refused";
+
+/** locate_session 命令的结构化返回 */
+export interface LocateReport {
+  level: LocateLevel;
+  terminal: string;
+  tty: string | null;
+  project: string;
+  message: string;
+}

@@ -9,6 +9,7 @@ import type {
   DailyCost,
   DailyStats,
   EngineEvent,
+  LocateReport,
   MonitorState,
   ProjectCost,
   RateLimitForecast,
@@ -62,6 +63,7 @@ interface AppStore {
   testNotify: () => Promise<CommandResult>;
   testWebhook: () => Promise<CommandResult>;
   aiAnalyze: (sessionId: string) => Promise<AiVerdict>;
+  locateSession: (sessionId: string) => Promise<LocateReport>;
   initEventListeners: () => Promise<() => void>;
 }
 
@@ -232,6 +234,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   testWebhook: async () => run(() => invoke<string>("test_webhook")),
 
   aiAnalyze: async (sessionId) => invoke<AiVerdict>("ai_analyze", { sessionId }),
+
+  locateSession: async (sessionId) => invoke<LocateReport>("locate_session", { sessionId }),
 
   /**
    * 事件订阅 + 兜底轮询

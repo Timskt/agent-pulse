@@ -58,6 +58,7 @@ const TABLE = {
   "session.resume_goal": ["带目标续跑", "Resume with goal"],
   "session.focus": ["跳到终端", "Jump to terminal"],
   "session.analyze": ["AI 看一眼", "Ask AI"],
+  "session.locate": ["演练定位", "Rehearse locate"],
   "session.pid": ["进程 {pid}", "PID {pid}"],
 
   // ── 状态与注意力级别 ──

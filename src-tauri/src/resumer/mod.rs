@@ -1,6 +1,7 @@
 use crate::adapters::AgentSession;
 use crate::config::AppConfig;
 use crate::i18n::I18n;
+use serde::Serialize;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
@@ -23,6 +24,39 @@ use std::process::Command;
 pub struct Resumer {
     config: AppConfig,
     i18n: I18n,
+}
+
+/// 定位演练（dry-run）的结果级别
+///
+/// 演练走的是和真续跑**完全相同**的定位链路（找 TTY → 找终端 App → 找窗口 →
+/// 标题匹配），但**在敲字之前停下**，只回答一个问题：真要续跑的话，
+/// 这串字符会落到哪儿？它没有任何副作用——不抢焦点、不动剪贴板、不敲一个字，
+/// 所以可以把「12.1 那张从没实机验证过的表」从「冒险去试」变成「零风险随时可查」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateLevel {
+    /// TTY / 单窗口级：字符确定会落进这个会话
+    /// （iTerm2 / Terminal 的 TTY 匹配；Windows 的 cmd / conhost 一个窗口就是一个会话）
+    Exact,
+    /// 窗口级：窗口标题对上了项目名，但窗口里若有多个标签，可能敲错一个
+    Window,
+    /// 定位不到：当前设置下不会投递（除非开启「跟随最新会话」盲敲）
+    Refused,
+}
+
+/// 定位演练报告
+#[derive(Debug, Clone, Serialize)]
+pub struct LocateReport {
+    /// 定位级别，前端据此选 ✅ / ⚠️ / ❌ 三种颜色
+    pub level: LocateLevel,
+    /// 认出的终端 / 应用（认不出时为空串）
+    pub terminal: String,
+    /// TTY 设备路径（仅 macOS 有）
+    pub tty: Option<String>,
+    /// 用于标题匹配的项目名
+    pub project: String,
+    /// 一句人话报告（已按当前语言翻译），可直接展示
+    pub message: String,
 }
 
 /// 以硬超时执行外部命令，超时后强制终止子进程
@@ -539,6 +573,43 @@ impl Resumer {
             Err(self.i18n.t("resume.unsupported").to_string())
         }
     }
+    
+    /// 定位演练（dry-run）：走完整定位链路，但在敲字前停下
+    ///
+    /// 这是「续跑」的零风险版本——不抢焦点、不动剪贴板、不敲一个字，
+    /// 只如实报告「真要续跑，字符会落到哪儿」。用户报「续跑没反应」时，
+    /// 第一句话就问演练结果是什么；这也是他们敢开自动续跑之前看到的东西。
+    ///
+    /// 与 [`Self::resume`] 一样按平台 cfg 分派；每个平台的实现都在
+    /// 该平台的续跑实现旁边，方便对照「演练」与「真敲」走的是同一条定位链路。
+    pub async fn locate(&self, session: &AgentSession) -> LocateReport {
+        #[cfg(target_os = "macos")]
+        {
+            self.locate_macos(session).await
+        }
+    
+        #[cfg(target_os = "windows")]
+        {
+            self.locate_windows(session).await
+        }
+    
+        #[cfg(target_os = "linux")]
+        {
+            self.locate_linux(session)
+        }
+    
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = session;
+            LocateReport {
+                level: LocateLevel::Refused,
+                terminal: String::new(),
+                tty: None,
+                project: String::new(),
+                message: self.i18n.t("resume.unsupported").to_string(),
+            }
+        }
+    }
 
     /// macOS: 通过 TTY 精确定位终端窗口并发送续跑指令
     #[cfg(target_os = "macos")]
@@ -831,6 +902,168 @@ return "vscode-window""#
         )
     }
 
+    /// macOS 定位演练：走与 [`Self::resume_macos`] 相同的定位链路，但不敲字
+    ///
+    /// 与真续跑的唯一区别：生成的脚本只「看」不「动」——遍历窗口/标签做匹配，
+    /// 匹配上就回报级别，不 `write text`、不 `AXRaise`、不抢焦点、不动剪贴板。
+    #[cfg(target_os = "macos")]
+    async fn locate_macos(&self, session: &AgentSession) -> LocateReport {
+        let tty = Self::get_tty_for_pid(session.pid);
+        let terminal_app = Self::find_terminal_for_pid(session.pid);
+        let project = project_name_of(&session.working_dir).to_string();
+
+        // Warp 没有脚本接口：真续跑时只能对着前台盲敲，演练就如实报「只会盲敲」
+        if terminal_app == "Warp" {
+            return LocateReport {
+                level: LocateLevel::Refused,
+                message: self.i18n.tf("locate.blind_only", &[("terminal", "Warp")]),
+                terminal: terminal_app,
+                tty,
+                project,
+            };
+        }
+
+        let Some(script) = self.macos_locate_script(&terminal_app, tty.as_deref(), &project)
+        else {
+            return LocateReport {
+                level: LocateLevel::Refused,
+                message: self.i18n.t("locate.no_terminal").to_string(),
+                terminal: terminal_app,
+                tty,
+                project,
+            };
+        };
+
+        match run_osascript(&script, &self.i18n).await {
+            Ok(raw) => {
+                let level = match raw.as_str() {
+                    "matched" => LocateLevel::Exact,
+                    "vscode-window" => LocateLevel::Window,
+                    _ => LocateLevel::Refused,
+                };
+                let message = match (level, raw.as_str()) {
+                    (LocateLevel::Exact, _) => self.i18n.tf(
+                        "locate.exact_tty",
+                        &[
+                            ("terminal", terminal_app.as_str()),
+                            (
+                                "tty",
+                                tty.as_deref()
+                                    .unwrap_or_else(|| self.i18n.t("resume.tty_unknown")),
+                            ),
+                        ],
+                    ),
+                    (LocateLevel::Window, _) => self.i18n.tf(
+                        "locate.window",
+                        &[("terminal", terminal_app.as_str()), ("project", project.as_str())],
+                    ),
+                    (_, "no-app") => self.i18n.t("resume.app_not_running").to_string(),
+                    _ => self
+                        .i18n
+                        .tf("locate.refused", &[("terminal", terminal_app.as_str())]),
+                };
+                LocateReport {
+                    level,
+                    message,
+                    terminal: terminal_app,
+                    tty,
+                    project,
+                }
+            }
+            Err(e) => LocateReport {
+                level: LocateLevel::Refused,
+                message: self.i18n.tf("resume.script_failed", &[("detail", &e)]),
+                terminal: terminal_app,
+                tty,
+                project,
+            },
+        }
+    }
+
+    /// 生成「只定位、不投递」的 AppleScript；`None` = 连是哪个终端都认不出
+    ///
+    /// 与 [`Self::macos_script`] 一一对应，但每个分支都砂掉了投递动作：
+    /// iTerm2 不 `write text`、Terminal / IDE 不走剪贴板粘贴。纯只读探测，
+    /// 所以连 `activate` 都不调——演练不该把用户的窗口焦点抢走。
+    #[cfg(target_os = "macos")]
+    fn macos_locate_script(
+        &self,
+        terminal_app: &str,
+        tty: Option<&str>,
+        project_name: &str,
+    ) -> Option<String> {
+        let script = match (terminal_app, tty) {
+            // iTerm2: 遍历 session 比对 TTY（只定位，不 write text）
+            ("iTerm2", Some(tty_path)) => format!(
+                r#"with timeout of 8 seconds
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aSession in sessions of aTab
+                    if tty of aSession contains "{tty_path}" then
+                        return "matched"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+        return "refused"
+    end tell
+end timeout"#
+            ),
+            // Terminal: 遍历 tab 比对 TTY（只定位，不聚焦不粘贴）
+            ("Terminal", Some(tty_path)) => format!(
+                r#"with timeout of 8 seconds
+    tell application "Terminal"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                if tty of aTab contains "{tty_path}" then
+                    return "matched"
+                end if
+            end repeat
+        end repeat
+        return "refused"
+    end tell
+end timeout"#
+            ),
+            // VS Code 系 / JetBrains 系：靠窗口标题匹配项目名
+            (app, _) if TITLE_MATCHED_APPS.contains(&app) => {
+                self.title_locate_script(app, project_name)
+            }
+            // 其余：认不出是哪个终端，连 osascript 都不启动
+            _ => return None,
+        };
+        Some(script)
+    }
+
+    /// IDE / 编辑器内置终端的「只定位」脚本（[`Self::title_matched_script`] 的演练版）
+    ///
+    /// 遍历窗口看标题里有没有项目名，有就回报 `vscode-window`；没有 `AXRaise`、
+    /// 没有粘贴，纯查询。`no-app` 表示这个应用已经不在运行了。
+    #[cfg(target_os = "macos")]
+    fn title_locate_script(&self, app_hint: &str, project_name: &str) -> String {
+        // 连项目名都没有，窗口无从匹配；至少还能报一下应用在不在
+        if project_name.is_empty() {
+            return format!(
+                r#"tell application "System Events"
+    if (every application process whose name contains "{app_hint}") is {{}} then return "no-app"
+end tell
+return "refused""#
+            );
+        }
+        format!(
+            r#"tell application "System Events"
+    set candidates to (every application process whose name contains "{app_hint}")
+    if candidates is {{}} then return "no-app"
+    repeat with w in (every window of item 1 of candidates)
+        if name of w contains "{project_name}" then
+            return "vscode-window"
+        end if
+    end repeat
+end tell
+return "refused""#
+        )
+    }
+
     /// 获取进程所在的 TTY 设备路径
     #[cfg(unix)]
     pub fn get_tty_for_pid(pid: u32) -> Option<String> {
@@ -1115,6 +1348,143 @@ if ($located -eq "unlocated") {{ Write-Output "fallback" }} else {{ Write-Output
         )
     }
 
+    /// Windows 定位演练：走与 [`Self::resume_windows`] 相同的定位链路，但不前台化、不敲字
+    ///
+    /// 脚本只沿父进程链找到宿主窗口、核一下标题，然后回报级别：
+    /// 不调 `SetForegroundWindow`、不动剪贴板、不发 `SendKeys`。
+    #[cfg(target_os = "windows")]
+    async fn locate_windows(&self, session: &AgentSession) -> LocateReport {
+        let project = project_name_of(&session.working_dir).to_string();
+        let ps_script = Self::windows_locate_script(session.pid, &project, self.allow_blind());
+
+        let output = match run_with_timeout(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", &ps_script],
+            25,
+            &self.i18n,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return LocateReport {
+                    level: LocateLevel::Refused,
+                    message: self.i18n.tf("resume.script_failed", &[("detail", &e)]),
+                    terminal: String::new(),
+                    tty: None,
+                    project,
+                };
+            }
+        };
+
+        // 脚本输出两行：HOST=<进程名> 和一个结果码（EXACT/WINDOW/BLIND/REFUSED/NO_WINDOW）
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut host = String::new();
+        let mut code = String::new();
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("HOST=") {
+                host = v.to_string();
+            } else if !line.is_empty() {
+                code = line.to_string();
+            }
+        }
+
+        let level = match code.as_str() {
+            "EXACT" => LocateLevel::Exact,
+            // BLIND = 标题没对上但开了盲敲：真续跑会敲，所以归到「会敲但不精准」的黄灯
+            "WINDOW" | "BLIND" => LocateLevel::Window,
+            _ => LocateLevel::Refused, // REFUSED / NO_WINDOW
+        };
+        let message = match code.as_str() {
+            "EXACT" => self
+                .i18n
+                .tf("locate.exact_window", &[("terminal", host.as_str())]),
+            "WINDOW" => self.i18n.tf(
+                "locate.window",
+                &[("terminal", host.as_str()), ("project", project.as_str())],
+            ),
+            "BLIND" => self
+                .i18n
+                .tf("locate.blind_would", &[("terminal", host.as_str())]),
+            "NO_WINDOW" => self.i18n.t("locate.no_window").to_string(),
+            _ => self
+                .i18n
+                .tf("locate.refused", &[("terminal", host.as_str())]),
+        };
+        LocateReport {
+            level,
+            message,
+            terminal: host,
+            tty: None,
+            project,
+        }
+    }
+
+    /// Windows 定位演练脚本的生成器
+    ///
+    /// **故意不加 `#[cfg(target_os = "windows")]`**：与 [`Self::windows_resume_script`]
+    /// 同理——纯字符串拼接，不碰 Windows API，放开 cfg 之后每个平台的 CI 都能编它、测它。
+    ///
+    /// 它跟真续跑脚本共用同一套定位逻辑（沿父进程链找窗口 + 多标签宿主核标题），
+    /// 但**砂掉了一切副作用**：不 `ShowWindow` / `SetForegroundWindow`，不碰剪贴板，
+    /// 不 `SendKeys`。输出两行：`HOST=<进程名>` 供诊断，和一个结果码：
+    /// `EXACT`（cmd / conhost 单窗口）/ `WINDOW`（多标签标题对上）/
+    /// `BLIND`（标题没对但开了盲敲）/ `REFUSED`（标题没对且没盲敲）/ `NO_WINDOW`。
+    pub fn windows_locate_script(pid: u32, project_name: &str, allow_blind: bool) -> String {
+        let ps_project = project_name.replace('\'', "''");
+        let ps_blind = if allow_blind { "$true" } else { "$false" };
+        let multi_tab = WINDOWS_MULTI_TAB_HOSTS
+            .iter()
+            .map(|h| format!("'{h}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            r#"
+$target = {pid}
+$project = '{ps_project}'
+$allowBlind = {ps_blind}
+
+# 沿父进程链往上找第一个带窗口的祖先（与真续跑脚本同一条链路）
+$hostProc = $null
+$cur = $target
+for ($i = 0; $i -lt 8; $i++) {{
+    $p = Get-Process -Id $cur -ErrorAction SilentlyContinue
+    if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {{ $hostProc = $p; break }}
+    $ci = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+    if (-not $ci) {{ break }}
+    $cur = [int]$ci.ParentProcessId
+    if ($cur -le 4) {{ break }}
+}}
+
+if (-not $hostProc) {{
+    Write-Output "NO_WINDOW"
+    exit 0
+}}
+
+$hostName = $hostProc.ProcessName.ToLower()
+$title = [string]$hostProc.MainWindowTitle
+Write-Output "HOST=$($hostProc.ProcessName)"
+
+# 多标签宿主：认到窗口不等于认到标签，要核标题（但不前台化、不敲字）
+$multiTab = @({multi_tab})
+if ($multiTab -contains $hostName) {{
+    if ($project -ne '' -and $title.ToLower().Contains($project.ToLower())) {{
+        Write-Output "WINDOW"
+    }} elseif ($allowBlind) {{
+        Write-Output "BLIND"
+    }} else {{
+        Write-Output "REFUSED"
+    }}
+}} else {{
+    # cmd / conhost 这类单窗口宿主：一个窗口就是一个会话
+    Write-Output "EXACT"
+}}
+"#
+        )
+    }
+
     /// Linux: 通过 xdotool 定位终端窗口并发送续跑指令
     ///
     /// 策略：
@@ -1169,6 +1539,33 @@ if ($located -eq "unlocated") {{ Write-Output "fallback" }} else {{ Write-Output
                 }
                 self.resume_linux_ydotool(prompt).await
             }
+        }
+    }
+
+    /// Linux 定位演练：xdotool 能找到窗口，但认不出是哪个标签
+    ///
+    /// X11 路径走 [`Self::find_x11_window_for_pid`]，与真续跑相同；找到窗口算
+    /// 窗口级确定性（xdotool 没有「标签」概念，多标签终端仍可能敲错）。
+    /// 拿不到窗口（Wayland，或进程确实没窗口）时，真续跑会退到 ydotool 盲敲，
+    /// 演练就如实报「定位不到」。
+    #[cfg(target_os = "linux")]
+    fn locate_linux(&self, session: &AgentSession) -> LocateReport {
+        let project = project_name_of(&session.working_dir).to_string();
+        match Self::find_x11_window_for_pid(session.pid) {
+            Some(wid) => LocateReport {
+                level: LocateLevel::Window,
+                message: self.i18n.tf("locate.linux_window", &[("window", &wid)]),
+                terminal: "X11".to_string(),
+                tty: None,
+                project,
+            },
+            None => LocateReport {
+                level: LocateLevel::Refused,
+                message: self.i18n.t("locate.no_window").to_string(),
+                terminal: String::new(),
+                tty: None,
+                project,
+            },
         }
     }
 
@@ -1771,5 +2168,172 @@ mod tests {
                 assert!(!script.contains("using control down"), "{project}/{blind}");
             }
         }
+    }
+
+    // ── 定位演练（dry-run）──
+    //
+    // 演练的核心承诺是「只看不动」：走和真续跑同一条定位链路，
+    // 但不抢焦点、不动剪贴板、不敲一个字。下面每条都在钉这个承诺。
+
+    fn win_locate(project: &str, blind: bool) -> String {
+        Resumer::windows_locate_script(4242, project, blind)
+    }
+
+    #[test]
+    fn windows_locate_walks_up_to_the_host_window() {
+        // 与真续跑脚本同一条链路：agent 是控制台程序，窗口属于宿主，要往上找
+        let script = win_locate("agent-pulse", false);
+        assert!(script.contains("for ($i = 0; $i -lt 8; $i++)"), "要沿父进程链往上找");
+        assert!(script.contains("Write-Output \"HOST="), "要报宿主进程名供诊断");
+    }
+
+    #[test]
+    fn windows_locate_never_touches_the_window_or_keyboard() {
+        // 演练绝不能有副作用：不前台化、不碰剪贴板、不发按键
+        for blind in [false, true] {
+            let script = win_locate("agent-pulse", blind);
+            assert!(!script.contains("SetForegroundWindow"), "不许前台化 {blind}");
+            assert!(!script.contains("ShowWindow"), "不许还原窗口 {blind}");
+            assert!(!script.contains("SendKeys"), "不许发按键 {blind}");
+            assert!(!script.contains("Set-Clipboard"), "不许写剪贴板 {blind}");
+            assert!(!script.contains("Get-Clipboard"), "不许读剪贴板 {blind}");
+        }
+    }
+
+    #[test]
+    fn windows_locate_distinguishes_single_and_multi_tab_hosts() {
+        let script = win_locate("agent-pulse", false);
+        // 单窗口宿主（cmd / conhost）一个窗口就是一个会话 → EXACT；
+        // 多标签宿主认到窗口不等于认到标签，要核标题 → WINDOW / REFUSED
+        assert!(script.contains("Write-Output \"EXACT\""));
+        assert!(script.contains("Write-Output \"WINDOW\""));
+        assert!(script.contains("Write-Output \"REFUSED\""));
+        // 多标签名单与真续跑脚本共用同一张表
+        assert!(script.contains("'windowsterminal'"));
+        assert!(script.contains("'code'"));
+    }
+
+    #[test]
+    fn windows_locate_blind_branch_needs_permission() {
+        // 「标题没对上但仍会敲」的 BLIND 分支只在开了盲敲时才该出现
+        let on = win_locate("agent-pulse", true);
+        assert!(on.contains("Write-Output \"BLIND\""));
+        assert!(on.contains("$allowBlind = $true"));
+        let off = win_locate("agent-pulse", false);
+        assert!(off.contains("$allowBlind = $false"));
+    }
+
+    #[test]
+    fn locate_level_serializes_to_snake_case() {
+        // 前端靠这三个字符串选 ✅ / ⚠️ / ❌ 三种颜色，改名就是破坏契约
+        assert_eq!(serde_json::to_string(&LocateLevel::Exact).unwrap(), "\"exact\"");
+        assert_eq!(serde_json::to_string(&LocateLevel::Window).unwrap(), "\"window\"");
+        assert_eq!(serde_json::to_string(&LocateLevel::Refused).unwrap(), "\"refused\"");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_locate_scripts_never_type() {
+        // 演练的核心承诺：只看不动。所有定位脚本都不能含任何投递动作。
+        let r = resumer_with(false);
+        let scripts = [
+            r.macos_locate_script("iTerm2", Some("/dev/ttys003"), "agent-pulse"),
+            r.macos_locate_script("Terminal", Some("/dev/ttys003"), "agent-pulse"),
+            Some(r.title_locate_script("Code", "agent-pulse")),
+            Some(r.title_locate_script("Code", "")),
+        ];
+        for script in scripts.iter().flatten() {
+            assert!(!script.contains("write text"), "iTerm2 不许 write text");
+            assert!(!script.contains("keystroke"), "不许合成按键");
+            assert!(!script.contains("the clipboard"), "不许动剪贴板");
+            assert!(!script.contains("AXRaise"), "不许移动窗口");
+            assert!(!script.contains("activate"), "不许抢焦点");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_locate_matches_iterm_by_tty() {
+        let script = resumer_with(false)
+            .macos_locate_script("iTerm2", Some("/dev/ttys003"), "agent-pulse")
+            .expect("iTerm2 + TTY 该有定位脚本");
+        assert!(script.contains(r#"tty of aSession contains "/dev/ttys003""#));
+        assert!(script.contains(r#"return "matched""#));
+        assert!(script.contains(r#"return "refused""#));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_locate_unknown_terminal_has_no_script() {
+        // 连是哪个终端都认不出时，连 osascript 都不启动
+        assert!(resumer_with(false).macos_locate_script("", None, "agent-pulse").is_none());
+        assert!(resumer_with(true).macos_locate_script("SomethingElse", None, "agent-pulse").is_none());
+    }
+
+    /// 演练脚本也是生成的 AppleScript，语法同样要真编译一遍才放心
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_locate_script_compiles() {
+        use std::io::Write;
+
+        fn tool_exists(name: &str) -> bool {
+            Command::new("which")
+                .arg(name)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        fn app_installed(name: &str) -> bool {
+            Command::new("osascript")
+                .args(["-e", &format!(r#"id of application "{name}""#)])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !tool_exists("osacompile") {
+            return;
+        }
+
+        let cases: Vec<(&str, Option<&str>, &str, Option<&str>)> = vec![
+            ("iTerm2", Some("/dev/ttys003"), "agent-pulse", Some("iTerm2")),
+            ("Terminal", Some("/dev/ttys003"), "agent-pulse", Some("Terminal")),
+            ("Code", None, "agent-pulse", None),
+            ("Code", None, "", None),
+            ("Cursor", None, "agent-pulse", None),
+            ("PyCharm", None, "agent-pulse", None),
+        ];
+
+        let dir = std::env::temp_dir().join(format!("agent-pulse-locate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut compiled = 0usize;
+
+        for (app, tty, project, needs) in &cases {
+            if needs.map(|n| !app_installed(n)).unwrap_or(false) {
+                continue;
+            }
+            let Some(script) = resumer_with(false).macos_locate_script(app, *tty, project) else {
+                continue;
+            };
+            let src = dir.join("locate.applescript");
+            let mut f = std::fs::File::create(&src).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            drop(f);
+            let out = Command::new("osacompile")
+                .arg("-o")
+                .arg(dir.join("locate.scpt"))
+                .arg(&src)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{app}/{project} 定位脚本编译失败：{}\n--- 脚本 ---\n{script}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            compiled += 1;
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        // Code / Cursor / PyCharm 走 System Events 不依赖安装，至少这几个该被验到
+        assert!(compiled >= 3, "只编译了 {compiled} 个定位脚本，覆盖太少");
     }
 }

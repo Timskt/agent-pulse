@@ -1,5 +1,8 @@
 # AgentPulse 架构设计文档
 
+> ℹ️ 本文写于 v1.0 之前，只覆盖核心引擎三层。**完整的五层架构、配置参考、开发红线**请见
+> [PROJECT_STATUS.md](../PROJECT_STATUS.md)（第 4–11 节）。下文保留作为快速入门参考。
+
 ## 系统概览
 
 AgentPulse 是一个跨平台桌面应用，用于监控 AI Coding Agent（Claude Code / Codex CLI 等）的会话状态，自动检测中断并发送续跑指令。

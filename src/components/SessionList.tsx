@@ -16,7 +16,7 @@ import {
   selectSessions,
   useAppStore,
 } from "../stores/useAppStore";
-import type { AgentSession, AttentionLevel } from "../types";
+import type { AgentSession, AttentionLevel, LocateReport } from "../types";
 import { Badge, Button, Card, CardBar, EmptyState, Tooltip } from "./ui";
 
 /**
@@ -114,7 +114,9 @@ function SessionRow({
   const manualResume = useAppStore((s) => s.manualResume);
   const focusTerminal = useAppStore((s) => s.focusTerminal);
   const aiAnalyze = useAppStore((s) => s.aiAnalyze);
+  const locateSession = useAppStore((s) => s.locateSession);
   const [busy, setBusy] = useState(false);
+  const [locateResult, setLocateResult] = useState<LocateReport | null>(null);
 
   const stalled = session.status === "interrupted" || session.status === "suspended";
   const attention = session.attention;
@@ -135,6 +137,17 @@ function SessionRow({
       try {
         const verdict = await aiAnalyze(session.id);
         return { ok: !verdict.is_interrupted, message: verdict.reasoning };
+      } catch (e) {
+        return { ok: false, message: t("common.error", { detail: String(e) }) };
+      }
+    });
+
+  const locate = () =>
+    act(async () => {
+      try {
+        const report = await locateSession(session.id);
+        setLocateResult(report);
+        return { ok: report.level !== "refused", message: "" };
       } catch (e) {
         return { ok: false, message: t("common.error", { detail: String(e) }) };
       }
@@ -198,6 +211,14 @@ function SessionRow({
       </div>
 
       <div className="flex shrink-0 flex-wrap items-center gap-1">
+        <Button
+          size="xs"
+          variant="ghost"
+          disabled={busy}
+          onClick={locate}
+        >
+          {t("session.locate")}
+        </Button>
         {session.tty && (
           <Button
             size="xs"
@@ -230,6 +251,22 @@ function SessionRow({
           {t("session.resume")}
         </Button>
       </div>
+
+      {locateResult && (
+        <p
+          className={cn(
+            "w-full text-[10px] leading-relaxed",
+            locateResult.level === "exact"
+              ? "text-emerald-600"
+              : locateResult.level === "window"
+                ? "text-amber-600"
+                : "text-red-500"
+          )}
+        >
+          {locateResult.level === "exact" ? "✅" : locateResult.level === "window" ? "⚠️" : "❌"}{" "}
+          {locateResult.message}
+        </p>
+      )}
     </div>
   );
 }

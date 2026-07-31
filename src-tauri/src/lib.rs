@@ -201,6 +201,41 @@ async fn focus_terminal(state: State<'_, AppState>, session_id: String) -> Resul
     Ok(detail)
 }
 
+/// 定位演练（dry-run）：走完整定位链路，但在敲字前停下
+///
+/// 「续跑」的零风险版本——如实报告「真要续跑，字符会落到哪儿」：
+/// ✅ 精确匹配 / ⚠️ 窗口级匹配 / ❌ 定位不到。用户报「续跑没反应」时的
+/// 第一个诊断动作，也是他们敢开自动续跑之前看到的东西。
+#[tauri::command]
+async fn locate_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<resumer::LocateReport, String> {
+    let i18n = state.i18n();
+    let session = {
+        let s = state.engine.state.lock().await;
+        s.sessions
+            .iter()
+            .find(|sess| sess.id == session_id)
+            .cloned()
+            .ok_or_else(|| i18n.t("err.session_not_found").to_string())?
+    };
+
+    let resumer = resumer::Resumer::new(state.config_manager.get());
+    let report = resumer.locate(&session).await;
+
+    state
+        .engine
+        .push_event_public(EngineEvent::new(
+            LogLevel::Info,
+            Some(session_id),
+            i18n.tf("log.locate", &[("detail", &report.message)]),
+        ))
+        .await;
+
+    Ok(report)
+}
+
 /// 测试发送通知（验证整条提醒通道）
 #[tauri::command]
 async fn test_notify(state: State<'_, AppState>) -> Result<String, String> {
@@ -395,6 +430,7 @@ pub fn run() {
             update_config,
             manual_resume,
             focus_terminal,
+            locate_session,
             test_notify,
             get_platform_info,
             get_stats,

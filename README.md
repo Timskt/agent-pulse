@@ -42,8 +42,8 @@
 ### 前置要求
 
 - Rust 1.77+
-- Node.js 20+
-- pnpm 9+
+- Node.js 22+
+- pnpm 11+
 - macOS: Xcode Command Line Tools
 
 ### 开发运行
@@ -77,12 +77,14 @@ pnpm tauri:build
 1. **发现** — 适配器扫描系统中的 AI Agent 进程（Claude Code / Codex）
 2. **检测** — 轮询检查：会话文件是否停止更新、输出中是否有中断关键词、进程是否退出
 3. **决策** — 双重校验：有中断信号 + 无完成标记 → 确认中断
-4. **续跑** — 通过 AppleScript 向对应终端窗口发送续跑提示词
-5. **保护** — 冷却时间 + 次数上限，防止无限循环
+4. **续跑** — 跨平台投递：macOS (AppleScript) / Windows (PowerShell + Win32) / Linux (xdotool·ydotool)，提示词走剪贴板粘贴
+5. **保护** — 冷却时间 + 次数上限 + 定位不到就不敲，防止无限循环和误敲
 
 ## 配置说明
 
 配置文件位于 `~/Library/Application Support/agent-pulse/config.json`（macOS）。
+
+常用配置项：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -90,16 +92,19 @@ pnpm tauri:build
 | `idle_timeout_secs` | 60 | 空闲超时判定 |
 | `max_resume_count` | 5 | 单会话最大续跑次数 |
 | `resume_cooldown_secs` | 30 | 续跑冷却时间 |
+| `auto_follow_latest` | false | 定位不到时是否盲敲前台窗口 |
 | `custom_keywords` | rate limit, overloaded... | 中断触发关键词 |
-| `completion_markers` | Task completed... | 完成标记（不触发续跑） |
 | `resume_prompt` | 请继续完成... | 续跑提示词 |
+
+完整配置参考（20+ 主配置 + 7 个子配置）见 [PROJECT_STATUS.md § 10.3](./PROJECT_STATUS.md)。
 
 ## 路线图
 
-- [x] **v0.1.0** — 核心引擎 + Claude Code 适配器 + macOS 续跑 + Dashboard UI
-- [ ] **v0.2.0** — Windows/Linux 支持 + Codex 适配器完善 + 系统托盘
-- [ ] **v0.3.0** — 统计面板 + Webhook 通知 + 自定义适配器 UI
-- [ ] **v1.0.0** — AI 智能判断 + 多语言 + 自动更新
+- [x] **v1.0** — 核心引擎 + Claude Code / Codex CLI / OpenCode 适配器 + 三平台续跑 + Dashboard UI + 系统托盘
+- [x] **v1.1** — 剪贴板投递 + 定位不到就不敲 + 三平台 CI 矩阵 + 实机验证清单
+- [x] **v1.2** — 感知层（成本追踪 + 限流预测）+ 洞察层（AI 判定 + 统计面板）
+- [x] **v1.3** — 远程层（手机看板 + Webhook）+ 会话历史 + i18n 中英双语
+- [ ] **v1.4** — 续跑演练（dry-run）按钮 + 自定义适配器 UI + 前端测试 + 文档对齐
 
 ## License
 

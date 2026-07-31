@@ -191,6 +191,56 @@ const TABLE: &[(&str, &str, &str)] = &[
         "Could not tell which terminal this session lives in",
     ),
     ("focus.done_simple", "已跳到会话窗口（{outcome}）", "Jumped to the session window ({outcome})"),
+    // ── 定位演练（dry-run）的结果文案 ──
+    //
+    // 演练报告「真要续跑字符会落到哪儿」，分三级：✅ 精确（TTY / 单窗口级）/
+    // ⚠️ 窗口级（标题对上但可能敲错标签）/ ❌ 定位不到（不会投递）。
+    (
+        "locate.exact_tty",
+        "✅ 精确匹配 · {terminal} · 会话 TTY {tty}",
+        "✅ Exact match · {terminal} · session tty {tty}",
+    ),
+    (
+        "locate.exact_window",
+        "✅ 精确匹配 · {terminal} · 一个窗口就是一个会话",
+        "✅ Exact match · {terminal} · one window is one session",
+    ),
+    (
+        "locate.window",
+        "⚠️ 窗口级匹配 · {terminal} · 窗口标题含「{project}」——同一窗口若有多个标签，可能敲错",
+        "⚠️ Window-level match · {terminal} · title contains \"{project}\" — one window with several tabs could mean the wrong tab",
+    ),
+    (
+        "locate.refused",
+        "❌ 定位不到 · {terminal} · 当前设置下不会投递（可开启「跟随最新会话」强制）",
+        "❌ Not located · {terminal} · nothing would be typed under current settings (enable \"Follow the newest session\" to force)",
+    ),
+    (
+        "locate.blind_only",
+        "⚠️ {terminal} 没有定位接口 · 只会盲敲 · 当前设置下不会投递",
+        "⚠️ {terminal} offers no way to locate · it can only type blindly · nothing would be typed under current settings",
+    ),
+    (
+        "locate.blind_would",
+        "⚠️ {terminal} · 标题不含项目名 · 但已开启「跟随最新会话」 · 会盲敲",
+        "⚠️ {terminal} · title doesn't contain the project · but \"Follow the newest session\" is on · would type blindly",
+    ),
+    (
+        "locate.linux_window",
+        "⚠️ 定位到窗口 · xdotool 窗口 {window} · 认不出是哪个标签",
+        "⚠️ Window located · xdotool window {window} · can't tell which tab",
+    ),
+    (
+        "locate.no_window",
+        "❌ 进程没有窗口 · 可能已退出或在 Wayland 下 · 不会投递",
+        "❌ The process has no window · it may have exited or be on Wayland · nothing would be typed",
+    ),
+    (
+        "locate.no_terminal",
+        "❌ 认不出这个会话在哪个终端里 · 不会投递",
+        "❌ Can't tell which terminal this session lives in · nothing would be typed",
+    ),
+    ("log.locate", "定位演练：{detail}", "Locate rehearsal: {detail}"),
     // ── 外部命令（osascript / xdotool / PowerShell）的失败原因 ──
     //
     // 这些字符串会经 Err 一路冒到 Activity Log 里，同样是用户可见文案。
