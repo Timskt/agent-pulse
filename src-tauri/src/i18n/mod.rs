@@ -270,6 +270,15 @@ const TABLE: &[(&str, &str, &str)] = &[
         "Could not tell which terminal this session lives in",
     ),
     ("focus.done_simple", "已跳到会话窗口（{outcome}）", "Jumped to the session window ({outcome})"),
+    // ── 续跑演练（dry-run）的活动日志 ──
+    //
+    // 面板上那一大段多行结论留给面板；日志只留一行摘要，否则一次演练就把日志刷满。
+    // 用户报「续跑没反应」时截图的往往就是日志，有这一行就不用再问「你演练过吗」。
+    (
+        "log.probe",
+        "续跑演练：{certainty} · 通道 {channel}",
+        "Resume dry run: {certainty} · channel {channel}",
+    ),
     // ── 外部命令（osascript / xdotool / PowerShell）的失败原因 ──
     //
     // 这些字符串会经 Err 一路冒到 Activity Log 里，同样是用户可见文案。

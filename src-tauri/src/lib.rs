@@ -206,20 +206,46 @@ async fn focus_terminal(state: State<'_, AppState>, session_id: String) -> Resul
 /// 「按下去才知道会发生什么」是这个功能最大的心理负担——尤其在 IDE 里开的
 /// 终端上，敲错窗口的代价是把提示词打进别人的代码。演练把这件事变成零风险：
 /// 它回答「现在按续跑，字会落到哪儿」，以及「为什么落不到」。
+///
+/// 结论同时写一条活动日志：用户报「续跑没反应」时截的往往就是那面板，
+/// 有这一行就不用再问「你演练过吗、结果是什么」。
 #[tauri::command]
 async fn probe_resume(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<resumer::ResumeProbe, String> {
+    let i18n = state.i18n();
     let session = {
         let s = state.engine.state.lock().await;
         s.sessions
             .iter()
             .find(|sess| sess.id == session_id)
             .cloned()
-            .ok_or_else(|| state.i18n().t("err.session_not_found").to_string())?
+            .ok_or_else(|| i18n.t("err.session_not_found").to_string())?
     };
-    Ok(resumer::probe_resume(&session, &state.config_manager.get()).await)
+    let probe = resumer::probe_resume(&session, &state.config_manager.get()).await;
+
+    // 日志里只留一行摘要，多行的 detail 留给面板——否则一次演练就把日志刷满
+    state
+        .engine
+        .push_event_public(EngineEvent::new(
+            if probe.would_deliver {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+            Some(session_id),
+            i18n.tf(
+                "log.probe",
+                &[
+                    ("certainty", &probe.certainty_label),
+                    ("channel", &probe.channel),
+                ],
+            ),
+        ))
+        .await;
+
+    Ok(probe)
 }
 
 /// 一键跳到「辅助功能」设置页（macOS 专用）
