@@ -4,15 +4,15 @@
 
 # AgentPulse 项目现状与规划
 
-> 对应提交：`cee4248`（`main` == `origin/main`，工作区干净）
-> CI：run `30605028183` 全绿（Frontend / Rust macOS / Rust Ubuntu / Rust Windows）
+> 对应提交：`4b200f6`（`main` == `origin/main`）
+> CI：run `30700566408` 全绿（Frontend Test + Build / Rust macOS / Rust Ubuntu / Rust Windows）
 > 文档日期：2026-08-01
 
 这份文档写给三种人看：接手这个仓库的人、半年后忘了细节的我自己、以及想知道"到底做完了没有"的你。
 所以它有两条约定：
 
 1. **凡是"做了"的，都能在代码里指到具体位置**（文件 + 符号名），不能指的一律不写成已完成。
-2. **凡是没在真机上跑通过的，一律进第 11 节「未验证清单」**，不管代码写得多完整、单测多绿。
+2. **凡是没在真机上跑通过的，一律进第 12 节「未验证清单」**，不管代码写得多完整、单测多绿。
    续跑这种"往别人终端里敲字"的功能，单测绿 ≠ 真的能用。
 
 ---
@@ -25,11 +25,11 @@
 4. [代码地图](#4-代码地图)
 5. [运行时架构与数据流](#5-运行时架构与数据流)
 6. [检测引擎：两条正交的轴](#6-检测引擎两条正交的轴)
-7. [续跑层：跨平台的"确定性分级"](#7-续跑层跨平台的确定性分级)
+7. [续跑层：确定性分级与闭环核验](#7-续跑层确定性分级与闭环核验)
 8. [洞察层：成本、限流预测、统计](#8-洞察层成本限流预测统计)
 9. [远程层与通知层](#9-远程层与通知层)
 10. [前端、i18n 与配置](#10-前端i18n-与配置)
-11. [工程实践：CI、cfg 纪律、图标流水线](#11-工程实践cicfg-纪律图标流水线)
+11. [工程实践：CI、打包、cfg 纪律](#11-工程实践ci打包cfg-纪律)
 12. [已知欠账与未验证清单](#12-已知欠账与未验证清单)
 13. [未来规划与设计](#13-未来规划与设计)
 14. [附录](#14-附录)
@@ -40,20 +40,21 @@
 
 | 维度 | 现状 |
 |---|---|
-| 版本 | `1.0.0`（`package.json` / `src/App.tsx: APP_VERSION`） |
-| 后端 | Rust，17 个文件，**8479 行**（含单测） |
-| 前端 | TypeScript + React 19，26 个 `.ts/.tsx`，**3740 行**（+ `index.css` 71 行） |
-| 单元测试 | **80 个**，`cargo test` 全过；三个平台的 CI 都跑 |
-| Tauri 命令 | 21 个 `#[tauri::command]` |
+| 版本 | `1.5.0`（`package.json` 是唯一来源，`vite.config.ts` 注入 `__APP_VERSION__`；与 `tauri.conf.json` / `Cargo.toml` 的一致性由 `src/version.test.ts` 锁死） |
+| 后端 | Rust，17 个文件，**10755 行**（含单测） |
+| 前端 | TypeScript + React 19，30 个 `.ts/.tsx`，**4511 行**（+ `index.css` 71 行） |
+| 单元测试 | Rust **115 个**（`cargo test`）+ 前端 **32 个**（`pnpm test`，vitest）；两者都在三个平台的 CI 里跑 |
+| Tauri 命令 | 25 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
-| 续跑平台 | macOS / Windows / Linux 三套实现均已落地 |
-| i18n 词条 | 后端 89 条（`(key, zh, en)`），前端 202 条（`[zh, en]`） |
+| 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
+| i18n 词条 | 后端 151 条（`(key, zh, en)`），前端 220 条（`[zh, en]`） |
 | 持久化 | SQLite 6 张表 |
-| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
+| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
 
 **这个版本能做到的事**：在你不改变任何使用习惯的前提下，后台盯着 Claude Code / Codex / OpenCode
 的会话文件与进程，判断它是"还在干活"、"卡住了"、"在等你回话"、"限流了"还是"报错了"；
 该叫人的时候发通知（带托盘角标和声音），该补一句话的时候把续跑提示词**静默**送进它自己那个终端窗口；
+**敲完之后回头核验那句话有没有真的落地**，没落地就把这件事摆到你眼前，而不是假装续跑成功；
 同时把 token 用量折算成钱、预测下一次限流窗口、把这一切用一个只读网页暴露到手机上。
 
 **这个版本刻意做不到的事**：它不会帮你启动 agent，不会接管你的终端，不会在拿不准的时候乱敲键盘。
@@ -98,74 +99,104 @@ AgentPulse 走的是另一条：**附着在你已有的工作方式上**。代�
 | v1.1 | **感知层** | ✅ | `TurnState` 回合状态、`error_output` 结构性证据通道、`AttentionLevel` 注意力分级、系统通知 + 声音 + 托盘角标 + 节流、三平台续跑（Windows / Linux 补齐）、剪贴板投递绕开输入法 |
 | v1.2 | **洞察层** | ✅ | 21 个模型的价目表、用量归集与去重游标、按天/按项目成本、限流窗口预测、统计面板、会话历史 |
 | v1.3 | **远程层** | ✅ | 只读手机看板（令牌 + CSP nonce + 默认只听 127.0.0.1）、Webhook（Slack / Discord / ntfy / Bark / 自定义） |
-| v1.3 P2 | 远程审批 | ❌ | 手机上点一下"续跑"——**未实现**，见 [13.2](#132-v15-候选) |
+| v1.3 P2 | 远程审批 | ❌ | 手机上点一下"续跑"——**未实现**，见 [13.2](#132-下一步候选v16) |
+| v1.4 | **可信化** | ✅ | tmux/screen 免权限投递通道、续跑演练（`ResumeProbe` 干跑探测）、macOS 辅助功能权限自检与"去开权限"引导、前端 vitest、局域网看板换绑修复 |
+| v1.5 | **闭环化** | ✅ | 投递后核验落地（`ResumeOutcome` + `resume_verified`）、一个计数器拆成三个、上限从判定层挪到动作闸门、静默失败会出声、日志区分事件与状态、版本号单一来源 |
 | v2.0 | 编排层 | ⏸ | 主动搁置，与非侵入定位冲突，动工前需确认 |
 | v2.1+ | 自治层 | ⏸ | 同上 |
+
+v1.4 这一版没有加任何"新玩法"，全部力气花在**让已经写完的功能变得可信**上——因为此前最大的风险
+不是缺功能，而是续跑这条主链路只有单测、没有任何"它到底认到哪儿了"的可观测手段。
+
+v1.5 顺着同一条线再往下走一步：v1.4 解决的是"动手之前能不能先看一眼"，v1.5 解决的是
+**"动完手之后知不知道自己成功了没有"**。这两件事合起来才让"自动续跑"这四个字站得住——
+一个既不能预演、又不核验结果的自动化功能，本质上是在让用户替它做质检。详见 [7.8](#78-开环--闭环敲完之后要回头看一眼)。
 
 ### 最近的提交脉络
 
 ```
+4b200f6  feat(v1.5): 续跑改成闭环——敲完要核验，放弃要出声
+7121d60  chore(v1.5): 版本号收成一个来源，页脚不再手抄
+0c00f4b  fix(remote): 换绑地址前等旧监听真的落地，修复「开了局域网手机却被拒绝」
+dbd6a5e  merge: 归并两条并行的续跑定位实现，只留一份判定
+160429d  docs: 加入项目现状与规划全景文档
+635d720  fix(resume): 权限没到位时先说清楚，别只把窗口跳过来
+83ca5b3  feat(v1.4): 续跑演练(dry-run)按钮 + 三平台验证清单 + 前端测试 + 文档对齐
 cee4248  fix(ci): pin resumer_with to macOS, widen the blind-typing test to all three
 f3999c3  ci: lint and test all three platforms on every push
 a888d91  feat(icon): regenerate the whole icon set from a vector master
 49d16a6  feat: perception, insight and remote layers + clipboard-based resume
-045e571  fix(startup): remove non-functional updater plugin that crashed app on launch
-29ea671  fix(windows): glob backslash escaping + drive letter encoding; perf: single process snapshot per scan
-eb09819  fix(ci): replace deprecated macos-13 runner with cross-compilation on macos-latest
 ```
 
-`49d16a6` 是 v1.1–v1.3 三层的主体；后面三个提交在收拾工程侧的尾巴（图标、CI 矩阵、cfg 纪律）。
+`49d16a6` 是 v1.1–v1.3 三层的主体；`83ca5b3` 起是 v1.4 可信化；`7121d60`/`4b200f6` 是 v1.5 闭环化。
+`dbd6a5e` 是一次真实的归并——本地和远端各自实现过一遍"续跑往哪儿投"的判定，合并时只留了一份，
+没有 force-push 覆盖任何一边。
 
 ---
 
 ## 4. 代码地图
 
-### 后端（`src-tauri/src/`，8479 行）
+### 后端（`src-tauri/src/`，10755 行）
 
 | 文件 | 行数 | 职责 | 关键符号 |
 |---|---:|---|---|
-| `resumer/mod.rs` | 1775 | 续跑执行器，**唯一带平台 cfg 的文件** | `Resumer::resume`、`resume_macos/windows/linux`、`macos_script`、`windows_resume_script`、`stage_clipboard`、`focus_session`、`TERMINAL_PATTERNS`、`WINDOWS_MULTI_TAB_HOSTS` |
-| `monitor/mod.rs` | 890 | 引擎主循环：一轮扫描的编排、事件流、成本告警 | `MonitorEngine::{start,stop,scan_once,collect,run_resumes,check_cost_alerts}`、`EngineEvent`、`ScanOutcome` |
-| `detector/mod.rs` | 823 | 判定：要不要续跑（`Verdict`）+ 要不要叫人（`AttentionLevel`） | `Detector::detect`、`make_verdict`、`grade_attention`、`contains_keyword`、`SignalKind` |
-| `remote/mod.rs` | 718 | 只读手机看板的 HTTP 服务（手写，无框架） | `RemoteService::{new,sync,generate_token}`、`secret_eq`、`respond_with_nonce`、`page` |
+| `resumer/mod.rs` | 3189 | 续跑执行器，**唯一带平台 cfg 的文件** | `Resumer::{resume,probe}`、`ResumeOutcome`、`resume_verified`、`transcript_fingerprint`、`resume_macos/windows/linux`、`macos_script`、`windows_resume_script`、`stage_clipboard`、`focus_session`、`accessibility_granted`、`tmux_send`、`ResumeProbe`、`ToolStatus`、`TERMINAL_PATTERNS`、`WINDOWS_MULTI_TAB_HOSTS` |
+| `monitor/mod.rs` | 1292 | 引擎主循环：一轮扫描的编排、动作闸门、事件流、成本告警 | `MonitorEngine::{start,stop,scan_once,collect,run_resumes,check_cost_alerts,push_event_on_change,forget_topic}`、`apply_resume_outcome`、`effective_cooldown`、`has_nudges_left`、`should_say`、`EngineEvent`、`ScanOutcome` |
+| `detector/mod.rs` | 883 | 判定：现在是什么状态（`Verdict`）+ 要不要叫人（`AttentionLevel`） | `Detector::detect`、`make_verdict`、`grade_attention`、`contains_keyword`、`SignalKind` |
+| `remote/mod.rs` | 870 | 只读手机看板的 HTTP 服务（手写，无框架） | `RemoteService::{new,sync,generate_token}`、`stop_listener`、`bind_with_retry`、`lan_ipv4`、`is_weak_lan_token`、`secret_eq`、`respond_with_nonce`、`page` |
 | `storage/mod.rs` | 651 | SQLite 持久化，6 张表 | `record_resume/record_detection/record_scan/record_usage_batch/…` |
+| `lib.rs` | 627 | Tauri 装配：AppState、托盘、事件泵、25 个命令 | `run()`、`setup_tray`、`engine-events` 泵 |
 | `adapters/claude_code.rs` | 602 | Claude Code 适配器（最完整的那个） | `extract_text_from_jsonl`、`error_output`、`classify_turn`、尾部窗口读取 |
-| `lib.rs` | 544 | Tauri 装配：AppState、托盘、事件泵、21 个命令 | `run()`、`setup_tray`、`engine-events` 泵 |
+| `i18n/mod.rs` | 531 | 后端文案表（151 条 `(key, zh, en)`） | `I18n::{t,tf}`、`TABLE` |
 | `cost/mod.rs` | 512 | 价目表、用量归集、按天/项目成本、限流预测 | `PRICE_TABLE`、`price_for`、`CostTracker`、`forecast_rate_limit` |
-| `i18n/mod.rs` | 393 | 后端文案表（89 条 `(key, zh, en)`） | `I18n::t`、`TABLE` |
 | `config/mod.rs` | 357 | 配置结构与持久化 | `AppConfig` + 6 个子配置、`ConfigManager` |
 | `webhook/mod.rs` | 346 | 五种 Webhook 目标的载荷构造 | `WebhookConfig`、`provider` 分派 |
 | `notify/mod.rs` | 309 | 系统通知、节流、托盘角标 | `Notifier::{allow,notify_attention,update_tray_badge}`、`composite_badge` |
-| `adapters/mod.rs` | 242 | 适配器抽象与进程快照 | `AgentAdapter` trait、`AgentSession`、`TurnState`、`take_process_snapshot` |
+| `adapters/mod.rs` | 269 | 适配器抽象与进程快照 | `AgentAdapter` trait、`AgentSession`、`TurnState`、`take_process_snapshot` |
 | `ai_judge/mod.rs` | 158 | 可选的 LLM 兜底判定（默认关闭，供应商中立） | `AiJudgeConfig` |
 | `adapters/opencode.rs` | 78 | OpenCode 适配器 | |
 | `adapters/codex.rs` | 75 | Codex CLI 适配器 | |
 | `main.rs` | 6 | 入口 | |
 
-### 前端（`src/`，3740 行 + 71 行 CSS）
+`resumer/mod.rs` 从 1775 行长到 3189 行，多出来的一千四百行是三件事：v1.4 的 tmux/screen 投递通道
+与**演练探测**（`probe`，把"按下去才知道对不对"变成"随时可查"），以及 v1.5 的**落地核验**
+（`resume_verified`，把"脚本没报错"变成"字真的进去了"）。`monitor/mod.rs` 从 890 长到 1292，
+多出来的几乎全是**动作闸门**——判定层退回只说事实之后，"该不该动手"这个问题需要一个明确的家。
+
+### 前端（`src/`，4511 行 + 71 行 CSS）
 
 | 文件 | 行数 | 职责 |
 |---|---:|---|
-| `components/ConfigPanel.tsx` | 813 | 设置页，配置项最多的地方（也是唯一需要拆分的文件，见欠账） |
-| `i18n/index.ts` | 408 | 前端文案表（202 条 `[zh, en]`） |
-| `stores/useAppStore.ts` | 320 | Zustand store：状态、事件、命令封装 |
-| `types.ts` | 259 | 与 Rust 侧结构一一对应的类型 |
-| `components/SessionList.tsx` | 235 | 会话卡片：状态、注意力标记、续跑按钮 |
+| `components/ConfigPanel.tsx` | 867 | 设置页，配置项最多的地方（也是唯一需要拆分的文件，见欠账） |
+| `i18n/index.ts` | 520 | 前端文案表（220 条 `[zh, en]`） |
+| `components/SessionList.tsx` | 406 | 会话卡片：状态、注意力标记、续跑按钮、演练结果、失败与停手标签 |
+| `stores/useAppStore.ts` | 361 | Zustand store：状态、事件、命令封装 |
+| `types.ts` | 298 | 与 Rust 侧结构一一对应的类型 |
 | `components/CostPanel.tsx` | 208 | 成本页：按天柱状图、按项目、限流预测 |
+| `stores/useAppStore.test.ts` | 171 | store 归约的单测 |
 | `components/StatsPanel.tsx` | 168 | 统计页 |
-| `App.tsx` | 161 | 5 个 Tab 的外壳、页头徽标、页脚 |
+| `App.tsx` | 167 | 5 个 Tab 的外壳、页头徽标、页脚、`APP_VERSION` |
 | `components/ui/Field.tsx` | 157 | 表单字段的统一封装 |
 | `components/HistoryPanel.tsx` | 141 | 会话历史 |
 | `components/ui/BarChart.tsx` | 113 | 纯 SVG 柱状图（不引图表库） |
 | `components/ui/Card.tsx` | 103 | 卡片 |
+| `lib/utils.test.ts` | 84 | `cn()` 的单测 |
 | `components/ui/Switch.tsx` | 84 | Radix Switch 封装 |
 | `components/LogPanel.tsx` | 79 | 活动日志流 |
-| `components/ui/{Select,Button,Tooltip,Tabs,index}.tsx` | 33–63 | Radix 组件封装 |
 | `lib/display.ts` | 65 | 展示层格式化（时间、金额、截断） |
+| `components/ui/Select.tsx` | 63 | Radix Select 封装 |
 | `lib/chime.ts` | 60 | WebAudio 提示音（不带音频文件） |
+| `lib/display.test.ts` | 58 | 格式化函数的单测 |
+| `components/ui/Button.tsx` | 54 | |
 | `components/StatusCards.tsx` | 48 | 顶部四张状态卡 |
-| `lib/useNotice.ts` | 36 | 轻量 toast |
+| `components/ui/Tooltip.tsx` | 43 | |
 | `lib/utils.ts` | 41 | `cn()` 等工具 |
+| `components/ui/Tabs.tsx` | 37 | |
+| `lib/useNotice.ts` | 36 | 轻量 toast |
+| `components/ui/index.ts` | 33 | 组件桶导出 |
+| `version.test.ts` | 32 | **版本号一致性守卫**：见 11.6 |
+| `main.tsx` | 10 | 挂载 |
+| `vite-env.d.ts` | 4 | 环境类型 |
 
 ---
 
@@ -200,11 +231,15 @@ take_process_snapshot() │  ① 发现            ② 取证            ③ 判
 
 **③ 判定** — `Detector::detect` 产出 `DetectionResult`，里面同时装着两条独立结论（第 6 节）。
 
-**④ 执行** — 只有 `Verdict::ConfirmInterrupt` 且过了冷却、且 `auto_resume_enabled` 为真，
-才会进入 `resume_actions`；随后 `run_resumes` 串行调 `Resumer::resume`。
+**④ 执行** — 判定为 `Verdict::ConfirmInterrupt` 之后还要过**三道各管一件事的闸门**，
+全部放行才进 `resume_actions`：冷却（`effective_cooldown` + `check_cooldown`，太频繁）、
+额度（`has_nudges_left`，催也没用）、总开关（`auto_resume_enabled`，用户不让）。
+拦下来的那一轮会说清是哪一道拦的——"等几十秒就好"和"得人去看一眼"对你的要求完全不同。
+随后 `run_resumes` 串行调 `Resumer::resume`，**并核验那句话有没有真的落地**（见 7.8）。
 
 **⑤ 落库与广播** — 检测、续跑、扫描、用量分别落到 SQLite；`EngineEvent` 进内存环形队列；
-达到条件时触发系统通知与 Webhook。
+达到条件时触发系统通知与 Webhook。这一步有一条容易踩的纪律：**事件按跃迁发，状态按变化发**，
+见 [7.11](#711-事件与状态日志不能自我复述)。
 
 ### 进程内的装配（`lib.rs`）
 
@@ -224,7 +259,7 @@ AppState {
   前端因此不需要轮询 `invoke`，也不会因为一轮扫描很慢而卡住 UI。
 - **自启动**：`tauri_plugin_autostart`（macOS 用 `LaunchAgent`）。
 - **注意**：`045e571` 移除了 updater 插件——它在没有配置签名公钥的情况下会让应用启动即崩。
-  自动更新要重做（见 [13.2](#132-v15-候选)）。
+  自动更新要重做（见 [13.2](#132-下一步候选v16)）。
 
 ### SQLite 表（`storage/mod.rs`）
 
@@ -241,18 +276,23 @@ AppState {
 
 ## 6. 检测引擎：两条正交的轴
 
-整个 `detector` 模块的设计核心是一句话：**"要不要替你敲一句话"和"要不要现在叫你过来"是两个问题，
+整个 `detector` 模块的设计核心是一句话：**"这个会话现在是什么状态"和"要不要现在叫你过来"是两个问题，
 不能用同一个阈值回答。**
 
 | | `Verdict`（中断判定） | `AttentionLevel`（注意力分级） |
 |---|---|---|
-| 回答的问题 | 要不要**续跑** | 要不要**现在叫人** |
+| 回答的问题 | 它现在**是什么状态**（够不够格续跑） | 要不要**现在叫人** |
 | 取值 | `Running` / `Suspicious` / `ConfirmInterrupt` / `TaskCompleted` | `None` / `NeedsInput` / `Completed` / `RateLimited` / `Error` |
 | 判错的代价 | **高**——往一个正在干活的会话里回车，会打断它、污染上下文 | **低**——多发一条通知，代价只是你瞥一眼 |
 | 因此阈值 | 极严，只认两种确定情形 | 明显更松，宁可多叫一次 |
 
 这条区分是被实际 bug 逼出来的：早期版本用同一套信号同时决定"通知"和"续跑"，
 结果要么通知太少（漏掉真的在等你的会话），要么续跑太猛（在压缩上下文的间隙里敲字）。
+
+还有一条同源但更容易被忽略的纪律：**判定层只回答"是什么"，不回答"该不该动手"。**
+额度、冷却、总开关全部住在 `monitor` 的动作闸门里，`make_verdict` 一个都不看。
+原因见 [7.10](#710-上限从判定层挪到动作闸门放弃动手的那一刻正是最该开口的一刻)——
+把"该不该动手"混进判定，代价是应用会在放弃动手的同时把提醒也一起收掉。
 
 ### 6.1 四种信号（`SignalKind`）
 
@@ -369,9 +409,11 @@ struct DetectionResult {
 
 ---
 
-## 7. 续跑层：跨平台的"确定性分级"
+## 7. 续跑层：确定性分级与闭环核验
 
-续跑要解决两个完全独立的难题。
+续跑要解决三个完全独立的难题：**投递什么**（7.1）、**投给谁**（7.2–7.6）、
+以及 v1.5 补上的第三个——**投完之后怎么知道成没成**（7.8–7.12）。
+外加一件横跨三者的事：**在真敲之前先看一遍会敲到哪**（7.13）。
 
 ### 7.1 难题一：投递什么——提示词走剪贴板，不走合成按键
 
@@ -465,14 +507,191 @@ IDE 按**进程名前缀**匹配而不是精确等于（`ide_paths_match_by_proc
 
 ### 7.7 保护机制
 
-| 机制 | 默认值 | 作用 |
-|---|---|---|
-| `max_resume_count` | 5 | 单会话最多续跑几次，防止无限循环（测试 `resume_cap_stops_further_typing`） |
-| `resume_cooldown_secs` | 30 | 两次续跑之间的冷却（测试 `cooldown_*`） |
-| `auto_resume_enabled` | `true` | 总开关；关掉后只通知不动手 |
-| `auto_follow_latest` | `false` | 盲敲授权，见 7.2 |
+| 机制 | 默认值 | 作用 | 住在哪 |
+|---|---|---|---|
+| `max_resume_count` | 5 | **连着**催几次没反应就停手（数 `resume_streak`，不是累计次数） | `monitor::has_nudges_left` |
+| `resume_cooldown_secs` | 30 | 两次续跑之间的冷却；投递连续失败时线性放大（`effective_cooldown`，上限 5 倍） | `monitor::check_cooldown` |
+| `auto_resume_enabled` | `true` | 总开关；关掉后只通知不动手 | `monitor::scan_once` |
+| `auto_follow_latest` | `false` | 盲敲授权，见 7.2 | `Resumer::allow_blind` |
 
-`resumer` 模块共 **26 个单元测试**，是全仓库测试最密的模块——因为它是唯一会"对外界产生副作用"的模块。
+四条里前三条**都不在判定层**——这是 v1.5 特意搬的家，理由见 7.10。
+（测试：`exhausted_streak_stops_typing_but_not_watching`、`failed_deliveries_never_exhaust_the_budget`、
+`cooldown_*`、`verdict_ignores_every_resume_counter`）
+
+`resumer` 模块共 **46 个单元测试**，是全仓库测试最密的模块——因为它是唯一会"对外界产生副作用"的模块。
+
+### 7.8 开环 → 闭环：敲完之后要回头看一眼
+
+用户的原话是「自动续跑好像还是不行」，而且这已经是第三次报同一类问题。前两次都是照着症状打补丁；
+这一次先问了一句"为什么每次都要等他来报"，答案是整条续跑链是**开环**的。
+
+`Resumer::resume` 返回 `Ok` 的真实含义只是「AppleScript / PowerShell / xdotool 没报错」，
+而不是「那句话进了那个会话」。这两件事之间横着一堆现实：
+
+| 脚本成功但字没进去 | 为什么 |
+|---|---|
+| 焦点在最后一刻被别的窗口抢走 | 前台化和按键之间有时间差 |
+| 粘贴进了同一个窗口的隔壁标签 | 多标签宿主只能靠标题匹配，标题会变 |
+| 输入法把内容吃掉 | 走剪贴板已经大幅缓解，但组合键仍可能被 IME 拦 |
+| pane 刚好被关掉 | tmux 通道里 pane id 会失效 |
+| 辅助功能授权掉了 | macOS 上重签名、换版本都会掉，见 12.6 |
+
+**发出动作却从不观察世界有没有变，这样的系统永远学不会自己坏了**，于是它的失败只能由用户来发现——
+一次又一次。
+
+闭环需要的信号本来就躺在磁盘上：agent 只要真的动起来，就会往自己的会话记录里写东西。
+
+```rust
+enum ResumeOutcome {
+    Failed,        // 通道自己就报错了，字肯定没出去
+    Landed,        // 会话记录长了 → 它动了
+    Silent,        // 脚本成功，但记录一动不动 → 没落地
+    Unverifiable,  // 这个 agent 没有可核验的记录文件
+}
+```
+
+`resume_verified()` 的做法很朴素：投递**前**给 `session.session_file` 拍一个 `(长度, mtime)` 指纹，
+投完盯 6 秒，长了就是落地了。没长就是没落地——**至于为什么没落地，这一层不必知道**，
+也正因如此以后新增投递通道不需要再配一套失败识别逻辑。
+
+一个刻意的分级：没有会话记录文件的 agent 记成 `Unverifiable`，**不算失败**。
+宁可承认"这个核验不了"，也不假装核验过——把"不知道"记成"成功"是所有静默失败的起点。
+
+### 7.9 一个被当三件事用的计数器，拆成三个
+
+旧代码只有 `resume_count` 一个数字，同时被用来做三件互相冲突的事：给人看、撞上限、判断通道健康。
+更糟的是它在**投递之前**就自增，且失败不回退。后果是一条完整的失效链：
+
+> 辅助功能授权掉了 → 5 次投递全部失败，但 `resume_count` 照样从 0 数到 5 →
+> 第 6 次起自动续跑对这个会话**永久沉默** → 而一个字都没真的敲进去过。
+
+现在是三个各管一件事的计数器：
+
+| 计数器 | 数什么 | 谁在用 | 什么时候清零 |
+|---|---|---|---|
+| `resume_count` | 一辈子催过多少次 | 只给人看（会话卡片上的"已续跑 N 次"） | 永不 |
+| `resume_streak` | **连着**催了几次却没见它动 | `has_nudges_left` 对着 `max_resume_count` | 判定回到 `Verdict::Running`（会话真动了） |
+| `resume_failures` | 连着几次**根本没送达** | `effective_cooldown` 退避 + 告警升级 + 卡片红标签 | 一次 `Landed` |
+
+策略集中在一个纯函数 `apply_resume_outcome` 里，**不裹在锁里**——裹在锁里的策略没法单测，
+而这三个数字的关系正是最需要被钉住的部分。
+
+顺带修掉的第三个语义错误：上限的含义从"一辈子"改成"连着"。拿累计次数撞上限，等于给每个会话发一张
+「一生只准被催 5 次」的配额卡——一个跑一整天、真的停顿过六次的会话，从第六次起就没人管了。
+上限想拦的是"对着一个不响应的会话空转"，不是"一个会话一辈子只准被催 5 次"。
+「它其实没干完活，每次都要我去发继续」有一半是这么来的。
+
+### 7.10 上限从判定层挪到动作闸门（放弃动手的那一刻，正是最该开口的一刻）
+
+上限原来是 `Detector::make_verdict` 里的一句提前返回，位置在任何证据被检查**之前**：
+
+```rust
+// 旧代码（已删除）
+if session.resume_streak >= config.max_resume_count {
+    return Verdict::Suspicious;
+}
+```
+
+两个真实后果：
+
+1. **单向门**。额度一光，判定永远给不出 `Running`，而清零条件正是 `Running`——
+   于是会话自己恢复干活了，界面上还挂着"疑似中断"，而且再也回不去。
+2. **悄悄放弃**（更严重的一个）。`grade_attention` 对 `Suspicious` 的处理是
+   `(AttentionLevel::None, None)`，也就是不打扰。于是应用一边放弃自己动手，
+   一边把该给人的提醒**也一起收了**——托盘上一片安静，用户还以为有人在守着。
+
+修法不是给这个 `if` 加条件，而是承认它站错了地方：**判定层回答"它是什么状态"，
+额度回答"我们还该不该动手"，这是两个问题。** 现在判定照实说 `ConfirmInterrupt`，
+注意力分级照常升到 `NeedsInput`，托盘角标和通知照常叫人；只有敲字这一件事停下来，
+并且在日志里说清楚是"催不动了"而不是"还在冷却"。
+
+（测试：`a_session_we_stopped_nudging_still_calls_for_help` 走完整条链——
+`ConfirmInterrupt` → `NeedsInput` → `attention.is_pending()`。这条链上任何一环退化，
+应用就会重新学会安静地放弃。）
+
+### 7.11 事件与状态：日志不能自我复述
+
+把上限搬出判定层之后暴露了一个更早就存在的缺陷：一个**持续**处于中断状态的会话
+（用户关了自动续跑，或者已经催不动了），每 10 秒就会重新落一条检测记录、写一条
+"检测到中断"日志、发一条 webhook。
+
+根子在于**事件和状态是两种东西，日志却只有一条流**：
+
+| | 例子 | 该怎么说 |
+|---|---|---|
+| **事件** | "检测到中断" | 发生一次说一次——按**状态跃迁**发 |
+| **状态** | "已经催不动了" | 它会一直成立——按**指纹变化**发 |
+
+两种机制刻意分开实现：
+
+- 事件走跃迁门：`if session.status != SessionStatus::Interrupted`，落库 / 日志 / webhook 三处跟着同一个条件。
+  （这个写法本来就在用了——`Verdict::TaskCompleted` 一直是这么发的，只是中断这条漏了。）
+- 状态走 `push_event_on_change(topic, fingerprint, event)`：`topic` 说"这条在讲哪件事"，
+  `fingerprint` 说"那件事现在什么样"。指纹没变就闭嘴，变了（连击数从 5 涨到 8）才再说一次。
+  情况解除时调用方要 `forget_topic`，否则同一个情况第二次发生就说不出口了。
+
+顺手修正的一个不诚实的数字：`status.total_detections` 以前数的是"本轮有几个会话处于确认中断"，
+于是一个开着的中断会话每轮都记一笔，界面上的检测数和 `detection_records` 的行数越差越远。
+现在只数**新确认**的（`newly_confirmed`），它自己注释里承诺的那个不变式终于成立了。
+
+（测试：`standing_conditions_are_only_announced_once` 直接测纯函数 `should_say`：
+同一指纹说一次、指纹变了再说一次、忘掉之后能重新开口。）
+
+### 7.12 静默的功能坏掉时必须变吵
+
+自动续跑的全部价值在于"你感觉不到它"。代价是：**它坏掉的时候，长得和它正常工作一模一样**。
+所以这一层的每个失败都有一个出口：
+
+| 出口 | 触发 | 在哪看到 |
+|---|---|---|
+| 系统通知 | 连续 2 次没送达（≥600 秒节流） | 桌面通知 |
+| 启动前体检 | 引擎 `start()` 前查 macOS 辅助功能授权 | 活动日志 + 通知 |
+| 红标签「敲不进去 ×N」 | `resume_failures > 0` | 会话卡片 |
+| 琥珀标签「已停手，等你」 | `resume_streak >= max_resume_count` | 会话卡片 |
+| 「催不动了」日志 | 额度闸门拦下的那一轮（指纹变化时） | 活动日志 |
+| 演练按钮 | 随时手动 | 会话卡片内展开（见 7.13） |
+
+前两个是 v1.4 的，后四个是 v1.5 的。共同的判断标准只有一句：**用户不应该靠
+"怎么一直没人帮我按继续"来发现这个功能坏了。**
+
+### 7.13 演练（dry run）：把定位链路走一遍，但一个字都不敲
+
+7.2 的策略是"定位不到就不敲"，可它对用户是**黑箱**：按下去之前没人知道会命中哪条分支。
+而这个功能最大的心理负担恰恰在这里——尤其在 IDE 集成终端上，敲错标签就是把提示词
+写进别人的代码。所以 `Resumer::probe` 走**完全相同的定位链路**，走到"该投递了"这一步
+停手，把过程本身交回来：
+
+```rust
+pub struct ResumeProbe {
+    pub session_id: String,
+    pub certainty: String,          // exact | window | none —— 与真实投递同一套判定
+    pub certainty_label: String,    // 已按当前语言翻好，前端不再拼字
+    pub channel: String,            // tmux 面板 / iTerm2 标签 / 编辑器内置终端 …（已本地化）
+    pub target: Option<String>,     // 命中的 pane id、tty、窗口标题或窗口 id
+    pub detail: String,             // 卡在哪一环的人话说明（已本地化）
+    pub would_deliver: bool,        // 按现在的配置，点"续跑"会不会真的发出字符
+    pub terminal_app: Option<String>,
+    pub tty: Option<String>,
+    pub project_name: String,
+    pub allow_blind: bool,          // 「盲敲最前窗口」开没开
+    pub needs_permission_fix: bool, // macOS 辅助功能没给 → 前端出「去开权限」按钮
+    pub tools: Vec<ToolStatus>,     // 这条通道依赖的外部工具在不在（含用途说明）
+}
+```
+
+三个设计约束：
+
+- **和真实路径共用判定，不另写一套。** 如果演练自己有一份"大概是这样"的逻辑，它就会
+  在最需要可信的时候骗人。共用的代价是 `probe` 必须能在"要投递了"的位置干净地返回。
+- **零副作用。** 不改剪贴板、不前台化窗口、不发任何按键；所以 tooltip 敢写
+  "演练不会敲任何字，随便点"，用户才会真的去点。
+- **结论要能直接行动，而且不靠认字符串。** `needs_permission_fix` 是个布尔而不是让前端
+  去匹配工具名——认名字就得按语言比字符串，换成英文界面立刻失灵；它直接连到
+  「去开权限」按钮（`openAccessibilitySettings`）。`tools` 把缺失的 `xdotool` / `wl-copy`
+  连同**它是干什么用的**一起列出来，只报"缺失"等于把排查工作又推回给用户。
+
+它同时是最省事的支持工具：用户报"续跑没反应"时，第一句话就是"点一下演练，把那一栏
+念给我听"，因为它一次回答了 7.2 的确定性、7.4 的通道、以及依赖是否就位。
 
 ---
 
@@ -637,19 +856,19 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 | `RemoteConfig` | `enabled: false`，`port: 17650`，`bind_all: false`，`token: ""` |
 | `WebhookConfig` | 默认关；provider + url + topic + template |
 | `AiJudgeConfig` | 默认关；供应商中立（见 12.4） |
-| `CustomAdapterConfig` | 自定义适配器的配置载体（UI 未做，见 13.1） |
+| `CustomAdapterConfig` | 自定义适配器的配置载体（UI 未做，见 13.2） |
 | `ModelPriceOverride` | 用户覆盖价目表 |
 
 ---
 
-## 11. 工程实践：CI、cfg 纪律、图标流水线
+## 11. 工程实践：CI、打包、cfg 纪律
 
 ### 11.1 CI 现状（`.github/workflows/ci.yml`）
 
 | Job | 触发 | 内容 |
 |---|---|---|
 | `check-rust` | 每次 push / PR | **三平台矩阵**（ubuntu / macos / windows，`fail-fast: false`）→ `cargo clippy --all-targets -- -D warnings` → `cargo test` |
-| `check-frontend` | 每次 push / PR | pnpm 11 + Node 22 → `pnpm build`（`tsc && vite build`，类型错误即红） |
+| `check-frontend` | 每次 push / PR | pnpm 11 + Node 22 → `pnpm test`（vitest，32 个）→ `pnpm build`（`tsc && vite build`，类型错误即红） |
 | `build-tauri` | **仅 `v*` 标签** | 4 个目标：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc` |
 | `release` | 仅 `v*` 标签 | 汇总产物 → `softprops/action-gh-release@v2` |
 
@@ -658,11 +877,15 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 - **三个平台都跑 lint 和测试**。续跑层几乎全是 `#[cfg(target_os = …)]`，只在 ubuntu 上跑 clippy
   等于 Windows 和 macOS 分支从来没被编译过——上一版就是这么让一个 Windows 专属编译错误
   躺到打标签才暴露的。
-- **`--all-targets`**。不加它，`#[cfg(test)]` 里的代码不会被编译；80 个单元测试是跨平台脚本
+- **`--all-targets`**。不加它，`#[cfg(test)]` 里的代码不会被编译；115 个单元测试是跨平台脚本
   唯一的自动化保障，"能编译"和"测试也能编译"是两件事。
 
-最近一次绿灯：run `30605028183`（Frontend 16s / macOS 1m / Ubuntu 2m / Windows 1m；
-`build-tauri` 与 `release` 因为不是标签推送而 Skipped，符合预期）。
+还有一处后补的：**`pnpm test` 单独一步，排在 `pnpm build` 前面**。此前 `check-frontend` 只跑
+`pnpm build`，于是前端的 32 个测试在 CI 里根本没人跑——本地绿、远端从不验证，等于没有。
+拆成两步还有个好处：测试挂了能一眼看出是测试挂了，而不是被埋进一次构建失败里。
+
+最近一次绿灯：run `30700566408`（Frontend / Rust macOS / Rust Ubuntu / Rust Windows 四个全绿；
+`build-tauri` 与 `Create Release` 因为不是标签推送而 Skipped，符合预期）。
 
 ### 11.2 一个值得记住的教训：cfg 必须跟调用点严格对齐
 
@@ -692,7 +915,72 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 2. 平台无关的纯字符串生成器 + 数据表故意不加 cfg，让每个平台都能跑它们的测试（11.2）；
 3. 改动 cfg 时做一遍静态审计：逐个确认每个带 Linux/Windows cfg 的私有项都有同平台调用点。
 
-### 11.4 图标流水线（`scripts/gen-icons.sh`）
+### 11.4 怎么触发打包（`build-tauri`）
+
+**一句话：打包只认 `v*` 标签，推 `main` 不会打包。**
+
+`build-tauri` 和 `release` 两个 job 都带 `if: startsWith(github.ref, 'refs/tags/v')`，
+所以日常往 `main` 推代码只会跑 lint 和测试（这也是为什么 CI 一次只要几分钟）。
+四个平台的产物 + GitHub Release 需要显式打一个标签。
+
+**完整流程**
+
+```bash
+# 0. 先确认四处版本号一致（package.json 是唯一来源，其余三处由测试锁死）
+pnpm test                          # src/version.test.ts 会替你查
+
+# 1. 本地五道关全过再打标签——标签是对外的，不该用它来试错
+cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test && cd ..
+npx tsc --noEmit && pnpm test && pnpm build
+
+# 2. 推代码，等 main 上的 CI 绿了
+git push origin main
+gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
+
+# 3. 打标签并推标签（标签必须以 v 开头，且和 package.json 的版本一致）
+git tag v1.5.0
+git push origin v1.5.0
+
+# 4. 盯打包
+gh run list --limit 3
+gh run watch <run-id> --exit-status
+```
+
+**标签推上去之后会发生什么**
+
+```
+push tag v*
+   │
+   ├─► check-rust     ubuntu / macos / windows  ─┐   （标签推送也会重跑一次）
+   ├─► check-frontend ubuntu                    ─┤
+   │                                             │  needs: 两个都绿才继续
+   └─► build-tauri  ────────────────────────────┘
+         ├── macos-latest  · aarch64-apple-darwin      → .dmg（Apple Silicon）
+         ├── macos-latest  · x86_64-apple-darwin       → .dmg（Intel）
+         ├── ubuntu-22.04  · x86_64-unknown-linux-gnu  → .deb / .rpm / .AppImage
+         └── windows-latest· x86_64-pc-windows-msvc    → .msi / .exe(NSIS)
+                   │  每个目标 upload-artifact 一份
+                   ▼
+              release（Create Release）
+                   softprops/action-gh-release@v2
+                   generate_release_notes: true，产物全部挂到 Release 上
+```
+
+几个容易踩的点：
+
+| 点 | 说明 |
+|---|---|
+| `fail-fast: false` | 一个平台挂了另外三个照样编完，一次就能看清所有平台的问题 |
+| `needs: [check-rust, check-frontend]` | lint / 测试不绿**不会**开始打包，省掉四份白跑的构建 |
+| `permissions: contents: write` | 创建 Release 需要，已经配好；不用手动开 |
+| `ubuntu-22.04` 不是 `latest` | Linux 构建刻意钉在 22.04：glibc 版本决定产物的向下兼容范围，`latest` 漂移会让老发行版装不上 |
+| 标签打错了 | 删标签重推：`git tag -d v1.5.0 && git push origin :refs/tags/v1.5.0`，然后重新打。已经生成的 Release 要手动删 |
+| 未签名 | macOS 产物**没有 Apple 开发者签名**，下载后首次打开要右键 → 打开；另见 12.6 的签名与辅助功能授权的坑 |
+
+**只想验打包链路、不想发版**：推一个预发布标签（如 `v1.5.0-rc.1`）也一样会触发——
+`v*` 匹配的是前缀。跑完把 Release 和标签删掉即可。
+
+### 11.5 图标流水线（`scripts/gen-icons.sh`）
 
 原来仓库里最大的图标只有 256px，`.icns`/`.ico` 里的小尺寸全是位图缩出来的，边缘一圈毛刺。
 现在是**从 SVG 母版矢量渲染每一个尺寸**，缩放这一步彻底不存在：
@@ -710,6 +998,28 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 一个相关的细节：`index.html` 的首屏底色写死成 `#fafafa`。界面早就换成浅色了，但 HTML 里
 还留着 `class="dark"` 和 `bg-gray-950`，于是 React 挂载前会闪一下深色，且底部露白处是黑的。
 
+### 11.6 版本号只有一个来源
+
+版本号原来抄在四个地方：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`，
+以及 `src/App.tsx` 里一个手写的 `const APP_VERSION = "1.0.0"`。前三个是各自工具链的硬性要求，
+第四个纯粹是手抄——结果就是页脚长期显示 `v1.0.0`，而应用其实已经是 v1.4。
+
+**一个显示错版本号的应用，会让人怀疑它报的其他每一件事。** 这个项目的全部产出都是判断
+（它卡住了没有、这句话敲进去了没有），信任成本比一般工具高得多，所以这类"小错"要按大错处理。
+
+现在的做法：
+
+| 环节 | 做法 |
+|---|---|
+| 唯一来源 | `package.json` 的 `version` |
+| 注入前端 | `vite.config.ts` 读它，`define` 成编译期常量 `__APP_VERSION__`（`src/vite-env.d.ts` 声明类型） |
+| 页脚 | `const APP_VERSION = __APP_VERSION__`，不再有任何手写字面量 |
+| 另外两处 | `tauri.conf.json` / `Cargo.toml` 仍需各自写一份（工具链要求），但由 `src/version.test.ts` 断言三者相等——不一致就红 |
+
+`version.test.ts` 用 `?raw` 导入 `Cargo.toml`、用 `resolveJsonModule` 读两个 JSON，
+**刻意不 import `node:fs`**：`@types/node` 不在 devDependencies 里，`src/` 下任何测试
+只要碰 `node:*` 就会让 `pnpm build` 报 `TS2307`（这个坑踩过一次）。
+
 ---
 
 ## 12. 已知欠账与未验证清单
@@ -721,30 +1031,38 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 | 项 | 状态 | 怎么验 |
 |---|---|---|
 | **剪贴板续跑路径** | ⚠️ 三个平台**都没有实机验证过**。单测只保证生成的脚本语法正确、内容里走的是剪贴板而不是合成按键 | 在 macOS 的 iTerm2 / Terminal / VS Code 集成终端里各跑一次真实续跑，看中文有没有变成"啊啊啊" |
+| **落地核验（`resume_verified`）** | ⚠️ 逻辑有单测，但"6 秒窗口够不够"这个数只在推理上成立 | 真机续跑一次，看日志里报的是 `Landed` 还是 `Silent`；若正常续跑常被判成 `Silent`，说明窗口要放宽 |
+| **tmux / screen 通道** | ⚠️ 代码完整、`send-keys` 走 argv 数组不拼 shell，但**从没对着真实 pane 跑过** | `tmux new -s t`，在里面起一个 Claude Code，等它停下看会不会被续上 |
 | **Windows 续跑** | ⚠️ 只有 CI 编译 + 纯字符串单测 | 在 cmd、Windows Terminal、VS Code 各验一次；重点看多标签宿主的标题匹配 |
 | **Linux 续跑** | ⚠️ 同上，且 X11 / Wayland 两条路都没实测 | 各验一次；`ydotool` 需要 uinput 权限，估计会有坑 |
 | **手机看板** | ⚠️ 没有用真实浏览器打开过 | 手机连同一 WLAN，开 `bind_all`，扫码进页面 |
-| **打包路径** | ⚠️ 4 个目标的 `build-tauri` 自这些改动以来**没有跑过**（它只在 `v*` 标签上触发） | 打一个 `v1.0.1` 或先推个测试标签 |
+| **打包路径** | ⚠️ 4 个目标的 `build-tauri` 自这些改动以来**没有跑过**（它只在 `v*` 标签上触发，见 11.4） | 打一个 `v1.5.0`，或先推 `v1.5.0-rc.1` 只验链路 |
 
-### 12.2 文档与配置的陈旧项（小、但会误导人）
+清单的正式版本在 `docs/manual-test.md`（每平台每终端一行，走一遍打勾）。
+**演练按钮（7.13）把这张表的验证成本从"需要冒风险去试"降到了"零风险随时可查"**，
+但它验的是"定位到哪儿"，不是"字真的进去了"——后者仍然只能真机跑。
 
-| 项 | 问题 | 修法 |
-|---|---|---|
-| `docs/architecture.md` | 写于 `49d16a6` 之前，**完全没提感知层 / 洞察层 / 远程层**，读它会以为项目停在 v1.0 | 重写，或直接指向本文档 |
-| `src-tauri/tauri.conf.json` | `icon` 数组只有 5 项（`32x32` / `128x128` / `128x128@2x` / `.icns` / `.ico`），**漏了 `icons/icon.png`**（512px，脚本已经生成） | 补一行 |
-| `README.md` 路线图 | 把 Windows/Linux 支持、Codex 适配器、系统托盘列在"v0.2.0 未完成"里，实际都已交付；版本号也还停在 v0.1.0 的叙述 | 按第 3 节的进度表更新 |
-| `README.md` 前置要求 | 写 Node 20+ / pnpm 9+，CI 实际用 Node 22 / pnpm 11 | 对齐 |
-| `README.md` 配置说明 | 只列了 7 个配置项，实际有 20+ 个主配置 + 7 个子配置 | 指向本文档 10.3 |
+### 12.2 文档与配置的陈旧项
+
+| 项 | 状态 |
+|---|---|
+| `docs/architecture.md` | ✅ 已重写，覆盖到 v1.5（原先停在 v1.0，读它会以为项目没有感知/洞察/远程层） |
+| `src-tauri/tauri.conf.json` 的 `icon` 数组 | ✅ 已补 `icons/icon.png`（512px） |
+| 四处版本号漂移 | ✅ 已收成单一来源 + 测试锁死，见 11.6 |
+| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.5，配置表指向本文档 10.3） |
+| 本文档自身的计数 | ✅ 本次已重数（行数、测试数、i18n 词条数都是脚本数出来的，不是估的） |
 
 ### 12.3 结构性欠账
 
-- **`src/components/ConfigPanel.tsx` 813 行**，是前端唯一明显该拆的文件。
-  按 Tab 内的分组（检测 / 续跑 / 通知 / 成本 / 远程 / Webhook / 高级）拆成 6–7 个子组件即可，
-  `ui/Field.tsx` 已经把表单样板抽干了，拆分是纯搬运。
-- **前端没有任何自动化测试**（无 vitest / playwright）。目前的保障只有 `tsc` 类型检查。
-  真正值得测的是 `lib/display.ts` 的格式化和 `stores/useAppStore.ts` 的状态归约。
+- **`src/components/ConfigPanel.tsx` 867 行**，是前端唯一明显该拆的文件，而且它是这一版
+  唯一没动的欠账。按 Tab 内的分组（检测 / 续跑 / 通知 / 成本 / 远程 / Webhook / 高级）
+  拆成 6–7 个子组件即可，`ui/Field.tsx` 已经把表单样板抽干了，拆分是纯搬运。
+- **前端测试只覆盖到纯函数层**（`lib/display.ts`、`lib/utils.ts`、store 归约、版本一致性，
+  共 32 个）。组件渲染层没有任何测试——`SessionList` 的排序、标签显隐这类逻辑值得补
+  `@testing-library/react`。
 - **自动更新缺失**。`045e571` 移除了 updater 插件（没配签名公钥会导致启动即崩），
   现在只能手动下载新版本。
+- **`ai_judge` 没接进自动回路**，见 12.4。
 
 ### 12.4 AI 兜底判定只做了一半
 
@@ -761,54 +1079,105 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
   整个 9.1 的安全模型要重做。设计见 13.2。
 - **v2.0 编排层 / v2.1+ 自治层**：与非侵入定位冲突，见 13.4。**动工前必须先确认。**
 
+### 12.6 macOS：勾还在，权限已经没了（每次换版本都会踩）
+
+这是本项目**最容易被误判成"功能有 bug"的一件事**，而它根本不在代码里，所以单独记一节。
+
+macOS 的辅助功能授权由 TCC 数据库管理，而 TCC 记的**不是应用路径，是代码签名**
+（designated requirement）。CI 出来的包是 ad-hoc 签名（没有 Developer ID，见 11.4 注意事项），
+ad-hoc 签名**每次构建都不一样**。后果：
+
+> 换一个版本的 AgentPulse，系统设置 › 隐私与安全性 › 辅助功能 里那个勾**还在**，
+> 但对新的二进制**已经不生效**了。
+
+于是表现是：窗口老老实实跳到前台，然后一个字都没敲进去，而用户看设置面板明明是开着的。
+自签名/自己 `cargo tauri build` 出来的包、把 `.app` 覆盖更新、把它从"下载"拖到"应用程序"——
+都会触发同一件事。
+
+**怎么修**（三条都有效，按省事程度排）：
+
+| 做法 | 命令 / 步骤 |
+|---|---|
+| 关掉再打开 | 设置面板里把 AgentPulse 的勾**取消再勾上**——这一步就是让 TCC 重新记录当前签名 |
+| 删掉再加回 | 选中 AgentPulse 按 `−`，再按 `+` 从"应用程序"里重新添加 |
+| 命令行重置 | `tccutil reset Accessibility com.agentpulse.app`（会清掉这一项的全部记录，然后重新授权） |
+
+**它在产品里的三个出口**（不能指望用户读文档）：
+
+- `accessibility_granted()` 用 `tell application "System Events" to return UI elements enabled`
+  **只读探测**——不弹窗、不把人拽进设置面板，所以敢在引擎 `start()` 前和每次演练里各查一次。
+- `is_accessibility_error()` 认 `-1719` / `-25211` / `not allowed to send keystrokes` 等，
+  把这个"默认静默"的错误换成一句能照着做的话。它**故意不带 cfg**：纯字符串判断，
+  三个平台的 CI 都能测（`accessibility_errors_are_recognised`）。
+- `resume.needs_accessibility` / `probe.no_accessibility` 两条文案里都写了
+  "如果已经是开着的，取消再勾上"——因为**"勾着但失效"才是最常见的那种状态**，
+  只说"请去开启权限"等于让用户看着一个已经打勾的开关发愁。
+
+**结构性解法是绕开它**：`channel_needs_accessibility()` 里 tmux、screen、iTerm2 三条通道
+返回 `false`——它们直接写伪终端，不碰 `System Events`，所以**根本不需要这个授权**。
+在 tmux 里跑 agent 是唯一一劳永逸不受签名影响的路（这也是 v1.4 加 tmux 通道的主要动机）。
+
 ---
 
 ## 13. 未来规划与设计
 
-规划的第一原则：**下一个版本的价值不在新功能，而在让已经写完的功能变得可信。**
-现在最大的风险不是"少了什么"，而是"续跑这条主链路没有任何实机证据"。
+规划的第一原则没变：**下一个版本的价值不在新功能，而在让已经写完的功能变得可信。**
+v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可见（演练、权限自检、免权限通道），
+一版让"动手之后"可查（落地核验、三个计数器、失败会出声）。
 
-### 13.1 v1.4 候选：把已有功能钉成可信（建议优先做完这一整节再谈新功能）
+剩下的最大风险仍然只有一条：**续跑这条主链路没有任何实机证据**（12.1）。
 
-**P0 — 续跑演练（dry-run）按钮** ★ 最推荐做的一件事
+### 13.1 已交付：原 v1.4 / v1.5 候选清单的落点
 
-在会话卡片上加一个"演练定位"按钮：走**完整的定位链路**（找 TTY → 找终端 App → 找窗口 →
-标题匹配），但**在投递前停下**，把结果如实报给你：
+| 原候选 | 结果 | 落在哪 |
+|---|---|---|
+| P0 续跑演练（dry-run）按钮 | ✅ v1.4 | `Resumer::probe` + `ResumeProbe`，见 7.13 |
+| P0 三平台实机验证清单 | ✅ 清单已写 / ⚠️ **还没走完** | `docs/manual-test.md`，见 12.1 |
+| P1 拆 `ConfigPanel.tsx` | ❌ 仍未做（867 行） | 见 13.2 |
+| P1 前端 vitest | ✅ v1.4 | 32 个，见 14.2 |
+| P2 重写 `docs/architecture.md` / README / `icons/icon.png` | ✅ | 见 12.2 |
+| P2 自动更新重做 | ❌ 仍未做 | 见 13.2 |
+| P1 自定义适配器 UI | ❌ 仍未做 | 见 13.2 |
+| tmux / screen 通道（原属 13.3"更远"） | ✅ v1.4 **提前做了** | 它是确定性最高、且**唯一不受 macOS 签名影响**的通道，见 12.6 |
+| 健康自检（原属 13.3） | ✅ v1.4 大部分 | `ToolStatus` / `channel_health` 随演练一起给出 |
+| 判定证据面板（原 v1.5 ②） | ⚠️ 部分 | v1.5 补了「敲不进去 ×N」「已停手，等你」两个标签，把**续跑侧**的证据摊开了；**检测侧**的证据面板仍未做 |
+| 闭环核验（原清单里没有，是 v1.5 现场加的） | ✅ v1.5 | 见 7.8–7.12 |
 
-```
-✅ 精确匹配   iTerm2 · session tty /dev/ttys003
-⚠️ 窗口级匹配 Code · 窗口标题含「agent-pulse」——同一窗口若有多个标签，可能敲错
-❌ 定位不到   Windsurf · 标题里没有项目名；当前设置下不会投递（可开启「跟随最新会话」强制）
-```
+最后一行值得单独说：它不在任何一版的候选清单里，是从"为什么每次都要等用户来报同一类问题"
+这个问题倒推出来的。**清单能列出的都是想得到的功能；想不到的那一层，只能靠追问症状的成因找到。**
 
-为什么这是性价比最高的一项：它把 12.1 里那张"从没实机验证过"的表，从**需要冒风险去试**
-变成**零风险随时可查**。它同时是一个诊断工具（用户报"续跑没反应"时第一句话就问演练结果是什么）
-和一个信任建立工具（你能看见它认出了你的窗口，才会放心开自动续跑）。
-实现成本很低——三个平台的脚本本来就返回 `matched` / `refused` / `fallback`，
-只要加一个"到此为止不要投递"的开关（`focus_session` 已经是半个现成品）。
+### 13.2 下一步候选（v1.6）
 
-**P0 — 三平台实机验证清单**：把 12.1 的表变成 `docs/manual-test.md`，
-每个平台每个终端一行，走一遍打勾。这是发 v1.1 tag 之前的准入条件。
+按"先让已交付的东西可信"排序：
 
-**P1 — 自定义适配器 UI**：`CustomAdapterConfig` 后端已就绪，缺一个"会话文件在哪、
+**P0 — 走完 `docs/manual-test.md`。** 这不是开发任务，是准入条件。12.1 那张表里有
+七行还挂着 ⚠️，其中"落地核验的 6 秒窗口够不够"只有实机能回答——真机跑一次，
+看日志报的是 `Landed` 还是 `Silent`。
+
+**P1 — 拆 `ConfigPanel.tsx`（867 行）。** 前端唯一明显的结构性欠账，而且是纯搬运：
+`ui/Field.tsx` 已经把表单样板抽干，按 Tab 内的分组拆 6–7 个子组件即可。
+
+**P1 — 自定义适配器 UI。** `CustomAdapterConfig` 后端已就绪，缺一个"会话文件在哪、
 进程名叫什么、怎么判断回合"的表单。做完之后 Aider / Cline / Gemini CLI 这类工具
-用户自己就能加，不必等我发版。
+用户自己就能加，不必等发版。
 
-**P1 — 拆 `ConfigPanel.tsx`** + 给 `lib/display.ts`、`stores/useAppStore.ts` 补 vitest。
+**P1 — 检测侧的判定证据面板。** 在会话卡片上展开"为什么是这个结论"：四个信号各自的取值、
+`TurnState` 是什么、忙碌宽限有没有生效、命中了哪个关键词。检测逻辑的复杂度已经到了
+"用户看不懂它为什么这么判"的程度，而这个项目的信任成本很高，值得把推理过程摊开。
+v1.5 已经把续跑侧的证据摊开了（7.12 那张表），检测侧是同一个思路的另一半。
 
-**P2 — 文档与元数据对齐**：重写 `docs/architecture.md`、更新 README 路线图/前置要求/配置表、
-`tauri.conf.json` 补 `icons/icon.png`。
+**P2 — 组件层测试。** 现在的 32 个前端测试只覆盖纯函数和 store 归约；`SessionList`
+的排序、标签显隐这类逻辑值得补 `@testing-library/react`。
 
-**P2 — 自动更新重做**：生成签名密钥对、配 `tauri-plugin-updater`、在 CI 的 `release` job 里
-产出 `latest.json`。上次失败的原因很具体（没有公钥就崩），别重复。
+**P2 — 自动更新重做。** 生成签名密钥对、配 `tauri-plugin-updater`、在 CI 的 `release` job 里
+产出 `latest.json`。上次失败的原因很具体（没有公钥就崩），别重复。顺带能解掉 12.6 的一半——
+有稳定的 Developer ID 签名，辅助功能授权就不会每次更新都失效。
 
-### 13.2 v1.5 候选
+**P2 — 多项目视图。** 按 `cwd` 项目名分组会话，成本页已经有按项目聚合，主面板还没有。
 
-**① 远程审批（原 v1.3 P2）——需要一次完整的安全设计**
-
-想要的体验：手机收到"会话在等你回话"的通知，点一下就让它续跑，不用回到电脑前。
-难点在于这会把一个**结构性只读**的服务变成可写服务，9.1 那张表里的每一条都要重新论证。
-建议的设计（还没实现）：
+**待拍板 — 远程审批（原 v1.3 P2）。** 想要的体验：手机收到"会话在等你回话"的通知，
+点一下就让它续跑，不用回到电脑前。难点在于这会把一个**结构性只读**的服务变成可写服务，
+9.1 那张表里的每一条都要重新论证。建议的设计（还没实现）：
 
 | 设计点 | 方案 |
 |---|---|
@@ -820,23 +1189,16 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 | 审计 | 每次远程审批落 `resume_records`，标注来源是远程；活动日志里可见 |
 | 仍不放宽绑定 | `bind_all` 的告知文案不变，且远程审批建议只在 `127.0.0.1` + 反代/隧道场景下用 |
 
-**② 判定证据面板**：在会话卡片上展开"为什么是这个结论"——列出四个信号各自的取值、
-`TurnState` 是什么、忙碌宽限有没有生效、命中了哪个关键词。检测逻辑的复杂度已经到了
-"用户看不懂它为什么这么判"的程度，而这个项目的信任成本很高，值得把推理过程摊开。
-
-**③ 多项目视图**：按 `cwd` 项目名分组会话，成本页已经有按项目聚合，主面板还没有。
-
 ### 13.3 更远的候选（都仍在"非侵入"边界内）
 
 | 想法 | 价值 | 备注 |
 |---|---|---|
-| **tmux / screen 支持** ★ | `tmux send-keys -t <pane>` 是**确定性最高**的投递通道：pane id 精确、完全不经过输入法、不需要窗口在前台、不需要任何辅助功能权限 | 对重度终端用户来说这会是最可靠的一条路，优先级应该排在很多 GUI 终端之前 |
-| **SSH 远端守护** | 守护跑在远程机器上的 agent（会话文件通过 ssh 读，续跑通过 `ssh + tmux send-keys` 投递） | 天然要求 tmux，所以是上一条的延伸 |
-| **更多适配器** | Aider / Cline / Gemini CLI / Continue | 做完 13.1 的自定义适配器 UI 之后，这件事可以交给用户 |
+| **SSH 远端守护** | 守护跑在远程机器上的 agent（会话文件通过 ssh 读，续跑通过 `ssh + tmux send-keys` 投递） | tmux 通道已经在 v1.4 落地，这条路的前置条件已经具备 |
+| **更多适配器** | Aider / Cline / Gemini CLI / Continue | 做完 13.2 的自定义适配器 UI 之后，这件事可以交给用户 |
 | **Windows 用 UIAutomation 取代标题匹配** | 能直接枚举标签页，把"窗口级确定性"提升到"标签级确定性"，多标签宿主不再需要靠标题猜 | 工程量不小，但这是 Windows 侧唯一的确定性天花板突破口 |
-| **从历史里学阈值** | 你每次手动续跑（说明它漏判了）和每次撤销（说明它误判了）都是标注数据，可以用来给这台机器调 `idle_timeout_secs` | 要小心：不能让学习结果绕过 6.4 的两条铁律 |
+| **从历史里学阈值** | 你每次手动续跑（说明它漏判了）和每次撤销（说明它误判了）都是标注数据，可以用来给这台机器调 `idle_timeout_secs`；v1.5 的 `ResumeOutcome` 让这件事第一次有了**自动**标注来源（`Silent` = 投递侧的问题，`Landed` 后马上又停 = 判定侧的问题） | 要小心：不能让学习结果绕过 6.4 的两条铁律 |
 | **成本报表导出** | 按周/月汇总、导出 CSV，给报销和团队分摊用 | 数据都在 SQLite 里，纯前端工作 |
-| **健康自检** | 一键检查：辅助功能权限、`xdotool`/`ydotool`/剪贴板工具是否就位、会话目录能不能读 | 与 13.1 的演练按钮同属"让不确定变可见" |
+| **AI 兜底接进自动回路** | 关键词判不准时自动请求二次判断，而不是只能手动问 | 见 12.4；要先想清楚"多久问一次"和"问错了谁买单" |
 
 ### 13.4 被主动搁置的两层：v2.0 编排 / v2.1 自治
 
@@ -854,11 +1216,11 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 
 ### 13.5 需要你拍板的决策点
 
-1. **v1.4 是否就按 13.1 的顺序做**（演练按钮 → 实机验证清单 → 自定义适配器 UI → 拆前端 → 文档）？
-2. **tmux 支持要不要提前**到 v1.4？如果你日常用 tmux，它比任何 GUI 终端的适配都更值得先做。
-3. **远程审批做不做**？做的话按 13.2 ① 的安全设计走。
+1. **v1.6 是否就按 13.2 的顺序做**（走验证清单 → 拆 ConfigPanel → 适配器 UI → 检测证据面板）？
+2. **远程审批做不做**？做的话按 13.2 末尾那张表的安全设计走。
+3. **自动更新要不要现在重做**？它顺带能解掉 12.6 那个"勾还在、权限没了"的坑，但需要一个
+   Apple Developer 账号来出稳定签名。
 4. **v2.0 / v2.1 是否重新启动**？如果要，是走原设想还是 13.4 末尾的"开放 API 给外部编排器"折中路径？
-5. **要不要先打一个 tag** 把 `build-tauri` 那条 4 目标打包链路验一遍（它自这些改动以来没跑过）？
 
 ---
 
@@ -871,27 +1233,39 @@ pnpm install                     # 装前端依赖
 pnpm tauri:dev                   # 开发（含 Rust 热重载）
 pnpm tauri:build                 # 打包，产物在 src-tauri/target/release/bundle/
 pnpm build                       # 仅前端：tsc && vite build（CI 用的就是这条）
+pnpm test                        # 前端 32 个 vitest（含四处版本号一致性）
 
 cd src-tauri
 cargo clippy --all-targets -- -D warnings   # CI 的 lint，本地务必先跑
-cargo test                                  # 80 个单元测试
+cargo test                                  # 115 个单元测试
 cargo test -- --list                        # 列出全部测试名
 
 ./scripts/gen-icons.sh           # 从 SVG 母版重出整套图标（需要 Chrome/Chromium）
+
+git tag v1.5.0 && git push origin v1.5.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
-### 14.2 测试分布（80 个）
+### 14.2 测试分布（Rust 115 + 前端 32）
 
 | 模块 | 个数 | 守的是什么 |
 |---|---:|---|
-| `resumer` | 26 | 生成脚本的语法、剪贴板通道、拒绝盲敲、终端识别边界 |
-| `detector` | 14 | 两条铁律、散文不是证据、词边界、续跑上限 |
+| `resumer` | 46 | 生成脚本的语法、剪贴板通道、拒绝盲敲、终端识别边界、落地核验、演练 |
+| `detector` | 16 | 两条铁律、散文不是证据、词边界、**判定不看任何续跑计数器** |
+| `monitor` | 14 | 冷却与线性退避、额度闸门、`ResumeOutcome` 归约、事件去重、标签 |
+| `remote` | 11 | 两种令牌来源、定长比较、弱令牌告警、换绑前先停旧监听、页面渲染 |
 | `adapters::claude_code` | 10 | 回合分类、记账行跳过、错误行提取、尾部读取的多字节边界 |
-| `remote` | 8 | 两种令牌来源、定长比较、页面渲染 |
 | `cost` | 7 | 最长前缀匹配、引入期价格、聚合 |
 | `webhook` | 6 | 五家载荷格式 |
 | `i18n` | 5 | 无重复 key、占位符有出处 |
-| `monitor` | 5 | 冷却、标签 |
+
+前端（vitest，`pnpm test`）：
+
+| 文件 | 个数 | 守的是什么 |
+|---|---:|---|
+| `src/lib/utils.test.ts` | 16 | token / 金额 / 时间格式化、`baseName` 的三平台路径、`cn` 的同族覆盖 |
+| `src/lib/display.test.ts` | 7 | 状态与注意力级别的映射齐全、每个值都是合法 Tailwind 类、i18n key 对得上 |
+| `src/stores/useAppStore.test.ts` | 7 | 命令归约：成功/失败的 `ok` 取值、错误文案原样传递、演练结论不被吞 |
+| `src/version.test.ts` | 2 | 四处版本号一致、是三段数字而不是占位符（见 11.6） |
 
 值得单独一提的几个测试名（它们本身就是文档）：
 
@@ -899,9 +1273,15 @@ cargo test -- --list                        # 列出全部测试名
 - `awaiting_user_plus_silence_confirms` —— 铁律 B
 - `talking_about_an_error_is_not_having_one` —— 散文不是故障证据
 - `keyword_hit_alone_never_types` —— 关键词单独出现不足以动手
+- `verdict_ignores_every_resume_counter` —— 判定层不回答"该不该动手"（7.10）
+- `a_session_we_stopped_nudging_still_calls_for_help` —— 放弃动手的那一刻正是最该出声的一刻
+- `exhausted_streak_stops_typing_but_not_watching` —— 停手 ≠ 停看
+- `failed_deliveries_never_exhaust_the_budget` —— 敲不进去不算"催过了"
 - `the_users_clipboard_is_given_back` —— 不能吞掉你复制的东西
 - `vscode_script_never_sends_ctrl_c` —— 焦点在编辑器里时 Ctrl-C 是复制
 - `blind_typing_is_off_by_default` —— 定位不到就不敲
+- `accessibility_errors_are_recognised` —— 静默的权限错误要换成人话（12.6）
+- `pty_channels_need_no_accessibility` —— tmux / screen / iTerm2 不需要授权
 - `tail_survives_multibyte_at_the_window_edge` —— 尾部读取不能把 UTF-8 字符切一半
 
 ### 14.3 技术栈
@@ -909,41 +1289,52 @@ cargo test -- --list                        # 列出全部测试名
 | 层 | 技术 |
 |---|---|
 | 桌面框架 | Tauri 2（`tray-icon` 特性；插件 shell / notification / autostart） |
-| 后端 | Rust — tokio(full)、sysinfo 0.35、notify 8、rusqlite 0.32(bundled)、reqwest 0.12(json)、glob 0.3、chrono、tracing、dirs 6、uuid v4、serde/serde_json |
+| 后端 | Rust 2021 — tokio(full)、sysinfo 0.35、notify 8、rusqlite 0.32(bundled)、reqwest 0.12(json)、glob 0.3、chrono、tracing、dirs 6、uuid v4、serde/serde_json |
 | 前端 | React 19.1 + TypeScript 5.8 + Vite 6.3 + TailwindCSS 3.4 |
 | 组件 | Radix UI（tabs / select / switch / tooltip / slot）+ cva + clsx + tailwind-merge |
 | 状态 | Zustand 5 |
 | 桥接 | `@tauri-apps/api` 2.5 |
+| 测试 | `cargo test`（Rust 内联 `#[cfg(test)]`）+ vitest 4 |
+| release profile | `strip = true`、`lto = true` |
 
 ### 14.4 目录结构
 
 ```
 agent-pulse/
 ├── PROJECT_STATUS.md          ← 本文档
-├── README.md                  ← 面向使用者（路线图待更新，见 12.2）
-├── docs/architecture.md       ← 已陈旧（见 12.2）
+├── README.md                  ← 面向使用者（路线图到 v1.5，含打包触发说明）
+├── docs/architecture.md       ← 分层架构与数据流
+├── docs/manual-test.md        ← 三平台实机验证清单（还没走完，见 12.1）
 ├── index.html                 ← 首屏底色写死 #fafafa
 ├── public/{icon.svg,favicon.png}
 ├── scripts/{gen-icons.sh,make_ico.py}
 ├── src/                       ← 前端
 │   ├── App.tsx  main.tsx  types.ts  index.css
+│   ├── version.test.ts        ← 四处版本号一致性（见 11.6）
 │   ├── components/{ConfigPanel,CostPanel,HistoryPanel,LogPanel,SessionList,StatsPanel,StatusCards}.tsx
-│   ├── components/ui/         ← Radix 封装 + 自绘 BarChart
-│   ├── i18n/index.ts          ← 202 条前端文案
-│   ├── lib/{display,chime,useNotice,utils}.ts
-│   └── stores/useAppStore.ts
+│   ├── components/ui/         ← Radix 封装（Button/Card/Field/Select/Switch/Tabs/Tooltip）+ 自绘 BarChart
+│   ├── i18n/index.ts          ← 220 条前端文案
+│   ├── lib/{display,chime,useNotice,utils}.ts + display.test.ts / utils.test.ts
+│   └── stores/useAppStore.ts + useAppStore.test.ts
 └── src-tauri/
-    ├── tauri.conf.json        ← icon 数组缺 icons/icon.png（见 12.2）
+    ├── tauri.conf.json        ← 版本号由 src/version.test.ts 与 package.json 对齐
     ├── icons/{master.svg,master-macos.svg,…}
     └── src/
-        ├── lib.rs             ← 装配：AppState / 托盘 / 事件泵 / 21 个命令
+        ├── lib.rs             ← 装配：AppState / 托盘 / 事件泵 / 25 个命令
         ├── adapters/{mod,claude_code,codex,opencode}.rs
-        ├── detector/mod.rs    ← Verdict + AttentionLevel
-        ├── monitor/mod.rs     ← 主循环
-        ├── resumer/mod.rs     ← 三平台续跑（唯一带平台 cfg 的文件）
+        ├── detector/mod.rs    ← Verdict + AttentionLevel（只回答"是什么"）
+        ├── monitor/mod.rs     ← 主循环 + 动作闸门
+        ├── resumer/mod.rs     ← 三平台续跑 + tmux/screen + 演练 + 落地核验（唯一带平台 cfg 的文件）
         ├── cost/mod.rs  storage/mod.rs  notify/mod.rs  webhook/mod.rs
         ├── remote/mod.rs      ← 只读看板
         ├── config/mod.rs  i18n/mod.rs  ai_judge/mod.rs
         └── main.rs
 ```
+
+---
+
+<p align="center">
+  <sub>本文档随代码一起演进。如果你发现文档和代码对不上，<b>以代码为准，并顺手改这里</b>——<br>
+  文档撒的谎比没有文档更贵。</sub>
+</p>
 

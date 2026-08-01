@@ -21,21 +21,29 @@
 
 - **多策略检测引擎** — 进程状态 + 会话文件监听 + 关键词匹配 + 心跳超时，多信号融合判定
 - **智能双重校验** — 中断信号存在 AND 完成标记不存在，才触发续跑，防止重复执行
+- **判定与动手分开** — 判定层只回答「现在是什么状态」，额度/冷却/总开关住在动作闸门里；催满次数只停手不闭嘴，改成叫人接管，不会静默放弃
 - **跨平台静默续跑** — macOS (AppleScript) / Windows (PowerShell + Win32) / Linux (xdotool·ydotool)，覆盖 iTerm2、Terminal、Windows Terminal、cmd·conhost，以及 VS Code / Cursor / Windsurf / JetBrains 全家桶里的内置终端
+- **tmux / screen 直投** — 跑在复用器里的会话按 pane id 寻址，不需要辅助功能授权、不需要窗口在前台、不过输入法（续跑不稳时最有效的一招）
+- **敲完要核验** — 投递成功 ≠ 字进去了。续跑后回头比对会话记录的指纹，`落地 / 静默 / 失败 / 无法核验` 四态分开记账，通道坏了当场出声而不是默默烧完额度
+- **续跑演练（dry-run）** — 把定位链路完整走一遍但**一个字都不敲**，先告诉你会敲到哪个窗口、缺哪个依赖、要不要去开权限
 - **提示词走剪贴板，不走合成按键** — 中文提示词经系统剪贴板 + 一次 ASCII 粘贴键投递，绕开输入法，不会再打出「啊啊啊啊」这类拼音残留
 - **定位不到就不敲** — 认不出会话属于哪个窗口时宁可放弃续跑，也不往别人的窗口里回车（想要兜底可在设置里打开「跟随最新会话」）
-- **插件式适配器** — Claude Code / Codex CLI，可扩展支持更多 Agent
-- **安全机制** — 最大续跑次数限制、冷却时间、手动/自动模式切换
-- **实时可观测** — 结构化日志流、状态面板、事件时间线
+- **花费与限流洞察** — 增量读用量记录算 token 与美元花费，按天/按项目排行，还能预测多久撞到窗口限流
+- **只读手机看板** — 默认**关闭**，开了也只听 `127.0.0.1`；需要手机看时才显式勾「允许局域网访问」（换成 `0.0.0.0`：同一个网络里的人拿到令牌就能看你的会话，请只在可信网络里开）。令牌必填、空令牌直接拒绝服务、比较用固定时间，结构上没有任何写路径
+- **插件式适配器** — Claude Code / Codex CLI / OpenCode / 自定义，可扩展支持更多 Agent
+- **安全机制** — 最大续跑连击数、冷却时间（随失败次数退避）、手动/自动模式切换
+- **实时可观测** — 结构化日志流、状态面板、事件时间线、中英双语界面
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
 | 桌面框架 | Tauri 2.0 |
-| 后端引擎 | Rust (sysinfo / notify / tokio) |
-| 前端 | React 19 + TypeScript + TailwindCSS |
+| 后端引擎 | Rust 2021 (sysinfo / notify / tokio / rusqlite) |
+| 前端 | React 19 + TypeScript 5.8 + TailwindCSS 3 + Vite 6 |
+| 组件层 | Radix UI + class-variance-authority |
 | 状态管理 | Zustand |
+| 测试 | `cargo test`（115）+ vitest（32） |
 
 ## 快速开始
 
@@ -62,23 +70,27 @@ pnpm tauri:dev
 pnpm tauri:build
 ```
 
-产物位于 `src-tauri/target/release/bundle/`。
+产物位于 `src-tauri/target/release/bundle/`。四平台一起出包走 CI，见下面
+[打包与发布](#打包与发布)。
 
 ## 工作原理
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  适配器发现   │ →  │  检测策略引擎 │ →  │  续跑执行器   │
-│  进程扫描     │    │  多信号融合   │    │  平台适配     │
-│  会话文件     │    │  双重校验     │    │  AppleScript  │
-└──────────────┘    └──────────────┘    └──────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  适配器发现   │ →  │  检测策略引擎 │ →  │  续跑执行器   │ →  │  落地核验     │
+│  进程扫描     │    │  多信号融合   │    │  通道优先级   │    │  记录指纹     │
+│  会话文件     │    │  动作闸门     │    │  剪贴板投递   │    │  四态记账     │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
-1. **发现** — 适配器扫描系统中的 AI Agent 进程（Claude Code / Codex）
-2. **检测** — 轮询检查：会话文件是否停止更新、输出中是否有中断关键词、进程是否退出
-3. **决策** — 双重校验：有中断信号 + 无完成标记 → 确认中断
-4. **续跑** — 跨平台投递：macOS (AppleScript) / Windows (PowerShell + Win32) / Linux (xdotool·ydotool)，提示词走剪贴板粘贴
-5. **保护** — 冷却时间 + 次数上限 + 定位不到就不敲，防止无限循环和误敲
+1. **发现** — 适配器扫描系统中的 AI Agent 进程（Claude Code / Codex / OpenCode / 自定义）
+2. **检测** — 轮询检查：会话文件是否停止更新、输出中是否有中断关键词、进程是否退出、回合有没有收尾
+3. **决策** — 双重校验：有中断信号 + 无完成标记 → 确认中断（判定只说状态，动不动手由闸门决定）
+4. **续跑** — 优先 tmux/screen 直投；否则跨平台定位投递：macOS (AppleScript) / Windows (PowerShell + Win32) / Linux (xdotool·ydotool)，提示词走剪贴板粘贴
+5. **核验** — 回头看 agent 的会话记录有没有长出新内容，确认那句话真的落地了
+6. **保护** — 冷却退避 + 连击上限 + 定位不到就不敲，防止无限循环和误敲；停手时改为叫人，不静默放弃
+
+更详细的分层、判定依据和踩坑记录见 [docs/architecture.md](./docs/architecture.md)。
 
 ## 配置说明
 
@@ -90,8 +102,8 @@ pnpm tauri:build
 |--------|--------|------|
 | `poll_interval_secs` | 10 | 轮询间隔 |
 | `idle_timeout_secs` | 60 | 空闲超时判定 |
-| `max_resume_count` | 5 | 单会话最大续跑次数 |
-| `resume_cooldown_secs` | 30 | 续跑冷却时间 |
+| `max_resume_count` | 5 | 连续几次没效果就停手（会话一动就清零，不是终身上限）|
+| `resume_cooldown_secs` | 30 | 续跑冷却时间（按连续失败次数线性退避，最多 6 倍）|
 | `auto_follow_latest` | false | 定位不到时是否盲敲前台窗口 |
 | `custom_keywords` | rate limit, overloaded... | 中断触发关键词 |
 | `resume_prompt` | 请继续完成... | 续跑提示词 |
@@ -104,7 +116,51 @@ pnpm tauri:build
 - [x] **v1.1** — 剪贴板投递 + 定位不到就不敲 + 三平台 CI 矩阵 + 实机验证清单
 - [x] **v1.2** — 感知层（成本追踪 + 限流预测）+ 洞察层（AI 判定 + 统计面板）
 - [x] **v1.3** — 远程层（手机看板 + Webhook）+ 会话历史 + i18n 中英双语
-- [ ] **v1.4** — 续跑演练（dry-run）按钮 + 自定义适配器 UI + 前端测试 + 文档对齐
+- [x] **v1.4** — tmux / screen 直投通道 + 续跑演练（dry-run）按钮 + 前端 vitest + 三平台验收清单
+- [x] **v1.5** — 续跑闭环（落地核验 + 四态记账）+ 三个计数器分家 + 判定层与动作闸门分离 + 看板换绑竞态修复 + 局域网地址自动推导
+- [ ] **v1.6** — 判定证据面板 + 自定义适配器 UI + 拆分设置页 + 组件层测试
+
+阶段性取舍、每一条的来由和候选清单见 [PROJECT_STATUS.md § 13](./PROJECT_STATUS.md)。
+**v2.0 编排层 / v2.1+ 自治层与「非侵入」定位冲突，已明确搁置。**
+
+## 打包与发布
+
+**打包只认 `v*` 标签，推 `main` 不会打包。** `build-tauri` 和 `release` 两个 job 都带
+`if: startsWith(github.ref, 'refs/tags/v')`，所以日常推代码只跑 lint 和测试（几分钟），
+四平台产物 + GitHub Release 需要显式打一个标签。
+
+```bash
+# 1. 本地五道关全过再打标签——标签是对外的，不该拿它试错
+cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test && cd ..
+npx tsc --noEmit && pnpm test && pnpm build
+
+# 2. 推代码，等 main 上的 CI 绿
+git push origin main
+gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
+
+# 3. 打标签并推标签（必须以 v 开头，且与 package.json 的版本一致——src/version.test.ts 会替你查）
+git tag v1.5.0
+git push origin v1.5.0
+
+# 4. 盯打包
+gh run list --limit 3
+gh run watch <run-id> --exit-status
+```
+
+标签推上去之后：`check-rust`（ubuntu / macOS / Windows）和 `check-frontend` 全绿才会开始
+`build-tauri`，四个目标各自产出并上传产物，最后由 `release` 汇总建 Release：
+
+| 目标 | 产物 |
+|---|---|
+| `aarch64-apple-darwin` | `.dmg`（Apple Silicon） |
+| `x86_64-apple-darwin` | `.dmg`（Intel） |
+| `x86_64-unknown-linux-gnu` | `.deb` / `.rpm` / `.AppImage`（钉在 ubuntu-22.04，glibc 向下兼容） |
+| `x86_64-pc-windows-msvc` | `.msi` / `.exe`（NSIS） |
+
+标签打错了：`git tag -d v1.5.0 && git push origin :refs/tags/v1.5.0`，重新打；已生成的
+Release 要手动删。macOS 产物**没有 Apple 开发者签名**，首次打开要右键 → 打开，且每次换
+版本都要重新授予「辅助功能」权限（原因见
+[PROJECT_STATUS.md § 12.6](./PROJECT_STATUS.md)）。完整说明见 § 11.4。
 
 ## License
 

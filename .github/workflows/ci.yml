@@ -49,7 +49,7 @@ jobs:
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
 
-      # --all-targets 才会把 #[cfg(test)] 里的代码也编进来：80 个单元测试是
+      # --all-targets 才会把 #[cfg(test)] 里的代码也编进来：115 个单元测试是
       # 跨平台脚本唯一的自动化保障，不能只编不看。
       - name: Clippy
         working-directory: src-tauri
