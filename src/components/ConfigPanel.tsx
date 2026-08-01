@@ -652,11 +652,39 @@ function AiSection({ config, set }: SectionProps) {
  * 默认只听 127.0.0.1，并且必须带令牌才返回数据。打开「允许局域网访问」
  * 等于换成 0.0.0.0，同一网络里拿到令牌的人就能读你的会话——开关旁边的
  * 说明文字把这件事写明白了，两种语言都写。
+ *
+ * 地址是算出来的，不是硬写的：以前这里永远显示 `127.0.0.1` 再附一句
+ * 「自己换成局域网 IP」，于是「IP 换错了」和「服务根本没起来」在手机上
+ * 表现完全一样——都是连接被拒绝，用户没法区分。
  */
 function RemoteSection({ config, set }: SectionProps) {
   const { t } = useI18n();
+  const getLanIp = useAppStore((s) => s.getLanIp);
+  const generateRemoteToken = useAppStore((s) => s.generateRemoteToken);
+  const [lanIp, setLanIp] = useState<string | null>(null);
   const r = config.remote;
-  const setR = (partial: Partial<RemoteConfig>) => set("remote", { ...r, ...partial });
+  const setR = (partial: Partial<RemoteConfig>) =>
+    set("remote", { ...r, ...partial });
+
+  // 只在真的要显示局域网地址时才去问：没开局域网访问就没必要算
+  useEffect(() => {
+    if (!r.enabled || !r.bind_all) return;
+    let alive = true;
+    void getLanIp().then((ip) => {
+      if (alive) setLanIp(ip);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [r.enabled, r.bind_all, getLanIp]);
+
+  const host = r.bind_all ? (lanIp ?? "127.0.0.1") : "127.0.0.1";
+  const url = `http://${host}:${r.port}/`;
+  // 令牌里出现 & 或 # 就会把 query 截断，服务端只收到前半段然后判鉴权失败。
+  // 编码一下，任何字符都能安全塞进链接。
+  const linkWithToken = `${url}?token=${encodeURIComponent(r.token)}`;
+  // 绑 loopback 时短令牌无所谓；开到局域网上，它就是唯一那道门
+  const weakToken = r.bind_all && r.token.trim().length < 16;
 
   return (
     <Section title={t("cfg.remote")} desc={t("cfg.remote.desc")}>
@@ -678,13 +706,30 @@ function RemoteSection({ config, set }: SectionProps) {
                   onValueChange={(v) => setR({ port: v })}
                 />
               </Field>
-              <Field label={t("cfg.remote_token")} hint={t("cfg.remote_token.hint")}>
-                <TextInput
-                  type="password"
-                  autoComplete="off"
-                  value={r.token}
-                  onChange={(e) => setR({ token: e.target.value })}
-                />
+              <Field
+                label={t("cfg.remote_token")}
+                hint={t("cfg.remote_token.hint")}
+              >
+                <div className="flex items-center gap-2">
+                  <TextInput
+                    type="password"
+                    autoComplete="off"
+                    value={r.token}
+                    onChange={(e) => setR({ token: e.target.value })}
+                  />
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="shrink-0"
+                    onClick={() => {
+                      void generateRemoteToken().then((token) =>
+                        setR({ token }),
+                      );
+                    }}
+                  >
+                    {t("cfg.remote_token_generate")}
+                  </Button>
+                </div>
               </Field>
             </div>
             <ToggleRow
@@ -693,16 +738,25 @@ function RemoteSection({ config, set }: SectionProps) {
               checked={r.bind_all}
               onCheckedChange={(v) => setR({ bind_all: v })}
             />
+            {weakToken && (
+              <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-700">
+                {t("cfg.remote_token_weak")}
+              </p>
+            )}
             {/* 地址只显示不带令牌的部分：设置页是会被截图的，令牌走剪贴板 */}
             <Field
               label={t("cfg.remote_url")}
-              hint={r.bind_all ? t("cfg.remote_url.lan") : undefined}
+              hint={
+                r.bind_all
+                  ? lanIp
+                    ? t("cfg.remote_url.lan_found")
+                    : t("cfg.remote_url.lan_unknown")
+                  : undefined
+              }
             >
               <div className="flex items-center gap-2">
-                <p className="font-mono text-[11px] text-neutral-500">
-                  http://127.0.0.1:{r.port}/
-                </p>
-                {r.token && <CopyLink url={`http://127.0.0.1:${r.port}/?token=${r.token}`} />}
+                <p className="font-mono text-[11px] text-neutral-500">{url}</p>
+                {r.token && <CopyLink url={linkWithToken} />}
               </div>
             </Field>
           </Nested>

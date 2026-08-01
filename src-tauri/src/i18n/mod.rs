@@ -96,7 +96,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("err.push_request", "请求失败：{detail}", "Request failed: {detail}"),
     ("err.push_status", "服务端返回 HTTP {status}", "The server returned HTTP {status}"),
     ("err.notify_failed", "系统通知发不出去：{detail}", "The system notification failed: {detail}"),
-    ("err.remote_bind", "看板端口 {port} 打不开：{detail}", "Could not open dashboard port {port}: {detail}"),
+    ("err.remote_bind", "看板地址 {addr} 打不开：{detail}", "Could not bind the dashboard to {addr}: {detail}"),
     // ── 会话状态（手机看板自己渲染，所以文案在后端）──
     ("status.active", "运行中", "Running"),
     ("status.suspended", "疑似中断", "Maybe stuck"),
@@ -117,6 +117,10 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("remote.offline", "连不上 AgentPulse，电脑上的应用可能已经退出", "Can't reach AgentPulse — the desktop app may have quit"),
     ("log.remote_started", "手机看板已启动：{url}", "Phone dashboard is up: {url}"),
     ("log.remote_lan", "看板已开放到局域网：同一网络里拿到令牌的人都能读你的会话", "The dashboard is open to the LAN — anyone on it with the token can read your sessions"),
+    // 手机要连的是这个地址：0.0.0.0 只是「听所有网卡」，手机上敲它连不上，
+    // 敲 127.0.0.1 连的是手机自己。少了这一行，用户只能去系统设置里翻 IP。
+    ("log.remote_lan_url", "手机上打开这个地址：{url}（令牌请用设置页的「复制带令牌的链接」）", "Open this on your phone: {url} (use “Copy link with token” in Settings for the token)"),
+    ("log.remote_weak_token", "看板开到了局域网，但令牌只有几个字符：这时候令牌就是唯一那道门，建议至少 {min} 位，设置页可以一键生成", "The dashboard is on the LAN but the token is very short — it is the only lock on the door. Use at least {min} characters; Settings can generate one."),
     ("log.remote_stopped", "手机看板已停止", "Phone dashboard stopped"),
     // ── 续跑与聚焦的结果文案 ──
     //

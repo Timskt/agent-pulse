@@ -415,15 +415,24 @@ const TABLE = {
     "留空则启动时自动生成",
     "Generated automatically if left blank",
   ],
+  "cfg.remote_token_generate": ["生成", "Generate"],
+  "cfg.remote_token_weak": [
+    "开到局域网上，令牌就是唯一那道门——现在这个太短了，几秒就能试出来。建议至少 16 位，点「生成」直接来一个。",
+    "On the LAN the token is the only lock on the door, and this one is short enough to guess in seconds. Use at least 16 characters — “Generate” makes one for you.",
+  ],
   "cfg.remote_bind_all": ["允许局域网访问", "Allow LAN access"],
   "cfg.remote_bind_all.desc": [
     "从 127.0.0.1 改成 0.0.0.0：同一个网络里的人只要拿到令牌就能看你的会话，请只在可信网络里开",
     "Switches from 127.0.0.1 to 0.0.0.0 — anyone on the network with the token can read your sessions. Trusted networks only.",
   ],
   "cfg.remote_url": ["看板地址", "Dashboard URL"],
-  "cfg.remote_url.lan": [
-    "手机上把 127.0.0.1 换成这台电脑在局域网里的 IP",
-    "On your phone, swap 127.0.0.1 for this machine's LAN IP",
+  "cfg.remote_url.lan_found": [
+    "这就是手机上要打开的地址，不用自己换 IP",
+    "This is the address to open on your phone — no IP swapping needed",
+  ],
+  "cfg.remote_url.lan_unknown": [
+    "没能算出这台电脑的局域网 IP（可能没连网），手机上要把 127.0.0.1 换成它",
+    "Couldn't determine this machine's LAN IP (offline?) — swap 127.0.0.1 for it on your phone",
   ],
   "cfg.remote_copy_link": ["复制带令牌的链接", "Copy link with token"],
 

@@ -77,6 +77,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # 单元测试单独一步：`pnpm build` 只保证「编得过」，不保证 store 的归约
+      # 和显示映射没被改坏。测试挂了要能一眼看出是测试挂了，而不是构建挂了。
+      - name: Unit tests
+        run: pnpm test
+
       - name: Type check & build
         run: pnpm build
 

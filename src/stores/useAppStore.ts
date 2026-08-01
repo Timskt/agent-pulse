@@ -69,6 +69,10 @@ interface AppStore {
   /** 续跑演练：走完定位流程但不投递，用来回答「字会敲到哪儿」 */
   probeResume: (sessionId: string) => Promise<ResumeProbe>;
   openAccessibilitySettings: () => Promise<CommandResult>;
+  /** 本机在局域网里的 IPv4；拿不到返回 null，界面退回 127.0.0.1 */
+  getLanIp: () => Promise<string | null>;
+  /** 生成一个 32 位强令牌，只填进输入框，存不存还是用户说了算 */
+  generateRemoteToken: () => Promise<string>;
   initEventListeners: () => Promise<() => void>;
 }
 
@@ -251,6 +255,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   openAccessibilitySettings: async () =>
     run(() => invoke<string>("open_accessibility_settings")),
+
+  // 拿不到局域网地址不是错误（可能就是没连网），所以吞掉异常返回 null，
+  // 界面照旧显示 127.0.0.1，而不是弹一句用户帮不上忙的报错
+  getLanIp: async () => {
+    try {
+      return await invoke<string | null>("get_lan_ip");
+    } catch {
+      return null;
+    }
+  },
+
+  generateRemoteToken: async () => invoke<string>("generate_remote_token"),
 
   /**
    * 事件订阅 + 兜底轮询

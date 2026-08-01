@@ -36,6 +36,18 @@ use crate::monitor::{EngineEvent, LogLevel, MonitorEngine};
 const MAX_HEAD: usize = 8 * 1024;
 /// 单个连接的读超时：手机切后台留下的半开连接不能一直占着 fd
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 换绑地址时的重试次数与间隔
+///
+/// 端口刚被自己放开、内核还没回收完的窗口很短，但正好卡在「勾上允许局域网
+/// 访问 → 保存」这一下上，所以宁可多等两百毫秒也不要让用户面对一个
+/// 「端口占用」却不知道该怎么办。
+const BIND_ATTEMPTS: usize = 3;
+const BIND_RETRY_GAP: Duration = Duration::from_millis(120);
+/// 开放到局域网时，令牌至少要这么长
+///
+/// 只听 127.0.0.1 时短令牌无所谓——能敲到 loopback 的人早就在你机器上了。
+/// 一旦换成 0.0.0.0，令牌就是唯一那道门，三五个字符是秒破的。
+const LAN_TOKEN_MIN: usize = 16;
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const HTML: &str = "text/html; charset=utf-8";
@@ -74,7 +86,7 @@ impl RemoteService {
 
         if !cfg.remote.enabled {
             if let Some(current) = running.take() {
-                current.handle.abort();
+                stop_listener(current).await;
                 self.log(
                     LogLevel::Info,
                     self.i18n().t("log.remote_stopped").to_string(),
@@ -98,20 +110,22 @@ impl RemoteService {
         if running.as_ref().is_some_and(|r| r.addr == addr) {
             return;
         }
+        // **先把旧的彻底停掉再绑新的**：`abort()` 只是提交取消请求，任务可能
+        // 还握着 socket。以前这里 abort 完就立刻 bind，于是「勾上允许局域网
+        // 访问 → 保存」会撞上 EADDRINUSE——旧的 127.0.0.1 还没放手，新的
+        // 0.0.0.0 就绑不上，两头都没了。用户看到的正是「明明开了局域网，
+        // 手机带着令牌连上来却是拒绝」：不是鉴权拒绝，是根本没人在听。
         if let Some(current) = running.take() {
-            current.handle.abort();
+            stop_listener(current).await;
         }
 
-        let listener = match TcpListener::bind(&addr).await {
+        let listener = match bind_with_retry(&addr).await {
             Ok(listener) => listener,
             Err(e) => {
                 let i18n = self.i18n();
                 let message = i18n.tf(
                     "err.remote_bind",
-                    &[
-                        ("port", &cfg.remote.port.to_string()),
-                        ("detail", &e.to_string()),
-                    ],
+                    &[("addr", &addr), ("detail", &e.to_string())],
                 );
                 self.log(LogLevel::Error, message).await;
                 return;
@@ -153,6 +167,30 @@ impl RemoteService {
         if cfg.remote.bind_all {
             self.log(LogLevel::Warn, i18n.t("log.remote_lan").to_string())
                 .await;
+            // 手机要连的是这个地址，不是 0.0.0.0，也不是 127.0.0.1。
+            // 「换错了 IP」和「服务没起来」在手机上长得一模一样（都是连接被拒绝），
+            // 所以把算出来的地址直接写进日志，省掉这一轮猜。
+            if let Some(ip) = lan_ipv4() {
+                self.log(
+                    LogLevel::Info,
+                    i18n.tf(
+                        "log.remote_lan_url",
+                        &[("url", &format!("http://{ip}:{}/", cfg.remote.port))],
+                    ),
+                )
+                .await;
+            }
+            // 开到局域网上，令牌就是唯一那道门；短令牌等于没锁
+            if is_weak_lan_token(&cfg.remote.token) {
+                self.log(
+                    LogLevel::Warn,
+                    i18n.tf(
+                        "log.remote_weak_token",
+                        &[("min", &LAN_TOKEN_MIN.to_string())],
+                    ),
+                )
+                .await;
+            }
         }
     }
 
@@ -181,6 +219,65 @@ impl RemoteService {
             }
         }
     }
+}
+
+/// 停掉当前监听，并**等它真的停下来**
+///
+/// `JoinHandle::abort()` 只是提交一个取消请求：函数返回时任务可能还在
+/// `accept().await` 上握着监听 socket。换绑地址（127.0.0.1 ↔ 0.0.0.0）用的是
+/// 同一个端口，所以「abort 完立刻 bind」有很大概率拿到 EADDRINUSE。
+/// 取消后的 `await` 会返回 `JoinError::Cancelled`——这正是「任务已经落地、
+/// socket 已经 drop」的信号，所以这里必须等。
+async fn stop_listener(current: Running) {
+    current.handle.abort();
+    let _ = current.handle.await;
+}
+
+/// 绑定地址，撞上占用就短暂重试
+///
+/// 自己刚放开的端口内核多半已经回收，但重试几乎免费，而失败的代价是
+/// 用户对着一句「端口占用」不知道下一步做什么。
+async fn bind_with_retry(addr: &str) -> std::io::Result<TcpListener> {
+    let mut last = None;
+    for attempt in 0..BIND_ATTEMPTS {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < BIND_ATTEMPTS {
+                    tokio::time::sleep(BIND_RETRY_GAP).await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("bind failed")))
+}
+
+/// 本机在局域网里的那个 IPv4
+///
+/// 手机能连的地址只有它：设置页以前硬写 `127.0.0.1` 再附一句「自己换成局域网
+/// IP」，于是「IP 换错了」和「服务根本没起来」在手机上的表现完全一样——都是
+/// 连接被拒绝。把地址算出来，这一类猜测就没了。
+///
+/// 用 UDP socket 的老办法：`connect` 到一个公网地址只是让内核**选一条路由**，
+/// 不发任何数据包，所以既不需要真的联网，也不会把任何东西送出去。
+/// 拿不到（没有网络、只有 IPv6）就返回 `None`，由调用方退回 `127.0.0.1`。
+pub fn lan_ipv4() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            Some(ip.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// 开放到局域网时，这个令牌算不算「等于没锁」
+///
+/// 只在 `bind_all` 打开时才有意义：绑 loopback 时能敲到端口的人早就在你机器上了。
+pub fn is_weak_lan_token(token: &str) -> bool {
+    token.trim().chars().count() < LAN_TOKEN_MIN
 }
 
 /// 处理一个连接：读一个请求、回一个响应、关掉
@@ -714,5 +811,60 @@ mod tests {
         // 故意不给 CORS：加了等于允许任意网站拿着你的令牌来抓数据
         assert!(!raw.to_ascii_lowercase().contains("access-control-allow"));
         assert!(raw.ends_with("<p>ok</p>"));
+    }
+
+    /// 换绑地址必须能在同一个端口上接上
+    ///
+    /// 这条钉的就是「勾上允许局域网访问 → 保存 → 手机连上来却被拒绝」：
+    /// 那时候不是鉴权拒绝，是旧监听还握着端口、新监听绑不上，结果没人在听。
+    /// `stop_listener` 等到任务真的落地，所以紧接着的 bind 一定成功。
+    #[tokio::test]
+    async fn rebinding_the_same_port_succeeds_after_stop() {
+        // 先要一个空闲端口，再让「服务」去占它——和 sync() 的顺序一致
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let loopback = format!("127.0.0.1:{port}");
+        let listener = bind_with_retry(&loopback).await.unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let running = Running {
+            addr: loopback.clone(),
+            handle,
+        };
+
+        stop_listener(running).await;
+        // 同一个端口换成 0.0.0.0——正是「允许局域网访问」那一下做的事
+        let rebound = bind_with_retry(&format!("0.0.0.0:{port}")).await;
+        assert!(
+            rebound.is_ok(),
+            "换绑失败了，手机那头看到的就是「连接被拒绝」：{:?}",
+            rebound.err()
+        );
+    }
+
+    #[test]
+    fn lan_ip_is_never_loopback() {
+        // CI 上可能完全没有可路由的地址，那时返回 None 是对的；
+        // 但只要给了地址，就绝不能是 127.x —— 手机连那个地址永远连不上
+        if let Some(ip) = lan_ipv4() {
+            assert!(!ip.starts_with("127."), "算出来的局域网地址是 loopback：{ip}");
+            assert!(ip != "0.0.0.0");
+        }
+    }
+
+    #[test]
+    fn short_tokens_are_weak_on_the_lan() {
+        // 绑 0.0.0.0 时令牌是唯一那道门，三个字符是秒破的
+        assert!(is_weak_lan_token("123"));
+        assert!(is_weak_lan_token(""));
+        assert!(is_weak_lan_token("   abc   "));
+        // uuid simple 是 32 个十六进制字符，够用
+        assert!(!is_weak_lan_token("0123456789abcdef"));
+        assert!(!is_weak_lan_token(&"x".repeat(32)));
     }
 }

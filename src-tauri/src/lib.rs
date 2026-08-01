@@ -373,6 +373,25 @@ async fn ai_analyze(
     judge.analyze(&session.agent_name, &output).await
 }
 
+/// 本机在局域网里的 IPv4（手机看板要连的就是这个）
+///
+/// 设置页以前硬写 `127.0.0.1`，再附一句「自己换成局域网 IP」——于是
+/// 「IP 换错了」和「服务根本没起来」在手机上长得一模一样：都是连接被拒绝。
+/// 拿不到就返回 `null`，前端退回 `127.0.0.1`。
+#[tauri::command]
+async fn get_lan_ip() -> Result<Option<String>, String> {
+    Ok(remote::lan_ipv4())
+}
+
+/// 生成一个强令牌（32 位十六进制）
+///
+/// 开到局域网上，令牌就是唯一那道门。让用户自己想一个足够长的字符串是
+/// 不现实的，所以给一个按钮——生成完只填进输入框，保存与否还是用户说了算。
+#[tauri::command]
+async fn generate_remote_token() -> Result<String, String> {
+    Ok(uuid::Uuid::new_v4().simple().to_string())
+}
+
 /// 获取后端 i18n 词条（前端调试用；界面文案在前端自己的字典里）
 #[tauri::command]
 async fn get_translations(
@@ -461,6 +480,8 @@ pub fn run() {
             get_session_history,
             test_webhook,
             ai_analyze,
+            get_lan_ip,
+            generate_remote_token,
             get_translations,
         ])
         .setup(move |app| {
