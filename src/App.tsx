@@ -38,8 +38,8 @@ import {
  * 选中的 `TabsContent`，所以切过去才会请求，不会开机就把三份数据全拉一遍。
  */
 
-/** 和 package.json / tauri.conf.json 保持一致 */
-const APP_VERSION = "1.0.0";
+/** 构建时从 package.json 注进来，不再手抄（见 vite.config.ts） */
+const APP_VERSION = __APP_VERSION__;
 
 const TABS: readonly { id: TabId; label: I18nKey }[] = [
   { id: "dashboard", label: "nav.dashboard" },
@@ -49,7 +49,7 @@ const TABS: readonly { id: TabId; label: I18nKey }[] = [
   { id: "config", label: "nav.config" },
 ];
 export default function App() {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const activeTab = useAppStore(selectActiveTab);
   const running = useAppStore(selectRunning);
   const loading = useAppStore(selectLoading);
@@ -72,6 +72,12 @@ export default function App() {
       void pending.then((dispose) => dispose());
     };
   }, [fetchState, fetchConfig, initEventListeners]);
+
+  // `index.html` 里写死的是 `lang="zh-CN"`：切成英文界面后读屏软件还会用中文
+  // 语音去念英文。跟着配置改，是这一处唯一能保持诚实的办法。
+  useEffect(() => {
+    document.documentElement.lang = lang === "en" ? "en" : "zh-CN";
+  }, [lang]);
 
   return (
     <TooltipProvider>
