@@ -12,6 +12,7 @@ import type {
   MonitorState,
   ProjectCost,
   RateLimitForecast,
+  ResumeProbe,
   ResumeRecord,
   SessionHistoryEntry,
 } from "../types";
@@ -57,11 +58,17 @@ interface AppStore {
   stopMonitoring: () => Promise<void>;
   scanNow: () => Promise<void>;
   updateConfig: (config: AppConfig) => Promise<CommandResult>;
-  manualResume: (sessionId: string, useGoalPrompt?: boolean) => Promise<CommandResult>;
+  manualResume: (
+    sessionId: string,
+    useGoalPrompt?: boolean,
+  ) => Promise<CommandResult>;
   focusTerminal: (sessionId: string) => Promise<CommandResult>;
   testNotify: () => Promise<CommandResult>;
   testWebhook: () => Promise<CommandResult>;
   aiAnalyze: (sessionId: string) => Promise<AiVerdict>;
+  /** 续跑演练：走完定位流程但不投递，用来回答「字会敲到哪儿」 */
+  probeResume: (sessionId: string) => Promise<ResumeProbe>;
+  openAccessibilitySettings: () => Promise<CommandResult>;
   initEventListeners: () => Promise<() => void>;
 }
 
@@ -87,7 +94,9 @@ const defaultMonitorState: MonitorState = {
  * 后端返回的错误已经是当前语言的成品文案（`src-tauri/src/i18n`），
  * 所以这里原样往上传，不再拼「错误: 」之类的前缀——那正是中英混杂的来源。
  */
-async function run(action: () => Promise<string | void>): Promise<CommandResult> {
+async function run(
+  action: () => Promise<string | void>,
+): Promise<CommandResult> {
   try {
     const message = await action();
     return { ok: true, message: message ?? "" };
@@ -160,10 +169,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
   fetchSessionHistory: async (query) => {
     const next = query ?? get().historyQuery;
     try {
-      const sessionHistory = await invoke<SessionHistoryEntry[]>("get_session_history", {
-        limit: 100,
-        query: next,
-      });
+      const sessionHistory = await invoke<SessionHistoryEntry[]>(
+        "get_session_history",
+        {
+          limit: 100,
+          query: next,
+        },
+      );
       set({ sessionHistory, historyQuery: next });
     } catch (e) {
       console.error("get_session_history", e);
@@ -218,7 +230,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   manualResume: async (sessionId, useGoalPrompt = false) => {
     const result = await run(() =>
-      invoke<string>("manual_resume", { sessionId, useGoalPrompt })
+      invoke<string>("manual_resume", { sessionId, useGoalPrompt }),
     );
     await get().fetchState();
     return result;
@@ -231,7 +243,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   testWebhook: async () => run(() => invoke<string>("test_webhook")),
 
-  aiAnalyze: async (sessionId) => invoke<AiVerdict>("ai_analyze", { sessionId }),
+  aiAnalyze: async (sessionId) =>
+    invoke<AiVerdict>("ai_analyze", { sessionId }),
+
+  probeResume: async (sessionId) =>
+    invoke<ResumeProbe>("probe_resume", { sessionId }),
+
+  openAccessibilitySettings: async () =>
+    run(() => invoke<string>("open_accessibility_settings")),
 
   /**
    * 事件订阅 + 兜底轮询
@@ -243,23 +262,29 @@ export const useAppStore = create<AppStore>((set, get) => ({
    * 守护中的间隔取扫描周期的一半（夹在 2–8 秒），比原来的 3 秒更贴合后端节奏。
    */
   initEventListeners: async () => {
-    const unlistenEvents = await listen<EngineEvent[]>("engine-events", (event) => {
-      set((state) => ({
-        localEvents: [...state.localEvents, ...event.payload].slice(-500),
-      }));
-    });
+    const unlistenEvents = await listen<EngineEvent[]>(
+      "engine-events",
+      (event) => {
+        set((state) => ({
+          localEvents: [...state.localEvents, ...event.payload].slice(-500),
+        }));
+      },
+    );
 
     const unlistenStopped = await listen("engine-stopped", () => {
       void get().fetchState();
     });
 
-    const unlistenAlert = await listen<AttentionAlert>("attention-alert", (event) => {
-      const alert = event.payload;
-      if (alert.sound) playChime(alert.volume, alert.level === "needs_input");
-      if (alert.session_id) set({ focusedSessionId: alert.session_id });
-      // 提醒意味着状态刚变，别等下一轮轮询
-      void get().fetchState();
-    });
+    const unlistenAlert = await listen<AttentionAlert>(
+      "attention-alert",
+      (event) => {
+        const alert = event.payload;
+        if (alert.sound) playChime(alert.volume, alert.level === "needs_input");
+        if (alert.session_id) set({ focusedSessionId: alert.session_id });
+        // 提醒意味着状态刚变，别等下一轮轮询
+        void get().fetchState();
+      },
+    );
 
     let timer: number | undefined;
     let disposed = false;

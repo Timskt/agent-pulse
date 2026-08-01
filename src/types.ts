@@ -9,10 +9,12 @@
  * 切英文时就露馅了。
  */
 
-export type SessionStatus = "active" | "suspended" | "interrupted" | "completed" | "exited";
+export type SessionStatus =
+  "active" | "suspended" | "interrupted" | "completed" | "exited";
 
 /** 注意力分级（v1.1）：这个会话现在要不要叫人 */
-export type AttentionLevel = "none" | "needs_input" | "completed" | "rate_limited" | "error";
+export type AttentionLevel =
+  "none" | "needs_input" | "completed" | "rate_limited" | "error";
 
 /** 用量汇总，可用于单会话、单项目或单日 */
 export interface UsageSnapshot {
@@ -256,4 +258,36 @@ export interface AiVerdict {
   confidence: number;
   reasoning: string;
   suggested_prompt: string | null;
+}
+
+/** 续跑这条路要用到的一个外部依赖 */
+export interface ToolStatus {
+  name: string;
+  available: boolean;
+  /** 后端已本地化的一句话 */
+  purpose: string;
+}
+
+/**
+ * 一次续跑演练的结果
+ *
+ * 演练走完全部定位流程但**一个字都不敲**，回答的是「现在按续跑，
+ * 这串提示词会落到哪儿」——以及落不到的时候，卡在哪一环。
+ */
+export interface ResumeProbe {
+  session_id: string;
+  /** `exact` 精确 | `window` 只到窗口 | `none` 定位不到 */
+  certainty: "exact" | "window" | "none";
+  certainty_label: string;
+  channel: string;
+  target: string | null;
+  detail: string;
+  would_deliver: boolean;
+  terminal_app: string | null;
+  tty: string | null;
+  project_name: string;
+  allow_blind: boolean;
+  /** macOS 上缺「辅助功能」权限：界面据此给一个「去开权限」按钮 */
+  needs_permission_fix: boolean;
+  tools: ToolStatus[];
 }

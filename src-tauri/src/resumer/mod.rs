@@ -151,6 +151,686 @@ pub fn session_terminal_app(pid: u32) -> Option<String> {
     }
 }
 
+/// 终端复用器里的一个投递目标（tmux pane / screen window）
+///
+/// **为什么这条路排在所有 GUI 终端之前**：
+/// - `tmux send-keys -t %3` 是按 **pane id 寻址**的。不需要窗口在前台、不需要猜
+///   是哪个标签、不需要辅助功能权限，用户甚至可以正在另一个 Space 里干别的。
+/// - 它写的是 pane 的伪终端，**完全不经过输入法**。中文提示词被拼音改写成
+///   「啊啊啊啊……」的那个问题（见 [`stage_clipboard`]）在这条路上不存在，
+///   连剪贴板都不用借。
+/// - 参数是 argv 数组，不拼 shell 字符串，提示词里有什么字符都无所谓。
+///
+/// 代价是它只覆盖「跑在复用器里的会话」，认不出来就往下走原来的 GUI 路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxTarget {
+    /// `tmux` 或 `screen`
+    pub tool: &'static str,
+    /// tmux 的 pane id（`%3`）；screen 的 session 名
+    pub target: String,
+    /// 这个 pane 的 tty，用来跟会话的 tty 对账（screen 拿不到，为空）
+    pub tty: String,
+}
+
+impl MuxTarget {
+    /// 这个目标是不是**逐 pane 精确**的
+    ///
+    /// tmux 能按 tty 把会话对到具体 pane，所以是精确的。
+    /// screen 不暴露 tty→window 的映射，`-X stuff` 只能投给该 session
+    /// **当前选中的那个 window**——万一用户切走了，字就敲进别的窗口。
+    /// 所以 screen 只能算窗口级，得跟其它盲敲路径一样先要授权。
+    pub fn is_exact(&self) -> bool {
+        self.tool == "tmux"
+    }
+}
+
+/// 生成投递命令序列：按顺序执行的 `(程序, argv)` 列表
+///
+/// 拆成纯函数是为了让三个平台的 CI 都能测到参数拼法——这里错一个 flag 的代价
+/// 不是报错，而是把 `Enter` 四个字母敲进用户的会话。
+///
+/// 两个关键 flag：
+/// - `-l`：关掉 key name 查表，把整串当字面 UTF-8 送。少了它，提示词里出现
+///   `Enter`、`Escape`、`C-c` 这类词会被当成按键名解释。
+/// - `--`：终止 flag 解析。少了它，以 `-` 开头的提示词会被 tmux 当成选项。
+///
+/// **故意不加 cfg**：纯字符串拼装，每个平台的单元测试都跑得到。
+pub fn mux_commands(target: &MuxTarget, prompt: &str) -> Vec<(String, Vec<String>)> {
+    match target.tool {
+        "screen" => {
+            // screen 的 `stuff` 直接把字符串塞进输入队列，末尾补一个回车（\r）。
+            // 不用 \n：终端里回车键送的是 CR，LF 在某些 TUI 里不触发提交。
+            vec![(
+                "screen".to_string(),
+                vec![
+                    "-S".to_string(),
+                    target.target.clone(),
+                    "-X".to_string(),
+                    "stuff".to_string(),
+                    format!("{prompt}\r"),
+                ],
+            )]
+        }
+        // tmux：先送字面文本，再单独送一次 Enter。
+        // 合成一步（在 prompt 末尾加 \r）也行，但分两步的失败模式更清楚：
+        // 第一步失败就还没提交，用户的输入框里不会留半句话。
+        _ => vec![
+            (
+                "tmux".to_string(),
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    target.target.clone(),
+                    "-l".to_string(),
+                    "--".to_string(),
+                    prompt.to_string(),
+                ],
+            ),
+            (
+                "tmux".to_string(),
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    target.target.clone(),
+                    "Enter".to_string(),
+                ],
+            ),
+        ],
+    }
+}
+
+/// 从 `tmux list-panes` 的输出里找出 tty 匹配的 pane
+///
+/// 每行形如 `%3\t/dev/ttys004`。会话的 tty 就是它所在 pane 的伪终端，
+/// 所以这一步是**对账**而不是猜测：对上了就是它，对不上就没有。
+///
+/// **故意不加 cfg**：纯解析，每个平台都能测。
+pub fn match_tmux_pane(list_output: &str, tty: &str) -> Option<String> {
+    if tty.is_empty() {
+        return None;
+    }
+    for line in list_output.lines() {
+        let mut parts = line.split('\t');
+        let pane = parts.next()?.trim();
+        let pane_tty = parts.next().unwrap_or_default().trim();
+        if pane.is_empty() || pane_tty.is_empty() {
+            continue;
+        }
+        // tmux 报的是 /dev/ttys004，`ps -o tty=` 也被我们补成了同样的前缀；
+        // 两边都可能少个 /dev/，所以按后缀互认一次
+        if pane_tty == tty || pane_tty.ends_with(tty) || tty.ends_with(pane_tty) {
+            return Some(pane.to_string());
+        }
+    }
+    None
+}
+
+/// 查找会话所在的 tmux pane / screen session
+///
+/// 顺序是先 tmux（能精确到 pane）再 screen（只能到 session）。
+/// 任何一步失败都返回 `None` 让调用方走原来的路——这里不该抛错，
+/// 「机器上没装 tmux」是最常见的情况，不是故障。
+#[cfg(unix)]
+pub fn mux_target_for_pid(pid: u32) -> Option<MuxTarget> {
+    let tty = session_tty(pid)?;
+
+    // tmux：一次列出所有 session 的所有 pane，按 tty 对账
+    if let Ok(out) = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_tty}"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(pane) = match_tmux_pane(&text, &tty) {
+                return Some(MuxTarget {
+                    tool: "tmux",
+                    target: pane,
+                    tty,
+                });
+            }
+        }
+    }
+
+    // screen：沿父进程链找 SCREEN，拿到 session 名
+    if let Some(name) = screen_session_for_pid(pid) {
+        return Some(MuxTarget {
+            tool: "screen",
+            target: name,
+            tty: String::new(),
+        });
+    }
+
+    None
+}
+
+/// 非 unix 平台没有 tmux/screen
+#[cfg(not(unix))]
+pub fn mux_target_for_pid(pid: u32) -> Option<MuxTarget> {
+    let _ = pid;
+    None
+}
+
+/// 沿父进程链找 `SCREEN`，返回它的 session 名（`12345.pts-0.host`）
+///
+/// screen 的子进程的父链上一定有那个 `SCREEN` 服务进程。拿到它的 pid 之后
+/// 用 `screen -ls` 反查全名——`-X` 需要的是全名或唯一前缀，光有 pid 不够。
+#[cfg(unix)]
+fn screen_session_for_pid(pid: u32) -> Option<String> {
+    let mut current = pid;
+    for _ in 0..8 {
+        let out = Command::new("ps")
+            .args(["-o", "ppid=,comm=", "-p", &current.to_string()])
+            .output()
+            .ok()?;
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (ppid_str, comm) = line.split_once(' ')?;
+        let ppid: u32 = ppid_str.trim().parse().ok()?;
+        let comm = comm.trim();
+        // screen 的服务进程名是大写 SCREEN，客户端才是小写 screen
+        if comm.rsplit('/').next().unwrap_or(comm) == "SCREEN" {
+            let ls = Command::new("screen").arg("-ls").output().ok()?;
+            let text = String::from_utf8_lossy(&ls.stdout);
+            return match_screen_session(&text, current);
+        }
+        if ppid <= 1 {
+            break;
+        }
+        current = ppid;
+    }
+    None
+}
+
+/// 从 `screen -ls` 的输出里按 pid 找出 session 全名
+///
+/// 输出形如 `\t12345.pts-0.host\t(Detached)`，第一段就是全名，点号前是 pid。
+///
+/// **故意不加 cfg**：纯解析，每个平台都能测。
+pub fn match_screen_session(ls_output: &str, pid: u32) -> Option<String> {
+    let prefix = format!("{pid}.");
+    for line in ls_output.lines() {
+        let name = line.split_whitespace().next().unwrap_or_default();
+        if name.starts_with(&prefix) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// 一次续跑演练的结果：**走完全部定位流程，但一个字都不敲**
+///
+/// 这个类型存在的理由：续跑是「按下去才知道对不对」的动作，而敲错窗口比不续跑
+/// 糟糕得多。演练把「要冒风险试一次」变成「零风险随时可查」——用户在真的依赖
+/// 自动续跑之前，先看一眼它认到了哪儿。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumeProbe {
+    pub session_id: String,
+    /// `exact` | `window` | `none`
+    pub certainty: String,
+    /// 已本地化的确定性名称
+    pub certainty_label: String,
+    /// 已本地化的通道名称（tmux 面板 / iTerm2 标签 / 编辑器内置终端 …）
+    pub channel: String,
+    /// 定位到的具体目标：pane id、tty、窗口标题、窗口 id
+    pub target: Option<String>,
+    /// 已本地化的一段解释：这串字符会落到哪儿、为什么
+    pub detail: String,
+    /// 按现在的配置，真的点续跑会不会发出字符
+    pub would_deliver: bool,
+    pub terminal_app: Option<String>,
+    pub tty: Option<String>,
+    pub project_name: String,
+    /// 「盲敲最前窗口」开没开
+    pub allow_blind: bool,
+    /// macOS 上缺「辅助功能」权限——界面据此给一个「去开权限」按钮
+    ///
+    /// 用一个布尔而不是让前端去认工具名：认名字就得按语言匹配字符串，
+    /// 换成英文界面立刻失灵。
+    pub needs_permission_fix: bool,
+    /// 环境自检：这条路要用到的外部工具在不在
+    pub tools: Vec<ToolStatus>,
+}
+
+/// 单个外部依赖的可用性
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolStatus {
+    pub name: String,
+    pub available: bool,
+    /// 已本地化的一句话：这个工具是干什么的
+    pub purpose: String,
+}
+
+/// macOS：辅助功能权限拿到了没有
+///
+/// **这是「跳过去了但一个字都没敲」的头号原因。** `System Events` 的 keystroke
+/// 需要「隐私与安全性 › 辅助功能」里勾上本应用；没勾上时，脚本前半段
+/// （`activate` / 选标签）照样成功，用户看到窗口跳过来了，
+/// 后半段 keystroke 直接抛 -1719，于是「跳转完就没动作」。
+///
+/// 更阴的一点：**重新构建过的应用会让这条授权失效**。TCC 记的是代码签名，
+/// 换了二进制就不算同一个应用了，系统settings 里那个勾还在、实际已经不生效。
+///
+/// 用 `UI elements enabled` 查询：它只读、不弹窗、不会把用户拽进设置面板。
+#[cfg(target_os = "macos")]
+async fn accessibility_granted(i18n: &I18n) -> bool {
+    matches!(
+        run_osascript(
+            "tell application \"System Events\" to return UI elements enabled",
+            i18n,
+        )
+        .await
+        .as_deref(),
+        Ok("true")
+    )
+}
+
+/// 判断一段 osascript 报错是不是「没有辅助功能权限」
+///
+/// 单独拎出来是因为这个错误的**默认表现是静默**：用户只看到窗口跳过来，
+/// 什么都没发生，然后来问「是不是坏了」。必须换成一句能照着做的话。
+///
+/// **故意不加 cfg**：纯字符串判断，每个平台都能测。
+pub fn is_accessibility_error(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("-1719")
+        || lower.contains("-25211")
+        || lower.contains("not allowed to send keystrokes")
+        || lower.contains("not allowed assistive access")
+        || lower.contains("assistive access")
+        || lower.contains("osascript is not allowed")
+}
+
+/// 一个通道要不要 macOS 的辅助功能权限
+///
+/// iTerm2 的 `write text` 和 tmux 的 `send-keys` 都是直接写伪终端，不碰
+/// `System Events`，所以这两条路即使没授权也能敲进去。其余分支全靠合成按键。
+///
+/// **故意不加 cfg**：纯映射，每个平台都能测。
+pub fn channel_needs_accessibility(channel_key: &str) -> bool {
+    !matches!(
+        channel_key,
+        "probe.channel_tmux" | "probe.channel_screen" | "probe.channel_iterm2"
+    )
+}
+
+/// 走完全部定位流程但**一个字都不敲**，报告「续跑会把字敲到哪儿」
+///
+/// 这是 12.1 那张「从没实机验证过」表格的解药：把「要冒险按一次才知道」
+/// 变成「零风险随时可查」。
+pub async fn probe_resume(session: &AgentSession, config: &AppConfig) -> ResumeProbe {
+    let i18n = I18n::from_code(&config.language);
+    let allow_blind = config.auto_follow_latest;
+    let tty = session_tty(session.pid);
+    let terminal_app = session_terminal_app(session.pid);
+    let project_name = project_name_of(&session.working_dir).to_string();
+
+    let tools = collect_tools(&i18n).await;
+
+    // 复用器优先：认出来就到此为止，这是确定性最高的一条
+    let (certainty, channel_key, target) = match mux_target_for_pid(session.pid) {
+        Some(m) if m.is_exact() => ("exact", "probe.channel_tmux", Some(m.target)),
+        Some(m) => ("window", "probe.channel_screen", Some(m.target)),
+        None => {
+            locate_gui(
+                session,
+                terminal_app.as_deref().unwrap_or_default(),
+                tty.as_deref(),
+                &project_name,
+                &i18n,
+            )
+            .await
+        }
+    };
+
+    let channel = i18n.t_owned(channel_key);
+
+    let mut would_deliver = match certainty {
+        "exact" | "window" => true,
+        _ => allow_blind,
+    };
+
+    // macOS：定位到了也可能敲不进去——没有辅助功能权限的合成按键是空动作。
+    //
+    // 只在「本来会敲」的时候才查：定位都失败的行上再挂一句权限警告纯属噪音，
+    // 而且能省一次 osascript 往返。
+    let blocked_by_permission = {
+        #[cfg(target_os = "macos")]
+        {
+            would_deliver
+                && channel_needs_accessibility(channel_key)
+                && !accessibility_granted(&i18n).await
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    };
+
+    let mut detail = match certainty {
+        "exact" => i18n.tf(
+            "probe.detail_exact",
+            &[
+                ("channel", &channel),
+                ("target", target.as_deref().unwrap_or("-")),
+            ],
+        ),
+        "window" => i18n.tf(
+            "probe.detail_window",
+            &[
+                ("channel", &channel),
+                ("target", target.as_deref().unwrap_or("-")),
+            ],
+        ),
+        _ if allow_blind => i18n.t_owned("probe.detail_none_blind"),
+        _ => i18n.t_owned("probe.detail_none"),
+    };
+
+    if blocked_by_permission {
+        would_deliver = false;
+        detail = format!("{detail}\n\n{}", i18n.t("probe.no_accessibility"));
+    }
+
+    ResumeProbe {
+        session_id: session.id.clone(),
+        certainty: certainty.to_string(),
+        certainty_label: i18n.t_owned(match certainty {
+            "exact" => "probe.certainty_exact",
+            "window" => "probe.certainty_window",
+            _ => "probe.certainty_none",
+        }),
+        channel,
+        target,
+        detail,
+        would_deliver,
+        terminal_app,
+        tty,
+        project_name,
+        allow_blind,
+        needs_permission_fix: blocked_by_permission,
+        tools,
+    }
+}
+
+/// 环境自检：续跑这条路要用到的外部依赖在不在
+///
+/// 每个平台只报自己真的会用到的东西——在 macOS 上列一行「xdotool 缺失」
+/// 只会让人白担心。
+async fn collect_tools(i18n: &I18n) -> Vec<ToolStatus> {
+    let mut tools = Vec::new();
+
+    #[cfg(unix)]
+    {
+        for (name, purpose) in [
+            ("tmux", "probe.tool_tmux"),
+            ("screen", "probe.tool_screen"),
+        ] {
+            tools.push(ToolStatus {
+                name: name.to_string(),
+                available: unix_tool_present(name),
+                purpose: i18n.t_owned(purpose),
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        tools.push(ToolStatus {
+            name: i18n.t_owned("probe.tool_accessibility_name"),
+            available: accessibility_granted(i18n).await,
+            purpose: i18n.t_owned("probe.tool_accessibility"),
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        for (name, purpose) in [
+            ("xdotool", "probe.tool_xdotool"),
+            ("ydotool", "probe.tool_ydotool"),
+        ] {
+            tools.push(ToolStatus {
+                name: name.to_string(),
+                available: unix_tool_present(name),
+                purpose: i18n.t_owned(purpose),
+            });
+        }
+        let clipboard = LINUX_CLIPBOARD_TOOLS
+            .iter()
+            .find(|(bin, _)| unix_tool_present(bin));
+        tools.push(ToolStatus {
+            name: clipboard
+                .map(|(bin, _)| bin.to_string())
+                .unwrap_or_else(|| "wl-copy / xclip / xsel".to_string()),
+            available: clipboard.is_some(),
+            purpose: i18n.t_owned("probe.tool_clipboard"),
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = i18n;
+        tools.push(ToolStatus {
+            name: "powershell".to_string(),
+            available: true,
+            purpose: i18n.t_owned("probe.tool_powershell"),
+        });
+    }
+
+    tools
+}
+
+/// `which <bin>` —— 只问在不在，不执行它
+#[cfg(unix)]
+fn unix_tool_present(bin: &str) -> bool {
+    Command::new("which")
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// macOS：只查询窗口/标签在不在，不发送任何按键
+#[cfg(target_os = "macos")]
+async fn locate_gui(
+    _session: &AgentSession,
+    terminal_app: &str,
+    tty: Option<&str>,
+    project_name: &str,
+    i18n: &I18n,
+) -> (&'static str, &'static str, Option<String>) {
+    match (terminal_app, tty) {
+        ("iTerm2", Some(tty_path)) => {
+            let script = format!(
+                r#"with timeout of 8 seconds
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aSession in sessions of aTab
+                    if tty of aSession contains "{tty_path}" then return "found"
+                end repeat
+            end repeat
+        end repeat
+        return "missing"
+    end tell
+end timeout"#
+            );
+            if run_osascript(&script, i18n).await.as_deref() == Ok("found") {
+                ("exact", "probe.channel_iterm2", Some(tty_path.to_string()))
+            } else {
+                ("none", "probe.channel_iterm2", None)
+            }
+        }
+        ("Terminal", Some(tty_path)) => {
+            let script = format!(
+                r#"with timeout of 8 seconds
+    tell application "Terminal"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                if tty of aTab contains "{tty_path}" then return "found"
+            end repeat
+        end repeat
+        return "missing"
+    end tell
+end timeout"#
+            );
+            if run_osascript(&script, i18n).await.as_deref() == Ok("found") {
+                ("exact", "probe.channel_terminal", Some(tty_path.to_string()))
+            } else {
+                ("none", "probe.channel_terminal", None)
+            }
+        }
+        (app, _) if TITLE_MATCHED_APPS.contains(&app) && !project_name.is_empty() => {
+            let script = format!(
+                r#"tell application "System Events"
+    set candidates to (every application process whose name contains "{app}")
+    if candidates is {{}} then return "no-app"
+    repeat with w in (every window of item 1 of candidates)
+        if name of w contains "{project_name}" then return name of w
+    end repeat
+end tell
+return "missing""#
+            );
+            match run_osascript(&script, i18n).await {
+                Ok(title) if title != "missing" && title != "no-app" => {
+                    ("window", "probe.channel_ide", Some(title))
+                }
+                _ => ("none", "probe.channel_ide", None),
+            }
+        }
+        ("", _) => ("none", "probe.channel_unknown", None),
+        (app, _) => ("none", "probe.channel_frontmost", Some(app.to_string())),
+    }
+}
+
+/// Linux：只查窗口 id，不激活也不输入
+#[cfg(target_os = "linux")]
+async fn locate_gui(
+    session: &AgentSession,
+    _terminal_app: &str,
+    _tty: Option<&str>,
+    _project_name: &str,
+    _i18n: &I18n,
+) -> (&'static str, &'static str, Option<String>) {
+    match Resumer::find_x11_window_for_pid(session.pid) {
+        Some(wid) => ("window", "probe.channel_x11", Some(wid)),
+        None => ("none", "probe.channel_x11", None),
+    }
+}
+
+/// Windows：只沿父进程链找宿主窗口并读标题，不切前台也不输入
+#[cfg(target_os = "windows")]
+async fn locate_gui(
+    session: &AgentSession,
+    _terminal_app: &str,
+    _tty: Option<&str>,
+    project_name: &str,
+    i18n: &I18n,
+) -> (&'static str, &'static str, Option<String>) {
+    let script = windows_probe_script(session.pid);
+    let Ok(out) = run_with_timeout(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+        15,
+        i18n,
+    )
+    .await
+    else {
+        return ("none", "probe.channel_console", None);
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let last = text.lines().filter(|l| !l.trim().is_empty()).next_back().unwrap_or_default().trim();
+    match last.split_once('\t') {
+        Some(("WINDOW", title)) => {
+            let multi_tab = WINDOWS_MULTI_TAB_HOSTS
+                .iter()
+                .any(|h| title.to_lowercase().contains(h));
+            // 单窗口宿主（conhost/cmd）= 一个窗口就是一个控制台，算精确；
+            // 多标签宿主还得靠标题里有项目名才能认到标签
+            if !multi_tab || (!project_name.is_empty() && title.contains(project_name)) {
+                ("window", "probe.channel_console", Some(title.to_string()))
+            } else {
+                ("none", "probe.channel_console", Some(title.to_string()))
+            }
+        }
+        _ => ("none", "probe.channel_console", None),
+    }
+}
+
+/// Windows 只读探测脚本：找到宿主窗口就把标题打出来，绝不切前台、绝不按键
+///
+/// **故意不加 cfg**：脚本生成器，三个平台的 CI 都能测。
+pub fn windows_probe_script(pid: u32) -> String {
+    format!(
+        r#"
+$cur = {pid}
+$hwnd = [IntPtr]::Zero
+$title = ""
+for ($i = 0; $i -lt 8; $i++) {{
+    $p = Get-Process -Id $cur -ErrorAction SilentlyContinue
+    if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {{
+        $hwnd = $p.MainWindowHandle
+        $title = $p.MainWindowTitle
+        break
+    }}
+    $ci = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+    if (-not $ci) {{ break }}
+    $cur = $ci.ParentProcessId
+    if ($cur -le 4) {{ break }}
+}}
+if ($hwnd -eq [IntPtr]::Zero) {{ Write-Output "NO_WINDOW"; exit 0 }}
+Write-Output "WINDOW`t$title"
+"#
+    )
+}
+
+/// 其它平台：没有续跑通道
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+async fn locate_gui(
+    _session: &AgentSession,
+    _terminal_app: &str,
+    _tty: Option<&str>,
+    _project_name: &str,
+    _i18n: &I18n,
+) -> (&'static str, &'static str, Option<String>) {
+    ("none", "probe.channel_unknown", None)
+}
+
+/// 直接把用户送到「辅助功能」设置页
+///
+/// 光说「去系统设置 › 隐私与安全性 › 辅助功能」不够——那是三层菜单，
+/// 而且真正的动作是**取消再勾一次**，不是第一次勾上。少一步都可能让人卡住。
+#[cfg(target_os = "macos")]
+pub async fn open_accessibility_settings(lang: &str) -> Result<String, String> {
+    let i18n = I18n::from_code(lang);
+    let out = run_with_timeout(
+        "open",
+        &["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+        10,
+        &i18n,
+    )
+    .await?;
+    if out.status.success() {
+        Ok(i18n.t_owned("probe.settings_opened"))
+    } else {
+        Err(i18n.tf(
+            "cmd.failed",
+            &[
+                ("program", "open"),
+                (
+                    "detail",
+                    String::from_utf8_lossy(&out.stderr).trim(),
+                ),
+            ],
+        ))
+    }
+}
+
+/// 别的平台没有这个权限概念
+#[cfg(not(target_os = "macos"))]
+pub async fn open_accessibility_settings(lang: &str) -> Result<String, String> {
+    Err(I18n::from_code(lang)
+        .t("probe.settings_unsupported")
+        .to_string())
+}
+
 /// macOS 上进程名 → 应用显示名的映射
 #[cfg(target_os = "macos")]
 fn mac_app_display_name(terminal_app: &str) -> &str {
@@ -511,12 +1191,21 @@ impl Resumer {
 
     /// 执行续跑
     /// `use_goal_prompt`: 是否使用 Goal 专用提示词（检测到活跃 goal 时为 true）
+    ///
+    /// 通道优先级：**先 tmux/screen，再 GUI 终端**。
+    /// 复用器那条路按 pane id 寻址、不经输入法、不需要前台窗口，
+    /// 确定性比任何 AppleScript / SendKeys / xdotool 路径都高一档，
+    /// 所以只要认得出来就用它，认不出来才退回到窗口定位。
     pub async fn resume(&self, session: &AgentSession, use_goal_prompt: bool) -> Result<String, String> {
         let prompt = if use_goal_prompt {
             &self.config.goal_resume_prompt
         } else {
             &self.config.resume_prompt
         };
+
+        if let Some(result) = self.try_resume_mux(session, prompt).await {
+            return result;
+        }
 
         #[cfg(target_os = "macos")]
         {
@@ -538,6 +1227,65 @@ impl Resumer {
             let _ = (session, prompt);
             Err(self.i18n.t("resume.unsupported").to_string())
         }
+    }
+
+    /// 尝试通过 tmux/screen 投递；`None` = 这个会话不在复用器里，请走别的路
+    ///
+    /// 返回 `Some(Err(..))` 只在「认出了复用器但投递失败」时发生——那种情况不该
+    /// 再退回去盲敲 GUI 窗口：既然已经确定会话在这个 pane 里，敲到别处只会更糟。
+    async fn try_resume_mux(
+        &self,
+        session: &AgentSession,
+        prompt: &str,
+    ) -> Option<Result<String, String>> {
+        let target = mux_target_for_pid(session.pid)?;
+
+        // screen 只能投给「该 session 当前选中的 window」，属于窗口级不确定，
+        // 跟其它盲敲路径同样的门槛
+        if !target.is_exact() && !self.allow_blind_any() {
+            return Some(Err(self.i18n.t("resume.blind_refused").to_string()));
+        }
+
+        tracing::info!(
+            "[Resumer] 会话 {} → {} 目标 {}",
+            session.id,
+            target.tool,
+            target.target
+        );
+
+        for (program, args) in mux_commands(&target, prompt) {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            match run_with_timeout(&program, &argv, 10, &self.i18n).await {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    return Some(Err(self.i18n.tf(
+                        "resume.mux_failed",
+                        &[("tool", target.tool), ("detail", &stderr)],
+                    )));
+                }
+                Err(e) => {
+                    return Some(Err(self.i18n.tf(
+                        "resume.mux_failed",
+                        &[("tool", target.tool), ("detail", &e)],
+                    )))
+                }
+            }
+        }
+
+        Some(Ok(self.i18n.tf(
+            "resume.sent_mux",
+            &[("tool", target.tool), ("target", &target.target)],
+        )))
+    }
+
+    /// 跟 [`Self::allow_blind`] 同一个开关，但不带平台 cfg
+    ///
+    /// 复用器那条路在所有 unix 上都可能走到，`allow_blind` 的 cfg 只覆盖三大平台，
+    /// 这里单开一个入口，免得为了共用而把 cfg 放宽到跟调用点不匹配
+    /// （那正是之前两次 CI 变红的原因）。
+    fn allow_blind_any(&self) -> bool {
+        self.config.auto_follow_latest
     }
 
     /// macOS: 通过 TTY 精确定位终端窗口并发送续跑指令
@@ -566,6 +1314,21 @@ impl Resumer {
             return Err(self.i18n.t("resume.blind_refused").to_string());
         };
 
+        // 5. 先问权限，再动手
+        //
+        // 这是「点了续跑，窗口跳过来了，然后什么都没发生」的根因所在：
+        // 脚本前半段（activate / 选标签）不需要任何授权，照样成功；后半段的
+        // `keystroke` 归「辅助功能」管，没授权就抛 -1719。用户看到的就是
+        // 干净的一次跳转加一片安静。
+        //
+        // 更容易踩的是：**这条授权在应用更新后会失效**。TCC 记的是代码签名，
+        // 换了二进制系统就不认了——设置里那个勾看着还在，实际已经不生效。
+        //
+        // 所以在跳窗口之前就查一次：没权限就别跳了，直接告诉用户去哪儿点。
+        if script.contains("System Events") && !accessibility_granted(&self.i18n).await {
+            return Err(self.i18n.t("resume.needs_accessibility").to_string());
+        }
+
         match run_osascript(&script, &self.i18n).await {
             // 脚本自己判断出「不知道该敲哪儿」，回传 refused
             Ok(raw) if raw == "refused" => {
@@ -592,6 +1355,12 @@ impl Resumer {
                         ("tty", tty_text),
                     ],
                 ))
+            }
+            // 权限查询有可能被系统缓存骗过（授权刚被撤销、查询还答 true），
+            // 所以真敲下去再撞上 -1719 时，同样翻译成那句能照着做的话，
+            // 而不是把 AppleScript 的英文原文糊到界面上
+            Err(stderr) if is_accessibility_error(&stderr) => {
+                Err(self.i18n.t("resume.needs_accessibility").to_string())
             }
             Err(stderr) => Err(self
                 .i18n
@@ -1318,6 +2087,144 @@ pub const YDOTOOL_PASTE_KEYS: [&str; 6] = ["29:1", "42:1", "47:1", "47:0", "42:0
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── tmux / screen 投递通道 ──
+    //
+    // 这条路的全部价值在于「不经过输入法、不需要窗口在前台」，所以这里
+    // 盯的是两件事：提示词必须作为**独立的 argv 元素**传下去（一旦被拼进
+    // shell 字符串，带引号或反引号的提示词就成了命令注入），以及回车必须
+    // 是单独一次 send-keys（跟文本混在一行会被当成字面量）。
+
+    #[test]
+    fn tmux_sends_text_and_enter_separately() {
+        let target = MuxTarget {
+            tool: "tmux",
+            target: "%7".to_string(),
+            tty: "/dev/ttys004".to_string(),
+        };
+        let cmds = mux_commands(&target, "继续 `whoami` \"干活\"");
+        assert_eq!(cmds.len(), 2, "文本和回车必须分两次发");
+
+        let (program, args) = &cmds[0];
+        assert_eq!(program, "tmux");
+        // `-l` = literal，`--` 收住选项解析：以 `-` 开头的提示词不会被当成选项
+        assert_eq!(args[..5], ["send-keys", "-t", "%7", "-l", "--"]);
+        // 提示词是最后一个独立元素，原样不动——没有任何转义或拼接
+        assert_eq!(args[5], "继续 `whoami` \"干活\"");
+        assert_eq!(args.len(), 6);
+
+        assert_eq!(cmds[1].1, ["send-keys", "-t", "%7", "Enter"]);
+        assert!(target.is_exact(), "pane id 是精确寻址");
+    }
+
+    #[test]
+    fn screen_stuffs_with_trailing_cr() {
+        let target = MuxTarget {
+            tool: "screen",
+            target: "12345.pts-0.host".to_string(),
+            tty: String::new(),
+        };
+        let cmds = mux_commands(&target, "继续");
+        assert_eq!(cmds.len(), 1, "screen 的 stuff 一次就带上回车");
+        assert_eq!(cmds[0].0, "screen");
+        assert_eq!(
+            cmds[0].1,
+            ["-S", "12345.pts-0.host", "-X", "stuff", "继续\r"]
+        );
+        assert!(
+            !target.is_exact(),
+            "screen 只能投到会话当前选中的窗口，不算精确"
+        );
+    }
+
+    #[test]
+    fn tmux_pane_is_matched_by_tty() {
+        let listing = "%0\t/dev/ttys001\n%3\t/dev/ttys004\n%9\t/dev/ttys007\n";
+        assert_eq!(
+            match_tmux_pane(listing, "/dev/ttys004"),
+            Some("%3".to_string())
+        );
+        // `ps` 有时只给 `ttys004`，两边都要能对上
+        assert_eq!(match_tmux_pane(listing, "ttys004"), Some("%3".to_string()));
+        assert_eq!(match_tmux_pane(listing, "/dev/ttys999"), None);
+        // 空 tty 绝不能匹配到第一行——那就是往陌生 pane 里敲字
+        assert_eq!(match_tmux_pane(listing, ""), None);
+        assert_eq!(match_tmux_pane("", "/dev/ttys004"), None);
+    }
+
+    #[test]
+    fn screen_session_is_matched_by_pid() {
+        let ls = "There are screens on:\n\t4242.pts-1.mac\t(Detached)\n\t99.pts-0.mac\t(Attached)\n";
+        assert_eq!(
+            match_screen_session(ls, 4242),
+            Some("4242.pts-1.mac".to_string())
+        );
+        // 不能被前缀蒙混：424 不是 4242
+        assert_eq!(match_screen_session(ls, 424), None);
+        assert_eq!(match_screen_session(ls, 1), None);
+    }
+
+    // ── 辅助功能权限 ──
+    //
+    // 「点了续跑，窗口跳过来了，然后什么都没发生」就是这条权限缺失的样子。
+    // 这两个测试守着「认得出这个错」和「哪些通道不受它影响」。
+
+    #[test]
+    fn accessibility_errors_are_recognised() {
+        for stderr in [
+            "execution error: System Events got an error: osascript is not allowed to send keystrokes. (-1719)",
+            "execution error: Not authorized to send Apple events (-25211)",
+            "System Events got an error: AgentPulse is not allowed assistive access.",
+        ] {
+            assert!(is_accessibility_error(stderr), "没认出来：{stderr}");
+        }
+        // 别把「窗口找不到」也当成权限问题——那两件事的解法完全不同
+        assert!(!is_accessibility_error(
+            "execution error: Can't get window 1 of process \"Code\". (-1728)"
+        ));
+        assert!(!is_accessibility_error(""));
+    }
+
+    #[test]
+    fn pty_channels_need_no_accessibility() {
+        // 这三条直接写伪终端，没授权也照样敲得进去
+        for ok in [
+            "probe.channel_tmux",
+            "probe.channel_screen",
+            "probe.channel_iterm2",
+        ] {
+            assert!(!channel_needs_accessibility(ok), "{ok} 不该要权限");
+        }
+        // 其余全靠合成按键
+        for needs in [
+            "probe.channel_terminal",
+            "probe.channel_ide",
+            "probe.channel_frontmost",
+            "probe.channel_unknown",
+        ] {
+            assert!(channel_needs_accessibility(needs), "{needs} 必须要权限");
+        }
+    }
+
+    #[test]
+    fn windows_probe_script_only_looks() {
+        let script = windows_probe_script(4242);
+        assert!(script.contains("ProcessId=$cur"));
+        assert!(script.contains("NO_WINDOW"));
+        // 演练的全部意义就是「一个字都不敲」：任何输入或切前台的调用都是 bug
+        for forbidden in [
+            "SendKeys",
+            "keybd_event",
+            "SetForegroundWindow",
+            "AppActivate",
+            "Set-Clipboard",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "演练脚本里不该出现 {forbidden}"
+            );
+        }
+    }
 
     // ── 终端识别 ──
     //

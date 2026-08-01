@@ -176,6 +176,85 @@ const TABLE: &[(&str, &str, &str)] = &[
         "Non-ASCII prompts are delivered via the clipboard, but none of wl-copy / xclip / xsel is installed — try: sudo apt install wl-clipboard",
     ),
     ("resume.no_window", "找不到 PID {pid} 对应的终端窗口", "No terminal window found for PID {pid}"),
+    // ── tmux / screen 通道 ──
+    //
+    // 这是确定性最高的一条路：按 pane id 寻址，不需要窗口在前台，
+    // 也完全绕开输入法——中文提示词不会再被拼音候选拆成「啊啊啊」。
+    (
+        "resume.sent_mux",
+        "已通过 {tool} 直接写入 {target}（不经输入法）",
+        "Typed straight into {target} via {tool} (bypassing the IME)",
+    ),
+    ("resume.mux_failed", "{tool} 投递失败：{detail}", "{tool} could not deliver the text: {detail}"),
+    // macOS 的合成按键要「辅助功能」权限。没授权时脚本前半段（切窗口）照样成功，
+    // 后半段 keystroke 静默失败——用户看到的就是「跳过去了，然后什么都没发生」。
+    (
+        "resume.needs_accessibility",
+        "窗口已经切过去了，但系统不允许本应用模拟键盘，所以一个字都没敲进去。请到「系统设置 › 隐私与安全性 › 辅助功能」里勾上 AgentPulse（如果已经勾了，取消再勾一次——应用更新过后这条授权会失效）。或者在 tmux 里跑 Agent，那条路不需要任何权限。",
+        "The window came forward, but the OS blocked this app from simulating the keyboard, so nothing was typed. Enable AgentPulse under System Settings › Privacy & Security › Accessibility (if it is already on, toggle it off and back on — the grant breaks whenever the app is updated). Alternatively, run your agents inside tmux: that path needs no permission at all.",
+    ),
+    // ── 续跑演练（dry-run）──
+    //
+    // 走完全部定位流程但一个字都不敲，把「要冒险按一次才知道」变成「随时可查」。
+    ("probe.certainty_exact", "能精确定位", "Exact target"),
+    ("probe.certainty_window", "只能定位到窗口", "Window-level only"),
+    ("probe.certainty_none", "定位不到", "Can't locate it"),
+    (
+        "probe.detail_exact",
+        "会通过{channel}投递到 {target}，这是能拿到的最强证据，敲错地方的可能性基本没有。",
+        "Will deliver to {target} via {channel}. That's the strongest evidence available — there's essentially no chance of typing into the wrong place.",
+    ),
+    (
+        "probe.detail_window",
+        "会通过{channel}投递到窗口 {target}。窗口是对的，但窗口里当前是哪个标签/面板无从得知——如果你在这个窗口里开了多个标签，可能敲到隔壁那个。",
+        "Will deliver to window {target} via {channel}. The window is right, but which tab or pane is currently selected inside it can't be known — if you have several tabs open there, the text may land in the neighbouring one.",
+    ),
+    (
+        "probe.detail_none",
+        "认不出这个会话的窗口，所以续跑会直接放弃，不会乱敲。想让它兜底投到前台终端的话，去设置里打开「跟随最新会话」。",
+        "This session's window can't be identified, so a resume would give up rather than type blindly. Turn on \"Follow the newest session\" in settings if you want it to fall back to the frontmost terminal.",
+    ),
+    (
+        "probe.detail_none_blind",
+        "认不出这个会话的窗口。你已经打开了「跟随最新会话」，所以续跑会投到当时的前台终端——那可能不是这个会话。",
+        "This session's window can't be identified. Since \"Follow the newest session\" is on, a resume will type into whatever terminal is frontmost at that moment — which may not be this session.",
+    ),
+    (
+        "probe.no_accessibility",
+        "另外：本应用还没拿到「辅助功能」权限，所以合成按键会静默失效（表现就是窗口跳过来了、字没敲进去）。到「系统设置 › 隐私与安全性 › 辅助功能」里勾上 AgentPulse；已经勾了的话取消再勾一次。",
+        "Also: this app hasn't been granted Accessibility permission, so synthetic keystrokes fail silently — the window comes forward and nothing gets typed. Enable AgentPulse under System Settings › Privacy & Security › Accessibility; if it's already on, toggle it off and back on.",
+    ),
+    ("probe.channel_tmux", "tmux 面板", "the tmux pane"),
+    ("probe.channel_screen", "screen 会话", "the screen session"),
+    ("probe.channel_iterm2", "iTerm2 标签", "the iTerm2 tab"),
+    ("probe.channel_terminal", "终端标签", "the Terminal tab"),
+    ("probe.channel_ide", "IDE 窗口", "the IDE window"),
+    ("probe.channel_x11", "X11 窗口", "the X11 window"),
+    ("probe.channel_console", "控制台窗口", "the console window"),
+    ("probe.channel_frontmost", "前台终端", "the frontmost terminal"),
+    ("probe.channel_unknown", "未知通道", "an unknown channel"),
+    ("probe.tool_tmux", "按面板 id 精确投递，绕开输入法", "Delivers by pane id, bypassing the IME"),
+    ("probe.tool_screen", "投递到会话当前选中的窗口", "Delivers to the session's currently selected window"),
+    ("probe.tool_accessibility_name", "辅助功能权限", "Accessibility permission"),
+    (
+        "probe.tool_accessibility",
+        "模拟键盘的前提；没有它，除 tmux 和 iTerm2 之外的通道全部失效",
+        "Required to simulate the keyboard; without it every channel except tmux and iTerm2 fails",
+    ),
+    ("probe.tool_xdotool", "X11 下定位窗口并输入", "Locates windows and types under X11"),
+    ("probe.tool_ydotool", "Wayland 下输入的兜底方案", "The fallback for typing under Wayland"),
+    ("probe.tool_clipboard", "投递非 ASCII 提示词要借剪贴板", "Non-ASCII prompts are delivered via the clipboard"),
+    ("probe.tool_powershell", "定位控制台窗口并输入", "Locates the console window and types into it"),
+    (
+        "probe.settings_opened",
+        "已打开「辅助功能」设置页。请在列表里找到 AgentPulse：没有就点 + 号加进去，已经勾上的话取消再勾一次——应用更新过后旧的授权不再生效。",
+        "Opened the Accessibility settings pane. Find AgentPulse in the list: add it with + if it isn't there, and if it is already checked, uncheck it and check it again — the old grant stops applying once the app has been updated.",
+    ),
+    (
+        "probe.settings_unsupported",
+        "只有 macOS 需要这个权限",
+        "Only macOS needs this permission",
+    ),
     ("focus.done", "已跳到 {terminal}（{outcome}）", "Jumped to {terminal} ({outcome})"),
     ("focus.app_only", "只激活了应用", "brought the app forward only"),
     ("focus.failed", "跳转失败：{detail}", "Couldn't jump: {detail}"),
@@ -292,6 +371,13 @@ impl I18n {
                 Lang::En => *en,
             })
             .unwrap_or(key)
+    }
+
+    /// 取翻译并拿走所有权
+    ///
+    /// 纯粹是为了让「查表结果直接填进结构体字段」的地方少一串 `.to_string()`。
+    pub fn t_owned(&self, key: &'static str) -> String {
+        self.t(key).to_string()
     }
 
     /// 取翻译并按 `{名字}` 占位符插值

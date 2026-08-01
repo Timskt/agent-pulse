@@ -201,6 +201,33 @@ async fn focus_terminal(state: State<'_, AppState>, session_id: String) -> Resul
     Ok(detail)
 }
 
+/// 续跑演练：走完全部定位流程，但**一个字都不敲**
+///
+/// 「按下去才知道会发生什么」是这个功能最大的心理负担——尤其在 IDE 里开的
+/// 终端上，敲错窗口的代价是把提示词打进别人的代码。演练把这件事变成零风险：
+/// 它回答「现在按续跑，字会落到哪儿」，以及「为什么落不到」。
+#[tauri::command]
+async fn probe_resume(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<resumer::ResumeProbe, String> {
+    let session = {
+        let s = state.engine.state.lock().await;
+        s.sessions
+            .iter()
+            .find(|sess| sess.id == session_id)
+            .cloned()
+            .ok_or_else(|| state.i18n().t("err.session_not_found").to_string())?
+    };
+    Ok(resumer::probe_resume(&session, &state.config_manager.get()).await)
+}
+
+/// 一键跳到「辅助功能」设置页（macOS 专用）
+#[tauri::command]
+async fn open_accessibility_settings(state: State<'_, AppState>) -> Result<String, String> {
+    resumer::open_accessibility_settings(&state.config_manager.get().language).await
+}
+
 /// 测试发送通知（验证整条提醒通道）
 #[tauri::command]
 async fn test_notify(state: State<'_, AppState>) -> Result<String, String> {
@@ -394,6 +421,8 @@ pub fn run() {
             get_config,
             update_config,
             manual_resume,
+            probe_resume,
+            open_accessibility_settings,
             focus_terminal,
             test_notify,
             get_platform_info,
