@@ -56,6 +56,10 @@ const TABLE = {
     "Start Claude Code, Codex CLI or OpenCode — sessions show up here on their own",
   ],
   "session.resumed": ["已续跑 {count} 次", "resumed {count}×"],
+  // 这两条是把「静默失败」摆到台面上。自动续跑的价值全在无感，代价是它坏掉的
+  // 时候跟正常工作长得一模一样——所以坏了必须在会话卡片上一眼看得见。
+  "session.resume_failing": ["敲不进去 ×{count}", "not landing ×{count}"],
+  "session.stood_down": ["已停手，等你", "stood down — needs you"],
   "session.usage": ["{tokens} tokens · ${cost}", "{tokens} tokens · ${cost}"],
   "session.resume": ["续跑", "Resume"],
   "session.resume_goal": ["带目标续跑", "Resume with goal"],

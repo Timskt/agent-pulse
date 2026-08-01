@@ -499,10 +499,20 @@ impl Detector {
             return Verdict::ConfirmInterrupt;
         }
 
-        // 达到续跑上限 → 不再续跑
-        if session.resume_count >= self.config.max_resume_count {
-            return Verdict::Suspicious;
-        }
+        // 这里**故意不看续跑额度**。
+        //
+        // 旧代码在这个位置有一句「额度用光就返回 Suspicious」，那是把两个不同的
+        // 问题揉在一起了：判定层回答的是「这个会话现在什么状态」，额度回答的是
+        // 「我们还该不该动手」。揉在一起有两个真实后果：
+        //
+        // 1. 额度一旦用光，判定永远给不出 `Running`，于是清零条件也永远不成立
+        //    ——会话自己恢复干活了，界面上还挂着「疑似中断」。
+        // 2. 更糟的是它**悄悄放弃**：状态从「确认中断」降级成「疑似」，
+        //    注意力分级就不再叫人了。应用不打算自己动手的时候，恰恰是最该
+        //    把事情交回人手上的时候，而不是装作还在守着。
+        //
+        // 所以额度改成只拦「敲字」这个动作，拦在 `monitor::has_nudges_left`。
+        // 判定层只管说实话。
 
         // 记录文件停更（这两个信号同源，取其一即可）
         let transcript_idle = signals.iter().any(|s| {
@@ -751,10 +761,15 @@ mod tests {
     }
 
     #[test]
-    fn resume_cap_stops_further_typing() {
+    fn verdict_ignores_every_resume_counter() {
+        // 判定层只回答「这个会话现在什么状态」。额度用光是「我们不打算动手」，
+        // 不是「它没有停在那儿等人」——把额度写进判定，等于让应用在放弃的同时
+        // 顺手把状态也降级，于是连提醒都不发了。额度现在拦在 `monitor` 那一侧。
         let d = detector();
-        let capped = AgentSession {
-            resume_count: AppConfig::default().max_resume_count,
+        let exhausted = AgentSession {
+            resume_count: 100,
+            resume_streak: AppConfig::default().max_resume_count + 3,
+            resume_failures: 7,
             ..session()
         };
         assert_eq!(
@@ -762,10 +777,34 @@ mod tests {
                 true,
                 &signal(SignalKind::FileStale),
                 false,
-                &capped,
+                &exhausted,
                 TurnState::AwaitingUser
             ),
-            Verdict::Suspicious
+            Verdict::ConfirmInterrupt,
+            "催不动了也要照实说它停着——不然注意力分级就不叫人了"
+        );
+    }
+
+    #[test]
+    fn lifetime_resume_count_never_caps() {
+        // 回归：上限管的是「连着催都没反应」，不是「一辈子只准被催 5 次」。
+        // 一个跑一整天、真停顿过很多次但每次都被成功唤醒的会话，
+        // 累计次数早就破百了，照样该继续守着它。
+        let d = detector();
+        let veteran = AgentSession {
+            resume_count: 100,
+            resume_streak: 0,
+            ..session()
+        };
+        assert_eq!(
+            d.make_verdict(
+                true,
+                &signal(SignalKind::FileStale),
+                false,
+                &veteran,
+                TurnState::AwaitingUser
+            ),
+            Verdict::ConfirmInterrupt
         );
     }
     // TESTS_PLACEHOLDER_DETECTOR
@@ -819,5 +858,26 @@ mod tests {
             silent.attention_detail.as_deref(),
             Some(d.i18n.t("attention.detail.silent"))
         );
+    }
+
+    #[test]
+    fn a_session_we_stopped_nudging_still_calls_for_help() {
+        // 整条链上最要紧的一句保证：我们不再替他敲字的那一刻，必须改成叫他。
+        // 上一版把额度写进判定层，判定从「确认中断」降级成「疑似」，
+        // `grade_attention` 对「疑似」的处理是不打扰——于是应用悄悄放弃，
+        // 托盘上一片安静，用户还以为有人在守着。
+        let d = detector();
+        let exhausted = AgentSession {
+            last_activity: ago(400),
+            resume_streak: AppConfig::default().max_resume_count + 2,
+            resume_count: 42,
+            resume_failures: 3,
+            ..session()
+        };
+
+        let r = d.detect(&exhausted, None, None, true, TurnState::AwaitingUser);
+        assert_eq!(r.verdict, Verdict::ConfirmInterrupt, "它确实还停在那儿");
+        assert_eq!(r.attention, AttentionLevel::NeedsInput);
+        assert!(r.attention.is_pending(), "托盘角标上得有它这一个");
     }
 }

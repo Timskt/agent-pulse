@@ -25,6 +25,84 @@ pub struct Resumer {
     i18n: I18n,
 }
 
+/// 一次续跑投递**在现实里**的结果
+///
+/// 存在的理由是一个此前从没被问出口的问题：**脚本跑通了，字真的进那个会话了吗？**
+///
+/// 旧设计只有 `Result<String, String>`：`Ok` 的含义是「AppleScript / PowerShell /
+/// xdotool 没报错」。可脚本成功跟字符落地是两件事——定位到一半焦点被别的窗口抢走、
+/// 粘贴进了隔壁标签页、输入法把内容吃掉、pane 刚好被关掉，全都是「脚本成功、
+/// 会话一动没动」。于是整条续跑链是**开环**的：发出动作，从不观察世界有没有变，
+/// 也就永远学不会自己坏了。
+///
+/// 闭环靠的信号本来就躺在磁盘上：**agent 只要真的动起来，就会往自己的会话记录里
+/// 写东西**。所以投递完盯一小会儿那个文件，长了就是落地了，没长就是没落地——
+/// 至于为什么没落地（权限、焦点、输入法、通道），这一层不必知道，也正因如此
+/// 以后新增通道不需要再配一套失败识别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// 通道自己就报错了：权限不在、定位不到、脚本超时
+    Failed,
+    /// 字敲出去了，而且**看见**会话动了起来
+    Landed,
+    /// 字敲出去了，但盯完那一小会儿会话还是没动——按键很可能进了别的窗口
+    Silent,
+    /// 字敲出去了；这个会话没有可读的记录文件，核验不了，只能按「大概进去了」记账
+    Unverifiable,
+}
+
+impl ResumeOutcome {
+    /// 这一次算不算「催过了一遍」
+    ///
+    /// 只有这种才该消耗 `max_resume_count` 的额度。**这是 v1.5 修掉的核心缺陷**：
+    /// 旧代码在投递之前就把计数加了，失败也不回退，于是「敲不进去」被算成
+    /// 「已经敲够了」——五次一到，这个会话的自动续跑就永久沉默，而一个字都没
+    /// 真的敲进去过。macOS 的辅助功能授权每次重新构建应用都会失效，失败因此是
+    /// 系统性的，不是偶发，用户看到的就是「自动续跑好像根本不工作」。
+    pub fn counts_as_nudge(&self) -> bool {
+        matches!(self, ResumeOutcome::Landed | ResumeOutcome::Unverifiable)
+    }
+
+    /// 这一次要不要计进「这条通道是不是坏了」
+    ///
+    /// `Silent` 也算：从用户角度看，「脚本说成功但会话没动」和「脚本报错」
+    /// 是同一件事——没人替我按继续。
+    pub fn is_failure(&self) -> bool {
+        matches!(self, ResumeOutcome::Failed | ResumeOutcome::Silent)
+    }
+
+    /// 日志里那句「结果如何」的文案键
+    pub fn i18n_key(&self) -> &'static str {
+        match self {
+            ResumeOutcome::Failed => "resume.outcome_failed",
+            ResumeOutcome::Landed => "resume.outcome_landed",
+            ResumeOutcome::Silent => "resume.outcome_silent",
+            ResumeOutcome::Unverifiable => "resume.outcome_unverified",
+        }
+    }
+}
+
+/// 核验窗口：投递之后盯记录文件多久
+///
+/// Claude Code 收到提示词后是立刻把这条 user 消息追加进 jsonl 的，正常在一秒内。
+/// 给到 6 秒是留给慢磁盘和网络盘；再长就会拖住扫描节拍，而且拖久了也不会变结论。
+const VERIFY_WINDOW_SECS: u64 = 6;
+
+/// 每次复查的间隔
+const VERIFY_POLL_MS: u64 = 300;
+
+/// 会话记录文件的活动指纹：(字节数, 修改时间)
+///
+/// 故意不问适配器「你怎么算动了」：**会话记录长出新内容**这条判据对所有把会话
+/// 落盘的 agent 都成立，不需要每接一个新 agent 就重新实现一遍。没有记录文件的
+/// agent 自然拿不到指纹，那种情况是「核验不可用」（[`ResumeOutcome::Unverifiable`]），
+/// 不是失败——宁可少管，也不要给一个本来好使的通道判死刑。
+fn activity_fingerprint(session: &AgentSession) -> Option<(u64, std::time::SystemTime)> {
+    let path = session.session_file.as_ref()?;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 /// 以硬超时执行外部命令，超时后强制终止子进程
 ///
 /// AppleScript / PowerShell / xdotool 在目标终端繁忙时可能长时间挂起
@@ -802,6 +880,32 @@ pub async fn open_accessibility_settings(lang: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// 投递通道体检：现在到底敲不敲得进去（不敲字、不弹权限窗）
+///
+/// 这个功能的卖点是「静默、用户无感」，代价是**它坏掉的时候也一样静默**。
+/// macOS 的辅助功能授权每次重新构建应用就会失效（TCC 记的是代码签名），
+/// 于是典型剧本是：用户装了新版本，设置里那个勾还在，一切看起来正常，
+/// 直到某天想起来「它好久没帮我按继续了」。
+///
+/// 所以引擎一启动就先体检：敲得进去就闭嘴，敲不进去就**现在**说，
+/// 而不是等某个会话真卡住、还白烧掉几次续跑额度之后才说。
+///
+/// 返回 `None` = 通道健康；`Some(能照着做的一句话)` = 当下敲不进去。
+#[cfg(target_os = "macos")]
+pub async fn channel_health(lang: &str) -> Option<String> {
+    let i18n = I18n::from_code(lang);
+    if accessibility_granted(&i18n).await {
+        return None;
+    }
+    Some(i18n.t_owned("resume.needs_accessibility"))
+}
+
+/// Windows / Linux 没有这层授权，事前没什么可体检的
+#[cfg(not(target_os = "macos"))]
+pub async fn channel_health(_lang: &str) -> Option<String> {
+    None
+}
+
 /// macOS 上进程名 → 应用显示名的映射
 #[cfg(target_os = "macos")]
 fn mac_app_display_name(terminal_app: &str) -> &str {
@@ -1198,6 +1302,45 @@ impl Resumer {
             let _ = (session, prompt);
             Err(self.i18n.t("resume.unsupported").to_string())
         }
+    }
+
+    /// 投递 **并核验**：这是外面该用的那个入口
+    ///
+    /// [`Self::resume`] 只回答「脚本跑通了没有」，这个方法回答「会话真的动了没有」。
+    /// 差别不是措辞：整条自动续跑链此前是开环的——把按键发出去，从不看世界有没有变，
+    /// 因此把「敲错窗口」「权限掉了」「输入法吃字」一律记成成功，
+    /// 计数照加、上限照撞，最后自己把自己关掉。
+    ///
+    /// 做法很土但正好够用：投递前记下会话记录文件的指纹，投递后盯
+    /// [`VERIFY_WINDOW_SECS`] 秒。文件长了 = 落地；没长 = 没落地；没有文件 = 核验不了。
+    ///
+    /// 返回 `(结论, 给人看的一句话)`。第二个值仍然是脚本自己的说法（命中了哪个窗口 /
+    /// 报了什么错），核验结论不会把它盖掉——排查的时候两个都要。
+    pub async fn resume_verified(
+        &self,
+        session: &AgentSession,
+        use_goal_prompt: bool,
+    ) -> (ResumeOutcome, String) {
+        let before = activity_fingerprint(session);
+
+        let detail = match self.resume(session, use_goal_prompt).await {
+            Ok(msg) => msg,
+            Err(e) => return (ResumeOutcome::Failed, e),
+        };
+
+        // 没有记录文件就别装作核验过了：这一步的价值全在诚实上
+        let Some(before) = before else {
+            return (ResumeOutcome::Unverifiable, detail);
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(VERIFY_WINDOW_SECS);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(VERIFY_POLL_MS)).await;
+            if activity_fingerprint(session).is_some_and(|now| now != before) {
+                return (ResumeOutcome::Landed, detail);
+            }
+        }
+        (ResumeOutcome::Silent, detail)
     }
     
     /// 尝试通过 tmux/screen 投递；`None` = 这个会话不在复用器里，请走别的路
@@ -2959,5 +3102,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // Code / Cursor / PyCharm 走 System Events 不依赖安装，至少这几个该被验到
         assert!(compiled >= 3, "只编译了 {compiled} 个定位脚本，覆盖太少");
+    }
+
+    // ── 投递核验的四种结论 ──
+    //
+    // 这四种结论把「脚本没报错」和「字真的进去了」分开了。分类一旦搞错，
+    // 后果是整条自动续跑链自己把自己关掉，所以这里逐条钉住。
+
+    #[test]
+    fn only_real_deliveries_consume_the_budget() {
+        assert!(ResumeOutcome::Landed.counts_as_nudge());
+        assert!(
+            ResumeOutcome::Unverifiable.counts_as_nudge(),
+            "核验不了不等于失败：不落记录文件的 agent 不该被判死刑"
+        );
+        assert!(
+            !ResumeOutcome::Failed.counts_as_nudge(),
+            "没送达就不算催过——否则「敲不进去」会被算成「已经敲够了」"
+        );
+        assert!(
+            !ResumeOutcome::Silent.counts_as_nudge(),
+            "脚本成功但会话没动，等于没催"
+        );
+    }
+
+    #[test]
+    fn silent_is_a_failure_too() {
+        assert!(ResumeOutcome::Failed.is_failure());
+        assert!(
+            ResumeOutcome::Silent.is_failure(),
+            "从用户角度看，「按键进了别的窗口」和「脚本报错」是同一件事"
+        );
+        assert!(!ResumeOutcome::Landed.is_failure());
+        assert!(!ResumeOutcome::Unverifiable.is_failure());
+    }
+
+    #[test]
+    fn every_outcome_has_localized_text() {
+        for outcome in [
+            ResumeOutcome::Failed,
+            ResumeOutcome::Landed,
+            ResumeOutcome::Silent,
+            ResumeOutcome::Unverifiable,
+        ] {
+            let key = outcome.i18n_key();
+            let zh = I18n::from_code("zh").t(key);
+            let en = I18n::from_code("en").t(key);
+            assert_ne!(zh, key, "{key} 没有中文词条，会把裸键名显示给用户");
+            assert_ne!(en, key, "{key} 没有英文词条");
+            assert_ne!(zh, en, "{key} 两种语言的文案一模一样，八成漏翻了");
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_none_without_a_transcript() {
+        // 没有记录文件 → 核验不可用，而不是核验失败
+        let s = AgentSession::default();
+        assert!(activity_fingerprint(&s).is_none());
+        let missing = AgentSession {
+            session_file: Some("/definitely/not/a/real/path.jsonl".to_string()),
+            ..Default::default()
+        };
+        assert!(activity_fingerprint(&missing).is_none());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_the_transcript_grows() {
+        let dir = std::env::temp_dir().join(format!("agentpulse-fp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, b"{\"type\":\"user\"}\n").unwrap();
+
+        let session = AgentSession {
+            session_file: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let before = activity_fingerprint(&session).expect("刚写完的文件该有指纹");
+
+        // 追加一行就是「agent 动了」的信号；只比字节数就够，不必读内容
+        std::fs::write(&path, b"{\"type\":\"user\"}\n{\"type\":\"assistant\"}\n").unwrap();
+        let after = activity_fingerprint(&session).expect("文件还在");
+        assert_ne!(before, after, "记录长了指纹就得变，否则核验永远判「没动」");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

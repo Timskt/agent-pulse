@@ -39,8 +39,13 @@ export interface AgentSession {
   discovered_at: string;
   last_activity: string;
   status: SessionStatus;
+  /** 累计帮它按过多少次「继续」，只用于显示 */
   resume_count: number;
   last_resume_at: string | null;
+  /** 连着催了几次还不见动静；对着 `max_resume_count` 那道上限，会话一动就清零 */
+  resume_streak: number;
+  /** 连着几次根本没送达（权限掉了 / 敲进了别的窗口），驱动退避与告警 */
+  resume_failures: number;
   attention: AttentionLevel;
   attention_detail: string | null;
   /** 所在终端的 TTY，如 `/dev/ttys003`——多标签页时靠它认人 */

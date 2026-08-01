@@ -45,6 +45,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("notify.resumed.title", "已自动续跑", "Auto-resumed"),
     ("notify.budget.title", "成本预警", "Budget alert"),
     ("notify.rate_forecast.title", "限流预警", "Rate limit warning"),
+    ("notify.resume_broken.title", "自动续跑敲不进去了", "Auto-resume can't type anymore"),
     ("notify.test.title", "AgentPulse 通知测试", "AgentPulse test notification"),
     ("notify.test.body", "如果你看到这条通知，说明提醒通道已经打通。", "If you can see this, notifications are working."),
     // ── 注意力级别 ──
@@ -65,15 +66,36 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("notify.budget.daily_body", "今日已花费 ${spent}，是预算 ${budget} 的 {percent}%", "Spent ${spent} today — {percent}% of the ${budget} daily budget"),
     ("notify.budget.session_body", "{label} 已花费 ${spent}，超过单会话预算 ${budget}", "{label} has spent ${spent}, past the ${budget} per-session budget"),
     ("notify.rate_forecast.body", "{window} 小时窗口已用 {percent}%，按当前速度约 {minutes} 分钟后触发限流", "{percent}% of the {window}h window used — about {minutes} min to the limit at this rate"),
+    // 这条是「静默功能坏掉时必须吵一次」那条纪律的落点：自动续跑连着失败，
+    // 用户是看不出来的——屏幕上「没人替我按继续」和「它正常在守着」长得一样
+    (
+        "notify.resume_broken.body",
+        "{label} 连续 {count} 次没能把提示词敲进去，自动续跑现在等于没在工作：{detail}",
+        "{label} failed to receive the prompt {count} times in a row — auto-resume is effectively off: {detail}",
+    ),
     // ── 引擎日志（前端 Activity Log 直接展示）──
     ("log.engine_started", "监控引擎已启动，开始守护 AI Agent 会话", "Monitoring started — your agent sessions are being watched"),
     ("log.engine_stopped", "监控引擎已停止", "Monitoring stopped"),
     ("log.interrupt_detected", "[{agent}] 检测到中断信号：{signals}", "[{agent}] Interruption detected: {signals}"),
     ("log.cooldown_skip", "续跑冷却中，跳过本次触发", "Still cooling down — skipping this resume"),
+    // 额度用光。刻意跟冷却分成两条：冷却是「等一会儿就好」，这条是「等也没用，
+    // 得人去看一眼」，两句话对用户的要求完全不同，合成一句就等于什么也没说
+    (
+        "log.nudges_exhausted",
+        "[{agent}] 连着催了 {count} 次都没见它动，先不敲了——这一个交给你看一眼",
+        "[{agent}] {count} nudges in a row with no movement — standing down; this one needs you",
+    ),
     ("log.suspicious", "疑似中断，继续观察", "Possibly interrupted — keeping watch"),
     ("log.resume_sent", "已触发续跑（{mode}，第 {count} 次）：{detail}", "Resume sent ({mode}, attempt {count}): {detail}"),
     ("log.resume_failed", "续跑失败：{detail}", "Resume failed: {detail}"),
     ("log.resume_manual", "手动续跑：{detail}", "Manual resume: {detail}"),
+    // 开工前那次体检的结论。只写日志不弹窗：tmux / screen / iTerm2 三条通道
+    // 不需要辅助功能授权，对用那几条路的人来说弹窗就是误报
+    (
+        "log.channel_unhealthy",
+        "投递通道体检没过，自动续跑现在可能敲不进去：{detail}",
+        "The delivery channel failed its check — auto-resume may not be able to type: {detail}",
+    ),
     ("log.mode_goal", "Goal 恢复", "goal recovery"),
     ("log.mode_generic", "通用", "generic"),
     ("log.alerted", "已提醒：{label}（{level}）", "Alerted: {label} ({level})"),
@@ -134,6 +156,23 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("resume.matched", "已精确匹配到窗口", "matched the exact window"),
     ("resume.followed", "回退到当前窗口", "fell back to the current window"),
     ("resume.outcome_other", "结果 {raw}", "result {raw}"),
+    // ── 投递核验的四种结论 ──
+    //
+    // 这四条是 v1.5 那个架构改动露到界面上的部分：以前日志只能说「脚本没报错」，
+    // 现在能说清「字到底进去了没有」。区分「盯完没动」和「没法核验」很要紧——
+    // 前者是真出问题了，后者只是这类 agent 不落盘，别把两者混成一句话。
+    ("resume.outcome_landed", "已确认会话动起来了", "confirmed the session picked it up"),
+    (
+        "resume.outcome_silent",
+        "按键发出去了，但盯了几秒会话一点没动，很可能敲进了别的窗口",
+        "keystrokes went out but the session didn't budge — they likely landed in another window",
+    ),
+    (
+        "resume.outcome_unverified",
+        "已发送，这类会话没有可读的记录文件，核验不了",
+        "sent — this kind of session keeps no readable transcript, so it can't be verified",
+    ),
+    ("resume.outcome_failed", "没能送达", "could not be delivered"),
     (
         "resume.no_terminal",
         "认不出这个会话在哪个终端里，没有动手",

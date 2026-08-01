@@ -80,10 +80,35 @@ pub struct AgentSession {
     pub last_activity: String,
     /// 会话状态
     pub status: SessionStatus,
-    /// 已续跑次数
+    /// 已续跑次数（累计，只增不减）
+    ///
+    /// **只统计真的把字敲进去的那些次。** 这个语义很要紧：一旦把失败也算进来，
+    /// 「敲不进去」就会被当成「已经敲够了」。见 `monitor::commit_resume_outcome`。
+    ///
+    /// 这个数是给人看的（界面上「已续跑 N 次」、会话历史里的累计值），
+    /// **不参与任何判定**。要限制「还该不该继续催」，用 [`Self::resume_streak`]。
     pub resume_count: u32,
     /// 最后一次续跑时间
     pub last_resume_at: Option<String>,
+    /// 连续催了几次都没见它动（进程内状态，不落库）
+    ///
+    /// `max_resume_count` 那道上限真正想拦的是「对着一个不响应的会话没完没了地催」，
+    /// 而不是「一个会话一辈子只准被催 5 次」。用累计次数去撞上限，
+    /// 结果就是一个跑了一整天、真的停顿过六次的会话，从第六次起再没人管——
+    /// 「它其实没干完活，每次都要我去发继续」就是这么来的。
+    ///
+    /// 所以判定改用这个数：**一旦看见会话自己在干活（`Verdict::Running`）就清零**，
+    /// 额度还回去。只有连着催 N 次都毫无反应，才认定催也没用、闭嘴等人。
+    #[serde(default)]
+    pub resume_streak: u32,
+    /// 连续投递失败次数（进程内状态，不落库）
+    ///
+    /// 跟上面两个都分开是因为三者驱动完全不同的行为：累计次数只用来显示；
+    /// 「催了没反应」的连击数决定还该不该继续催；而失败次数决定
+    /// 「还要不要接着用这条通道，以及什么时候该改成大声告诉用户」。
+    /// 投递成功一次即清零。
+    #[serde(default)]
+    pub resume_failures: u32,
 
     // ── 以下字段由监控循环每轮回填，适配器发现会话时留空 ──
     /// 注意力级别（v1.1）：这个会话现在要不要叫人
@@ -121,6 +146,8 @@ impl Default for AgentSession {
             status: SessionStatus::Active,
             resume_count: 0,
             last_resume_at: None,
+            resume_streak: 0,
+            resume_failures: 0,
             attention: crate::detector::AttentionLevel::None,
             attention_detail: None,
             tty: None,

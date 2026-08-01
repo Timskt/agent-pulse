@@ -94,6 +94,7 @@ export function SessionList() {
               session={session}
               focused={session.id === focusedSessionId}
               aiEnabled={config?.ai_judge.enabled ?? false}
+              maxNudges={config?.max_resume_count ?? 0}
               onNotice={show}
             />
           ))}
@@ -107,11 +108,14 @@ function SessionRow({
   session,
   focused,
   aiEnabled,
+  maxNudges,
   onNotice,
 }: {
   session: AgentSession;
   focused: boolean;
   aiEnabled: boolean;
+  /** 连着催几次没反应就停手；0 表示没配上限 */
+  maxNudges: number;
   onNotice: (notice: Notice) => void;
 }) {
   const { t } = useI18n();
@@ -204,6 +208,18 @@ function SessionRow({
               <Badge tone="violet">
                 {t("session.resumed", { count: session.resume_count })}
               </Badge>
+            )}
+            {/* 敲不进去要当场说。这个功能平时不出声，所以「不出声」不能同时
+                是它坏掉的样子——否则用户只能靠「怎么一直没人帮我按继续」猜。 */}
+            {session.resume_failures > 0 && (
+              <Badge tone="red">
+                {t("session.resume_failing", {
+                  count: session.resume_failures,
+                })}
+              </Badge>
+            )}
+            {maxNudges > 0 && session.resume_streak >= maxNudges && (
+              <Badge tone="amber">{t("session.stood_down")}</Badge>
             )}
           </div>
 

@@ -18,7 +18,7 @@ use crate::cost::{self, CostTracker, RateLimitForecast};
 use crate::detector::{AttentionLevel, DetectionResult, Detector, Verdict};
 use crate::i18n::{I18n, Lang};
 use crate::notify::Notifier;
-use crate::resumer::Resumer;
+use crate::resumer::{ResumeOutcome, Resumer};
 use crate::storage::Storage;
 use crate::webhook::WebhookNotifier;
 use chrono::{Local, NaiveDateTime};
@@ -27,6 +27,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration, MissedTickBehavior};
+
+/// 连续失败几次就该改成大声说
+///
+/// 1 次可能只是恰好前台窗口被别人抢了；连着 2 次基本就是通道本身坏了。
+/// 门槛压得低是故意的：这个功能的失败模式是**静默**，而静默的失败
+/// 跟「正常工作」在屏幕上长得一模一样，晚说一小时就是白等一小时。
+const RESUME_FAILURE_ALERT_AT: u32 = 2;
 
 /// 日志级别
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,6 +118,10 @@ pub struct MonitorEngine {
     cost: Arc<CostTracker>,
     /// 查一次 TTY 要 spawn 十几个 `ps`，按 PID 缓存到进程消失为止
     terminal_cache: std::sync::Mutex<TerminalCache>,
+    /// 「这句话上次说的是什么情况」：话题键 → 情况指纹
+    ///
+    /// 见 [`MonitorEngine::push_event_on_change`]。
+    said: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl MonitorEngine {
@@ -125,6 +136,7 @@ impl MonitorEngine {
             notifier: OnceLock::new(),
             cost: Arc::new(CostTracker::new(cursors)),
             terminal_cache: std::sync::Mutex::new(HashMap::new()),
+            said: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -154,6 +166,37 @@ impl MonitorEngine {
         }
     }
 
+    /// 只在「情况变了」的那一轮说话
+    ///
+    /// 事件和状态是两种东西，日志却只有一条流。「检测到中断」是**事件**，
+    /// 发生一次说一次；「已经催不动了」是**状态**，它会一直成立——每 10 秒
+    /// 重播一遍的结果是日志面板被自己的历史刷满，真正的新消息被挤下屏幕。
+    /// 一个反复自我复述的日志，等于没有日志。
+    ///
+    /// 所以状态类的话走这里：`topic` 说的是「这条在讲哪件事」，
+    /// `fingerprint` 说的是「那件事现在什么样」。指纹没变就闭嘴；
+    /// 变了（比如连击数从 5 涨到 8）才再说一次。情况解除时调用方要
+    /// [`Self::forget_topic`] 把记忆清掉，否则同一个情况第二次发生就说不出口了。
+    async fn push_event_on_change(&self, topic: String, fingerprint: &str, event: EngineEvent) {
+        let worth_saying = {
+            let mut said = self.said.lock().unwrap();
+            should_say(&mut said, topic, fingerprint)
+        };
+        if worth_saying {
+            self.push_event(event).await;
+        }
+    }
+
+    /// 忘掉某个话题上次说过什么，让它下次能重新开口
+    fn forget_topic(&self, topic: &str) {
+        self.said.lock().unwrap().remove(topic);
+    }
+
+    /// 「催不动了」这条话题的键
+    fn exhausted_topic(session_id: &str) -> String {
+        format!("nudges_exhausted:{session_id}")
+    }
+
     /// 启动监控循环
     pub async fn start(&self) {
         {
@@ -174,6 +217,10 @@ impl MonitorEngine {
             I18n::from_code(&lang).t("log.engine_started"),
         ))
         .await;
+
+        // 先体检投递通道，再开始扫描：权限失效这件事该在用户还没等它干活时就说
+        let config = self.config();
+        self.check_resume_channel(&config, &I18n::from_code(&lang)).await;
 
         let mut poll_secs = self.config().poll_interval_secs.max(1);
         let mut ticker = new_ticker(poll_secs);
@@ -268,6 +315,12 @@ impl MonitorEngine {
             None
         };
         let mut resume_actions: Vec<(AgentSession, bool)> = Vec::new();
+        // 本轮**新**确认中断的会话数
+        //
+        // 一个会话可以连着几十轮都是「确认中断」（用户关了自动续跑，或者已经
+        // 催不动了）。那是一个持续的状态，不是几十次检测——每轮都记一笔，
+        // 界面上的检测数就会跟 `detection_records` 里的行数越差越远。
+        let mut newly_confirmed: u32 = 0;
 
         for (session, detection) in &detections {
             match detection.verdict {
@@ -278,31 +331,68 @@ impl MonitorEngine {
                         .map(|s| s.description.as_str())
                         .collect::<Vec<_>>()
                         .join("; ");
-                    self.storage.record_detection(
-                        &session.id,
-                        &session.agent_name,
-                        "ConfirmInterrupt",
-                        &signals,
-                        detection.has_active_goal,
-                    );
-                    self.push_event(EngineEvent::new(
-                        LogLevel::Warn,
-                        Some(session.id.clone()),
-                        i18n.tf(
-                            "log.interrupt_detected",
-                            &[("agent", &session.agent_name), ("signals", &signals)],
-                        ),
-                    ))
-                    .await;
-                    if let Some(hook) = &webhook {
-                        hook.notify_interrupt(&session.agent_name, &session.id, &signals)
-                            .await;
+
+                    // `session.status` 这会儿还是上一轮的结论（本轮的合并回写在后面），
+                    // 所以这一句问的是「它是刚刚才中断的吗」。中断是**事件**，
+                    // 发生一次报一次：落库、日志、webhook 三处都跟着这一个条件走。
+                    // 否则一个开着关闭自动续跑的会话，会每 10 秒给你发一条 webhook。
+                    if session.status != SessionStatus::Interrupted {
+                        newly_confirmed += 1;
+                        self.storage.record_detection(
+                            &session.id,
+                            &session.agent_name,
+                            "ConfirmInterrupt",
+                            &signals,
+                            detection.has_active_goal,
+                        );
+                        self.push_event(EngineEvent::new(
+                            LogLevel::Warn,
+                            Some(session.id.clone()),
+                            i18n.tf(
+                                "log.interrupt_detected",
+                                &[("agent", &session.agent_name), ("signals", &signals)],
+                            ),
+                        ))
+                        .await;
+                        if let Some(hook) = &webhook {
+                            hook.notify_interrupt(&session.agent_name, &session.id, &signals)
+                                .await;
+                        }
                     }
 
-                    let can_resume = check_cooldown(session, config.resume_cooldown_secs);
-                    if can_resume && config.auto_resume_enabled {
+                    // ── 该不该动手，在这里决定 ──
+                    //
+                    // 三道闸门各管一件事，故意分开写，也故意分开报：
+                    // 冷却管「太频繁」、总开关管「用户不让」、额度管「催也没用」。
+                    // 上一版把额度写在判定层，于是额度用光时会话状态被顺手降级，
+                    // 提醒也跟着消失——应用不打算动手的那一刻，正是最该叫人的一刻。
+                    let cooldown =
+                        effective_cooldown(config.resume_cooldown_secs, session.resume_failures);
+                    let cooled = check_cooldown(session, cooldown);
+                    let has_budget = has_nudges_left(session, config.max_resume_count);
+                    if cooled && has_budget && config.auto_resume_enabled {
                         resume_actions.push((session.clone(), detection.has_active_goal));
-                    } else if !can_resume {
+                    } else if !has_budget {
+                        // 说清楚是「催不动了」而不是「还在冷却」：两者的下一步动作
+                        // 完全不同——一个等几十秒就好，一个得人去看一眼。
+                        // 判定仍然是 ConfirmInterrupt，所以注意力分级照样会叫人。
+                        self.push_event_on_change(
+                            Self::exhausted_topic(&session.id),
+                            &session.resume_streak.to_string(),
+                            EngineEvent::new(
+                                LogLevel::Warn,
+                                Some(session.id.clone()),
+                                i18n.tf(
+                                    "log.nudges_exhausted",
+                                    &[
+                                        ("agent", &session.agent_name),
+                                        ("count", &session.resume_streak.to_string()),
+                                    ],
+                                ),
+                            ),
+                        )
+                        .await;
+                    } else if !cooled {
                         self.push_event(EngineEvent::new(
                             LogLevel::Info,
                             Some(session.id.clone()),
@@ -336,8 +426,13 @@ impl MonitorEngine {
         }
 
         // ── 把判定结论合并回会话列表 ──
+        //
+        // **这里不碰 `resume_count` / `last_resume_at`**：字还没敲出去呢。
+        // 计数一律等 `run_resumes` 拿到真实结果之后由 `commit_resume_outcome` 落笔。
+        // 旧代码在这儿就把计数加了、失败也不回退，等于把「敲不进去」记成
+        // 「已经敲够了」，五次之后自动续跑对这个会话永久沉默——详见
+        // `ResumeOutcome::counts_as_nudge` 上的说明。
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let mut resumed_now = 0u32;
         for session in &mut sessions {
             if let Some((_, detection)) = detections.iter().find(|(s, _)| s.id == session.id) {
                 session.attention = detection.attention;
@@ -350,13 +445,15 @@ impl MonitorEngine {
                         if session.status != SessionStatus::Completed {
                             session.status = SessionStatus::Active;
                         }
+                        // **看见它自己在干活，就把续跑额度还回去。**
+                        // 这是闭环的另一半：`resume_streak` 只该数「催了却没反应」的连击，
+                        // 一旦会话恢复推进，之前那几次催就都算奏效了，不该继续压着额度。
+                        // 累计次数（`resume_count`）不动——那是给人看的历史。
+                        session.resume_streak = 0;
+                        // 额度回来了，「催不动了」这句话下次卡住时要能重新说出口
+                        self.forget_topic(&Self::exhausted_topic(&session.id));
                     }
                 }
-            }
-            if resume_actions.iter().any(|(r, _)| r.id == session.id) {
-                session.resume_count += 1;
-                session.last_resume_at = Some(now.clone());
-                resumed_now += 1;
             }
         }
 
@@ -424,19 +521,14 @@ impl MonitorEngine {
             .iter()
             .filter(|s| s.status == SessionStatus::Interrupted)
             .count();
-        // 只把「确认中断」计入检测数：否则每轮扫描都会给每个健康会话记一笔，
-        // 界面上的数字就永远对不上 detection_records 里的行数
-        let confirmed = detections
-            .iter()
-            .filter(|(_, d)| matches!(d.verdict, Verdict::ConfirmInterrupt))
-            .count() as u32;
+        // 检测数只数「新确认」的那几次，理由见 `newly_confirmed` 的定义处
+        let confirmed = newly_confirmed;
         {
             let mut state = self.state.lock().await;
             state.status.sessions_total = total;
             state.status.sessions_active = active;
             state.status.sessions_interrupted = interrupted;
             state.status.pending_attention = pending;
-            state.status.total_resumes += resumed_now;
             state.status.total_detections += confirmed;
             state.status.last_scan_at = Some(now);
             state.status.cost_today = cost_today;
@@ -519,6 +611,8 @@ impl MonitorEngine {
             for session in &mut sessions {
                 if let Some(old) = existing.get(&session.id) {
                     session.resume_count = old.resume_count;
+                    session.resume_streak = old.resume_streak;
+                    session.resume_failures = old.resume_failures;
                     session.last_resume_at = old.last_resume_at.clone();
                     session.discovered_at = old.discovered_at.clone();
                     session.status = old.status.clone();
@@ -638,6 +732,9 @@ impl MonitorEngine {
     }
 
     /// 逐个执行续跑动作
+    ///
+    /// **必须串行**：剪贴板是全局单件，前台窗口也只有一个。两个续跑并发跑
+    /// AppleScript，就会互相抢剪贴板和焦点，两边都可能敲到对方的窗口里去。
     async fn run_resumes(
         &self,
         config: &AppConfig,
@@ -658,60 +755,174 @@ impl MonitorEngine {
                 "log.mode_generic"
             });
 
-            match resumer.resume(session, *use_goal_prompt).await {
-                Ok(msg) => {
-                    self.storage.record_resume(
-                        &session.id,
-                        &session.agent_name,
-                        &session.working_dir,
-                        prompt_type,
-                        true,
-                        &msg,
-                    );
-                    self.push_event(EngineEvent::new(
-                        LogLevel::Success,
-                        Some(session.id.clone()),
-                        i18n.tf(
-                            "log.resume_sent",
-                            &[
-                                ("mode", mode),
-                                ("count", &(session.resume_count + 1).to_string()),
-                                ("detail", &msg),
-                            ],
-                        ),
-                    ))
-                    .await;
+            // 投递 + 核验：会话记录有没有长出新内容，才是「敲进去了」的证据
+            let (outcome, detail) = resumer.resume_verified(session, *use_goal_prompt).await;
+            let landed = outcome.counts_as_nudge();
+            let failures = self.commit_resume_outcome(&session.id, outcome).await;
 
-                    if let Some(hook) = webhook {
-                        hook.notify_resume(&session.agent_name, &session.id, &msg)
-                            .await;
-                    }
-                    if let Some(notifier) = self.notifier.get() {
-                        notifier.notify_resumed(
-                            &config.notification,
-                            &config.language,
-                            &session.id,
-                            &msg,
-                        );
-                    }
+            self.storage.record_resume(
+                &session.id,
+                &session.agent_name,
+                &session.working_dir,
+                prompt_type,
+                landed,
+                &detail,
+            );
+
+            if landed {
+                self.push_event(EngineEvent::new(
+                    LogLevel::Success,
+                    Some(session.id.clone()),
+                    i18n.tf(
+                        "log.resume_sent",
+                        &[
+                            ("mode", mode),
+                            ("count", &(session.resume_count + 1).to_string()),
+                            ("detail", &format!("{} · {}", i18n.t(outcome.i18n_key()), detail)),
+                        ],
+                    ),
+                ))
+                .await;
+
+                if let Some(hook) = webhook {
+                    hook.notify_resume(&session.agent_name, &session.id, &detail)
+                        .await;
                 }
-                Err(e) => {
-                    self.storage.record_resume(
+                if let Some(notifier) = self.notifier.get() {
+                    notifier.notify_resumed(
+                        &config.notification,
+                        &config.language,
                         &session.id,
-                        &session.agent_name,
-                        &session.working_dir,
-                        prompt_type,
-                        false,
-                        &e,
+                        &detail,
                     );
-                    self.push_event(EngineEvent::new(
-                        LogLevel::Error,
-                        Some(session.id.clone()),
-                        i18n.tf("log.resume_failed", &[("detail", &e)]),
-                    ))
-                    .await;
                 }
+            } else {
+                self.push_event(EngineEvent::new(
+                    LogLevel::Error,
+                    Some(session.id.clone()),
+                    i18n.tf(
+                        "log.resume_failed",
+                        &[(
+                            "detail",
+                            &format!("{} · {}", i18n.t(outcome.i18n_key()), detail),
+                        )],
+                    ),
+                ))
+                .await;
+                self.escalate_resume_failure(config, i18n, session, failures, &detail)
+                    .await;
             }
+        }
+    }
+
+    /// 把一次投递的真实结果落到会话上，返回落笔后的连续失败次数
+    ///
+    /// 单独拎出来、并且只在拿到 [`ResumeOutcome`] 之后调用，是这一版的核心修正。
+    /// 三个计数器驱动三种完全不同的行为，所以必须分开写：
+    ///
+    /// - `resume_count`：累计帮了多少次，**只给人看**，不参与判定。
+    /// - `resume_streak`：连着催了几次还不见动静，对着 `max_resume_count` 那道上限。
+    ///   会话一旦恢复推进就由 `scan_once` 清零。
+    /// - `resume_failures`：连着几次根本没送达，驱动退避和升级告警。送达即清零。
+    ///
+    /// 三者共同的前提是**投递失败时一个都不加**——否则「敲不进去」会被当成
+    /// 「已经催够了」，自动续跑在一个字都没敲进去的情况下自己把自己关掉。
+    ///
+    /// `last_resume_at` 两种情况都写：它是冷却计时的起点，失败也得等一会儿再试，
+    /// 不然通道坏掉时会变成每轮扫描都去撞一次墙。
+    async fn commit_resume_outcome(&self, session_id: &str, outcome: ResumeOutcome) -> u32 {
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut state = self.state.lock().await;
+        if outcome.counts_as_nudge() {
+            state.status.total_resumes += 1;
+        }
+        let Some(session) = state.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return 0;
+        };
+        apply_resume_outcome(session, outcome, now);
+        session.resume_failures
+    }
+
+    /// 连续失败到一定次数就**别再静默了**
+    ///
+    /// 这个功能整个价值就是「用户无感」，所以它自己坏掉的时候必须反过来：
+    /// 静默地失败等于装作在工作。一次失败可能只是恰好被别的窗口抢了焦点；
+    /// 连着 [`RESUME_FAILURE_ALERT_AT`] 次基本就是通道本身坏了（权限掉了、
+    /// 终端关了、pane 没了），那就弹一次通知，把能照着做的那句话给出去。
+    /// `notify_alert` 自带 ≥600 秒节流，不会变成刷屏。
+    async fn escalate_resume_failure(
+        &self,
+        config: &AppConfig,
+        i18n: &I18n,
+        session: &AgentSession,
+        failures: u32,
+        detail: &str,
+    ) {
+        if failures < RESUME_FAILURE_ALERT_AT {
+            return;
+        }
+        let Some(notifier) = self.notifier.get() else {
+            return;
+        };
+        let body = i18n.tf(
+            "notify.resume_broken.body",
+            &[
+                ("label", &session_label(session)),
+                ("count", &failures.to_string()),
+                ("detail", detail),
+            ],
+        );
+        notifier.notify_alert(
+            &config.notification,
+            &format!("resume:broken:{}", session.id),
+            i18n.t("notify.resume_broken.title"),
+            &body,
+        );
+    }
+
+    /// 开工前先给投递通道做个体检
+    ///
+    /// 补的是「诊断能力有、但从来不主动用」这个洞：应用早就能查辅助功能授权，
+    /// 却只在用户手动点「续跑演练」时查。于是权限失效这件事，总是等到某个会话
+    /// 已经卡住、额度也白烧了几次之后才被发现。
+    ///
+    /// 只写日志、不弹通知：tmux / screen / iTerm2 三条通道根本不需要这个授权，
+    /// 对那些用户来说弹窗是误报。真的敲不进去时，`escalate_resume_failure`
+    /// 会拿着实证去吵。
+    async fn check_resume_channel(&self, config: &AppConfig, i18n: &I18n) {
+        if !config.auto_resume_enabled {
+            return;
+        }
+        if let Some(hint) = crate::resumer::channel_health(&config.language).await {
+            self.push_event(EngineEvent::new(
+                LogLevel::Warn,
+                None,
+                i18n.tf("log.channel_unhealthy", &[("detail", &hint)]),
+            ))
+            .await;
+        }
+    }
+
+    /// 手动续跑之后同步会话上的续跑状态
+    ///
+    /// **故意不动 `resume_count`**：那个计数对着 `max_resume_count` 那道上限，
+    /// 上限管的是「别没完没了地自动催」——用户自己点的那一次不该消耗它。
+    ///
+    /// 但 `last_resume_at` 必须写：不写的话，下一轮扫描的自动续跑会看到一个
+    /// 空的冷却计时器，立刻再敲一遍，同一个会话吃两条提示词。
+    /// `resume_failures` 也跟着走：手动敲成了就证明通道是好的，自动那边的退避
+    /// 该马上松开。
+    pub async fn note_manual_resume(&self, session_id: &str, outcome: ResumeOutcome) {
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut state = self.state.lock().await;
+        let Some(session) = state.sessions.iter_mut().find(|s| s.id == session_id) else {
+            return;
+        };
+        session.last_resume_at = Some(now);
+        if outcome.is_failure() {
+            session.resume_failures = session.resume_failures.saturating_add(1);
+        } else {
+            session.resume_failures = 0;
         }
     }
 
@@ -844,6 +1055,64 @@ fn check_cooldown(session: &AgentSession, cooldown_secs: u64) -> bool {
     }
 }
 
+/// 失败越多，越沉得住气
+///
+/// 固定 30 秒冷却在通道好使的时候没问题；通道坏掉时它就成了每 30 秒撞一次墙——
+/// 日志被刷满、AppleScript 反复抢前台窗口把用户正在打的字打断，而结果一次都不会变。
+///
+/// 所以按连续失败次数线性拉长，最多 6 倍。**只线性、有上限**是两个都要的：
+/// 指数退避几次之后就会退到几小时，用户明明已经把权限补上了，却还要干等；
+/// 6 倍（默认 3 分钟）刚好是「不烦人」和「修好了马上就能恢复」之间那个位置。
+fn effective_cooldown(base_secs: u64, failures: u32) -> u64 {
+    base_secs.saturating_mul(1 + failures.min(5) as u64)
+}
+
+/// 还该不该继续往这个会话里敲字
+///
+/// 这道闸门只拦**动作**，不改判定。区别是实打实的：
+/// 上一版把它写在 `Detector::make_verdict` 里当提前返回，额度一光判定就降级成
+/// 「疑似」，而 `grade_attention` 对「疑似」的处理是不打扰——于是应用一边放弃
+/// 自己动手，一边把该给人的提醒也一起收了，最后谁都没管这个会话。
+/// 「它其实没干完活，每次都要我去发继续」有一半是这么来的。
+///
+/// 现在判定照实说「确认中断」，注意力分级照常升到 `NeedsInput` 叫人，
+/// 只有敲字这一件事停下来。放弃动手的那一刻，正是最该开口的一刻。
+///
+/// 数的是**连击**（`resume_streak`）而不是累计次数：上限想拦的是「对着一个
+/// 不响应的会话空转」，不是「一个会话一辈子只准被催 5 次」。会话一动就清零。
+fn has_nudges_left(session: &AgentSession, max: u32) -> bool {
+    session.resume_streak < max
+}
+
+/// 这句话现在还值不值得说
+///
+/// 抽成自由函数的理由跟 [`apply_resume_outcome`] 一样：裹在锁里的策略测不到。
+/// 规则一句话——同一个话题、同一个情况，只说第一次。
+fn should_say(said: &mut HashMap<String, String>, topic: String, fingerprint: &str) -> bool {
+    if said.get(&topic).is_some_and(|last| last == fingerprint) {
+        return false;
+    }
+    said.insert(topic, fingerprint.to_string());
+    true
+}
+
+/// 一次投递结果该怎么改写会话上的三个计数器
+///
+/// 从 `commit_resume_outcome` 里抽出来是为了**能单测**：这段逻辑正是上一版出错的
+/// 地方（计数在投递之前就加、失败不回退），而它原来被一把 async 锁裹着，
+/// 裹在锁里的策略是测不到的。规则本身只有一句：
+/// **没送达就一个计数都不许动**，送达了才既算一次帮忙、也算一次连击。
+fn apply_resume_outcome(session: &mut AgentSession, outcome: ResumeOutcome, now: String) {
+    session.last_resume_at = Some(now);
+    if outcome.is_failure() {
+        session.resume_failures = session.resume_failures.saturating_add(1);
+    } else {
+        session.resume_count = session.resume_count.saturating_add(1);
+        session.resume_streak = session.resume_streak.saturating_add(1);
+        session.resume_failures = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,5 +1155,138 @@ mod tests {
         let mut s = session_with("/tmp", None);
         s.last_resume_at = Some("not a timestamp".to_string());
         assert!(check_cooldown(&s, 300));
+    }
+
+    // ── 投递结果 → 计数器：v1.5 修掉的那个「自己把自己关掉」的缺陷 ──
+
+    fn stamp() -> String {
+        Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    #[test]
+    fn failed_delivery_never_burns_the_budget() {
+        // 这就是用户报的「自动续跑好像根本不工作」：macOS 辅助功能授权每次
+        // 重新构建应用都会失效，于是每次投递都失败。旧代码在投递前就加计数，
+        // 五次之后 `max_resume_count` 到顶，这个会话从此永久沉默——
+        // 而一个字都没真的敲进去过。
+        let mut s = session_with("/tmp", None);
+        for _ in 0..10 {
+            apply_resume_outcome(&mut s, ResumeOutcome::Failed, stamp());
+        }
+        assert_eq!(s.resume_count, 0, "没送达就不算帮过忙");
+        assert_eq!(s.resume_streak, 0, "更不该消耗上限额度");
+        assert_eq!(s.resume_failures, 10, "但要记得这条通道一直在失败");
+        assert!(s.last_resume_at.is_some(), "冷却计时还是要走，别每轮都撞墙");
+    }
+
+    #[test]
+    fn silent_delivery_counts_as_failure() {
+        // 脚本说成功、会话一动没动：从用户角度这跟报错是同一件事——没人替他按继续
+        let mut s = session_with("/tmp", None);
+        apply_resume_outcome(&mut s, ResumeOutcome::Silent, stamp());
+        assert_eq!(s.resume_count, 0);
+        assert_eq!(s.resume_failures, 1);
+    }
+
+    #[test]
+    fn landed_delivery_clears_the_failure_streak() {
+        let mut s = session_with("/tmp", None);
+        apply_resume_outcome(&mut s, ResumeOutcome::Failed, stamp());
+        apply_resume_outcome(&mut s, ResumeOutcome::Failed, stamp());
+        apply_resume_outcome(&mut s, ResumeOutcome::Landed, stamp());
+        assert_eq!(s.resume_failures, 0, "通道又通了，退避该立刻松开");
+        assert_eq!(s.resume_count, 1);
+        assert_eq!(s.resume_streak, 1);
+    }
+
+    #[test]
+    fn unverifiable_delivery_still_counts() {
+        // Codex / OpenCode 不落可读的记录文件，核验不了。这种情况按「大概进去了」
+        // 记账，跟改动前的行为一致——不能因为核验不了就判它失败，那是无根据地
+        // 给一条本来好使的通道判死刑。
+        let mut s = session_with("/tmp", None);
+        apply_resume_outcome(&mut s, ResumeOutcome::Unverifiable, stamp());
+        assert_eq!(s.resume_count, 1);
+        assert_eq!(s.resume_streak, 1);
+        assert_eq!(s.resume_failures, 0);
+    }
+
+    #[test]
+    fn backoff_grows_then_stops_growing() {
+        assert_eq!(effective_cooldown(30, 0), 30);
+        assert_eq!(effective_cooldown(30, 1), 60);
+        assert_eq!(effective_cooldown(30, 5), 180);
+        assert_eq!(
+            effective_cooldown(30, 99),
+            180,
+            "退避要有上限：用户把权限补回来之后不该还得干等几小时"
+        );
+    }
+
+    #[test]
+    fn backoff_never_overflows() {
+        assert_eq!(effective_cooldown(u64::MAX, 3), u64::MAX);
+    }
+
+    #[test]
+    fn exhausted_streak_stops_typing_but_not_watching() {
+        // 额度用光只该关掉「敲字」这一个动作。判定和提醒都不受影响——
+        // 这条测试就是为了钉住那个曾经的悄悄放弃：额度一光，判定被降级成
+        // 「疑似」，注意力分级于是不再叫人，会话被彻底遗忘。
+        let max = 3;
+        let mut s = session_with("/tmp/demo", None);
+        assert!(has_nudges_left(&s, max), "刚开始就有额度");
+
+        for landed in 1..=max {
+            apply_resume_outcome(&mut s, ResumeOutcome::Unverifiable, stamp());
+            assert_eq!(s.resume_streak, landed);
+        }
+        assert!(!has_nudges_left(&s, max), "连着催满就该停手");
+
+        // 会话自己动起来 → `scan_once` 把连击清零，额度整个还回来
+        s.resume_streak = 0;
+        assert!(
+            has_nudges_left(&s, max),
+            "它一动就该重新守着它，不是一辈子只准被催 max 次"
+        );
+    }
+
+    #[test]
+    fn failed_deliveries_never_exhaust_the_budget() {
+        // 敲不进去不算「催过」。这两件事混在一起时，权限一掉就会连着记 5 次
+        // 「催过了」，然后自动续跑对这个会话永久沉默，而用户什么提示也收不到。
+        let max = 3;
+        let mut s = session_with("/tmp/demo", None);
+        for _ in 0..20 {
+            apply_resume_outcome(&mut s, ResumeOutcome::Failed, stamp());
+        }
+        assert!(
+            has_nudges_left(&s, max),
+            "一次都没送达，额度一格都不该被吃掉"
+        );
+    }
+
+    #[test]
+    fn standing_conditions_are_only_announced_once() {
+        // 「已经催不动了」这个情况会一直成立。每 10 秒重播一次的结果是日志面板
+        // 被自己的历史刷满，新消息还没被看见就被挤下去了。
+        let mut said = HashMap::new();
+        let topic = MonitorEngine::exhausted_topic("cc-1");
+
+        assert!(should_say(&mut said, topic.clone(), "3"), "第一次要说");
+        for _ in 0..5 {
+            assert!(
+                !should_say(&mut said, topic.clone(), "3"),
+                "情况没变就别重复"
+            );
+        }
+        assert!(
+            should_say(&mut said, topic.clone(), "4"),
+            "连击数变了是新情况，该再说一次"
+        );
+
+        // 会话恢复后要忘掉这条话题，否则同一个情况第二次发生就说不出口了
+        said.remove(&topic);
+        assert!(should_say(&mut said, topic, "4"));
     }
 }
