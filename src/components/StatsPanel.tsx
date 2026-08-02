@@ -4,6 +4,8 @@ import { formatShortTime } from "../lib/utils";
 import {
   selectDailyStats,
   selectResumeHistory,
+  selectResumeHistoryTotal,
+  selectStatsOverview,
   selectTotals,
   useAppStore,
 } from "../stores/useAppStore";
@@ -33,6 +35,8 @@ export function StatsPanel() {
   const { t } = useI18n();
   const dailyStats = useAppStore(selectDailyStats);
   const resumeHistory = useAppStore(selectResumeHistory);
+  const resumeHistoryTotal = useAppStore(selectResumeHistoryTotal);
+  const overview = useAppStore(selectStatsOverview);
   const totals = useAppStore(selectTotals);
   const fetchStats = useAppStore((s) => s.fetchStats);
 
@@ -62,9 +66,9 @@ export function StatsPanel() {
   return (
     <div className="mx-auto max-w-3xl space-y-4">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <StatCard label={t("stats.detections")} value={detections} />
-        <StatCard label={t("stats.resumes")} value={resumes} />
-        <StatCard label={t("stats.successful")} value={successful} />
+        <StatCard label={t("stats.detections")} value={overview?.total_detections ?? detections} />
+        <StatCard label={t("stats.resumes")} value={overview?.total_resumes ?? resumes} />
+        <StatCard label={t("stats.successful")} value={overview?.successful_resumes ?? successful} />
         <StatCard label={t("stats.success_rate")} value={`${successRate}%`} />
       </div>
 
@@ -105,7 +109,7 @@ export function StatsPanel() {
             desc={t("stats.history_desc", { limit: HISTORY_LIMIT })}
             aside={
               <span className="text-[10px] tabular-nums text-neutral-400">
-                {t("stats.records", { count: resumeHistory.length })}
+                {t("stats.records", { count: resumeHistoryTotal || resumeHistory.length })}
               </span>
             }
           />

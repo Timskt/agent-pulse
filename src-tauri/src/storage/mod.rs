@@ -1,5 +1,5 @@
 use crate::cost::{DailyCost, ProjectCost, UsageEntry, UsageSnapshot};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,6 +57,40 @@ pub struct SessionHistoryEntry {
     pub resume_count: u32,
     pub total_tokens: u64,
     pub cost_usd: f64,
+}
+
+/// 按模型聚合的成本
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub model: String,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub requests: u32,
+}
+
+/// 分页后的续跑记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeRecordPage {
+    pub records: Vec<ResumeRecord>,
+    pub total: u32,
+}
+
+/// 分页后的会话历史
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryPage {
+    pub entries: Vec<SessionHistoryEntry>,
+    pub total: u32,
+}
+
+/// 统计总览
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatsOverview {
+    pub total_scans: u32,
+    pub total_detections: u32,
+    pub total_resumes: u32,
+    pub successful_resumes: u32,
+    pub failed_resumes: u32,
+    pub active_sessions: u32,
 }
 
 /// SQLite 持久化存储引擎
@@ -172,6 +206,48 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_history_last_seen ON session_history(last_seen);",
         );
+        drop(conn);
+        self.migrate();
+    }
+
+    /// 给已经存在的库补列
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` 只在**没有**这张表的时候管事。上面那一批
+    /// 建表语句对一个装过旧版本的机器来说全是空操作，于是往里加一列
+    /// 只对全新安装生效——老用户的库永远缺那一列，读它的查询要么报错
+    /// 要么被 `unwrap_or` 吞成默认值，看起来像功能没做。
+    ///
+    /// 所以补列走这里，一次把机制建好，以后加字段只是往表里加一行声明：
+    /// [`Self::ensure_column`] 自己判断列在不在，重复运行没有副作用，
+    /// 也不需要维护版本号——库的真实形状就是唯一的事实来源。
+    fn migrate(&self) {
+        // (表, 列, 类型与默认值)
+        const COLUMNS: &[(&str, &str, &str)] = &[
+            // v1.6：把「为什么停」跟「停了」分开存。旧行留空字符串，
+            // 统计层要按原因分组时，空串就是「那时候还没记原因」。
+            ("detection_records", "reason", "TEXT DEFAULT ''"),
+        ];
+        for (table, column, decl) in COLUMNS {
+            self.ensure_column(table, column, decl);
+        }
+    }
+
+    /// 列不存在就加上；存在就什么都不做
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) {
+        let conn = self.conn.lock().unwrap();
+        // 表名和列名都是本文件里的字面量，不来自外部输入，所以可以拼进 SQL；
+        // `PRAGMA` 和 `ALTER TABLE` 都不接受占位符，这里没有别的写法。
+        let existing: Result<i64, _> = conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            params![column],
+            |r| r.get(0),
+        );
+        if existing.unwrap_or(1) == 0 {
+            let _ = conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            );
+        }
     }
 
     /// 记录一次续跑事件
@@ -211,12 +287,13 @@ impl Storage {
         verdict: &str,
         signals: &str,
         has_active_goal: bool,
+        reason: &str,
     ) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO detection_records (session_id, agent_name, verdict, signals, has_active_goal)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, agent_name, verdict, signals, has_active_goal as i32],
+            "INSERT INTO detection_records (session_id, agent_name, verdict, signals, has_active_goal, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session_id, agent_name, verdict, signals, has_active_goal as i32, reason],
         );
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let _ = conn.execute(
@@ -323,6 +400,90 @@ impl Storage {
         }
     }
 
+    /// 分页、搜索、按结果筛选续跑记录
+    pub fn get_resume_page(
+        &self,
+        limit: u32,
+        offset: u32,
+        query: &str,
+        outcome: &str,
+    ) -> ResumeRecordPage {
+        let conn = self.conn.lock().unwrap();
+        let query = query.trim();
+        let like = format!("%{query}%");
+        let outcome_filter = match outcome {
+            "success" | "failed" => outcome,
+            _ => "all",
+        };
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM resume_records WHERE (?1 = '' OR agent_name LIKE ?2 OR working_dir LIKE ?2 OR message LIKE ?2) AND (?3 = 'all' OR (?3 = 'success' AND success = 1) OR (?3 = 'failed' AND success = 0))",
+            params![query, like, outcome_filter],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as u32;
+        let mut stmt = match conn.prepare(
+            "SELECT id, session_id, agent_name, working_dir, prompt_type, success, message, created_at FROM resume_records WHERE (?1 = '' OR agent_name LIKE ?2 OR working_dir LIKE ?2 OR message LIKE ?2) AND (?3 = 'all' OR (?3 = 'success' AND success = 1) OR (?3 = 'failed' AND success = 0)) ORDER BY id DESC LIMIT ?4 OFFSET ?5",
+        ) { Ok(stmt) => stmt, Err(_) => return ResumeRecordPage { records: vec![], total } };
+        let records = stmt
+            .query_map(params![query, like, outcome_filter, limit, offset], |row| {
+                Ok(ResumeRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    agent_name: row.get(2)?,
+                    working_dir: row.get(3)?,
+                    prompt_type: row.get(4)?,
+                    success: row.get::<_, i32>(5)? != 0,
+                    message: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map(|rows| rows.filter_map(|row| row.ok()).collect())
+            .unwrap_or_default();
+        ResumeRecordPage { records, total }
+    }
+
+    /// 获取统计摘要
+    pub fn stats_overview(&self) -> StatsOverview {
+        let conn = self.conn.lock().unwrap();
+        StatsOverview {
+            total_scans: conn
+                .query_row(
+                    "SELECT COALESCE(SUM(total_scans), 0) FROM daily_stats",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            total_detections: conn
+                .query_row(
+                    "SELECT COALESCE(SUM(total_detections), 0) FROM daily_stats",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            total_resumes: conn
+                .query_row(
+                    "SELECT COALESCE(SUM(total_resumes), 0) FROM daily_stats",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            successful_resumes: conn
+                .query_row(
+                    "SELECT COALESCE(SUM(successful_resumes), 0) FROM daily_stats",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            failed_resumes: conn
+                .query_row(
+                    "SELECT COALESCE(SUM(failed_resumes), 0) FROM daily_stats",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+            active_sessions: 0,
+        }
+    }
+
     /// 获取总体统计: (total_detections, total_resumes, successful_resumes)
     pub fn get_totals(&self) -> (u32, u32, u32) {
         let conn = self.conn.lock().unwrap();
@@ -333,7 +494,11 @@ impl Storage {
             .query_row("SELECT COUNT(*) FROM resume_records", [], |r| r.get(0))
             .unwrap_or(0);
         let success_resumes: u32 = conn
-            .query_row("SELECT COUNT(*) FROM resume_records WHERE success = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM resume_records WHERE success = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         (total_detections, total_resumes, success_resumes)
     }
@@ -545,6 +710,41 @@ impl Storage {
         .unwrap_or_default()
     }
 
+    /// 最近 N 天按模型聚合的成本
+    pub fn model_costs(&self, days: u32, limit: u32) -> Vec<ModelCost> {
+        let today = chrono::Local::now().date_naive();
+        let start = today - chrono::Duration::days(days.max(1) as i64 - 1);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT model, COALESCE(SUM(input_tokens + output_tokens + cache_write_tokens + cache_read_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM usage_records WHERE date >= ?1 GROUP BY model ORDER BY 3 DESC LIMIT ?2",
+        ) { Ok(stmt) => stmt, Err(_) => return vec![] };
+        stmt.query_map(
+            params![start.format("%Y-%m-%d").to_string(), limit],
+            |row| {
+                Ok(ModelCost {
+                    model: row.get(0)?,
+                    total_tokens: row.get::<_, i64>(1)? as u64,
+                    cost_usd: row.get(2)?,
+                    requests: row.get(3)?,
+                })
+            },
+        )
+        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// 指定区间的 token / 缓存 / 请求汇总
+    pub fn usage_summary(&self, days: u32) -> UsageSnapshot {
+        let today = chrono::Local::now().date_naive();
+        let start = today - chrono::Duration::days(days.max(1) as i64 - 1);
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM usage_records WHERE date >= ?1",
+            params![start.format("%Y-%m-%d").to_string()],
+            |row| { let i: i64 = row.get(0)?; let o: i64 = row.get(1)?; let cw: i64 = row.get(2)?; let cr: i64 = row.get(3)?; Ok(UsageSnapshot { input_tokens: i as u64, output_tokens: o as u64, cache_write_tokens: cw as u64, cache_read_tokens: cr as u64, total_tokens: (i + o + cw + cr) as u64, cost_usd: row.get(4)?, requests: row.get(5)? }) },
+        ).unwrap_or_default()
+    }
+
     /// 最近 N 小时内消耗的 token 总量（用于限流窗口预测）
     pub fn tokens_in_last_hours(&self, hours: u32) -> u64 {
         let since = chrono::Local::now() - chrono::Duration::hours(hours.max(1) as i64);
@@ -606,6 +806,46 @@ impl Storage {
                 cost_usd
             ],
         );
+    }
+
+    /// 分页、搜索、按项目或终端筛选会话历史
+    pub fn get_session_history_page(
+        &self,
+        limit: u32,
+        offset: u32,
+        query: &str,
+    ) -> SessionHistoryPage {
+        let conn = self.conn.lock().unwrap();
+        let query = query.trim();
+        let like = format!("%{query}%");
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM session_history WHERE (?1 = '' OR working_dir LIKE ?2 OR agent_name LIKE ?2 OR session_file LIKE ?2 OR terminal_app LIKE ?2)",
+            params![query, like], |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as u32;
+        let mut stmt = match conn.prepare(
+            "SELECT session_key, session_id, agent_name, working_dir, session_file, tty, terminal_app, first_seen, last_seen, last_status, resume_count, total_tokens, cost_usd FROM session_history WHERE (?1 = '' OR working_dir LIKE ?2 OR agent_name LIKE ?2 OR session_file LIKE ?2 OR terminal_app LIKE ?2) ORDER BY last_seen DESC LIMIT ?3 OFFSET ?4",
+        ) { Ok(stmt) => stmt, Err(_) => return SessionHistoryPage { entries: vec![], total } };
+        let entries = stmt
+            .query_map(params![query, like, limit, offset], |row| {
+                Ok(SessionHistoryEntry {
+                    session_key: row.get(0)?,
+                    session_id: row.get(1)?,
+                    agent_name: row.get(2)?,
+                    working_dir: row.get(3)?,
+                    session_file: row.get(4)?,
+                    tty: row.get(5)?,
+                    terminal_app: row.get(6)?,
+                    first_seen: row.get(7)?,
+                    last_seen: row.get(8)?,
+                    last_status: row.get(9)?,
+                    resume_count: row.get(10)?,
+                    total_tokens: row.get::<_, i64>(11)? as u64,
+                    cost_usd: row.get(12)?,
+                })
+            })
+            .map(|rows| rows.filter_map(|row| row.ok()).collect())
+            .unwrap_or_default();
+        SessionHistoryPage { entries, total }
     }
 
     /// 查询会话历史（关键字为空则返回最近的）

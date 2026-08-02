@@ -1,4 +1,6 @@
-use super::{to_glob_pattern, AgentAdapter, AgentSession, ProcessSnapshot, SessionStatus, TurnState};
+use super::{
+    to_glob_pattern, AgentAdapter, AgentSession, ProcessSnapshot, SessionStatus, TurnState,
+};
 use chrono::Local;
 use std::fs;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -265,17 +267,23 @@ impl ClaudeCodeAdapter {
             match kind {
                 // 簿记类记录：改模式、存快照、写标题，什么时候都可能落盘，
                 // 跟回合进行到哪一步无关，跳过继续往前找
-                "mode" | "permission-mode" | "file-history-snapshot" | "file-history-delta"
-                | "last-prompt" | "queue-operation" | "ai-title" | "summary" => continue,
+                "mode"
+                | "permission-mode"
+                | "file-history-snapshot"
+                | "file-history-delta"
+                | "last-prompt"
+                | "queue-operation"
+                | "ai-title"
+                | "summary" => continue,
 
                 "assistant" => {
                     let has_tool_use = value
                         .pointer("/message/content")
                         .and_then(|c| c.as_array())
                         .map(|blocks| {
-                            blocks.iter().any(|b| {
-                                b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
-                            })
+                            blocks
+                                .iter()
+                                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
                         })
                         .unwrap_or(false);
                     // 工具调用已经发出去，结果还没写回来 → 命令正在跑
@@ -469,7 +477,10 @@ mod tests {
             r#"{"type":"user","message":{"content":"跑一下测试"}}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"测试过了"}]}}"#,
         ]);
-        assert_eq!(ClaudeCodeAdapter::classify_turn(&l), TurnState::AwaitingUser);
+        assert_eq!(
+            ClaudeCodeAdapter::classify_turn(&l),
+            TurnState::AwaitingUser
+        );
     }
     // TESTS_PLACEHOLDER_ADAPTER
 
@@ -482,7 +493,10 @@ mod tests {
             r#"{"type":"ai-title","title":"修 bug"}"#,
             r#"{"type":"mode","mode":"acceptEdits"}"#,
         ]);
-        assert_eq!(ClaudeCodeAdapter::classify_turn(&l), TurnState::AwaitingUser);
+        assert_eq!(
+            ClaudeCodeAdapter::classify_turn(&l),
+            TurnState::AwaitingUser
+        );
     }
 
     #[test]
@@ -502,7 +516,10 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"稍等"}]}}"#,
             r#"{"type":"system","level":"info","subtype":"compact_boundary","content":"Conversation compacted"}"#,
         ]);
-        assert_eq!(ClaudeCodeAdapter::classify_turn(&compacted), TurnState::Busy);
+        assert_eq!(
+            ClaudeCodeAdapter::classify_turn(&compacted),
+            TurnState::Busy
+        );
     }
 
     #[test]
@@ -545,10 +562,7 @@ mod tests {
     #[test]
     fn error_level_system_lines_are_kept() {
         let l = lines(&[r#"{"type":"system","level":"error","content":"ECONNRESET"}"#]);
-        assert_eq!(
-            ClaudeCodeAdapter::extract_text_from_jsonl(&l),
-            "ECONNRESET"
-        );
+        assert_eq!(ClaudeCodeAdapter::extract_text_from_jsonl(&l), "ECONNRESET");
     }
     // TESTS_PLACEHOLDER_ADAPTER
 

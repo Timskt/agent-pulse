@@ -40,16 +40,16 @@
 
 | 维度 | 现状 |
 |---|---|
-| 版本 | `1.5.0`（`package.json` 是唯一来源，`vite.config.ts` 注入 `__APP_VERSION__`；与 `tauri.conf.json` / `Cargo.toml` 的一致性由 `src/version.test.ts` 锁死） |
-| 后端 | Rust，17 个文件，**10755 行**（含单测） |
-| 前端 | TypeScript + React 19，30 个 `.ts/.tsx`，**4511 行**（+ `index.css` 71 行） |
-| 单元测试 | Rust **115 个**（`cargo test`）+ 前端 **32 个**（`pnpm test`，vitest）；两者都在三个平台的 CI 里跑 |
+| 版本 | `1.6.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死） |
+| 后端 | Rust，17 个文件，持续同步统计 |
+| 前端 | TypeScript + React 19，持续同步统计 |
+| 单元测试 | Rust **128 个**（`cargo test`）+ 前端 **38 个**（`pnpm test`，vitest）；两者都在三个平台的 CI 里跑 |
 | Tauri 命令 | 25 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
 | 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
 | i18n 词条 | 后端 151 条（`(key, zh, en)`），前端 220 条（`[zh, en]`） |
 | 持久化 | SQLite 6 张表 |
-| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
+| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
 
 **这个版本能做到的事**：在你不改变任何使用习惯的前提下，后台盯着 Claude Code / Codex / OpenCode
 的会话文件与进程，判断它是"还在干活"、"卡住了"、"在等你回话"、"限流了"还是"报错了"；
@@ -102,6 +102,7 @@ AgentPulse 走的是另一条：**附着在你已有的工作方式上**。代�
 | v1.3 P2 | 远程审批 | ❌ | 手机上点一下"续跑"——**未实现**，见 [13.2](#132-下一步候选v16) |
 | v1.4 | **可信化** | ✅ | tmux/screen 免权限投递通道、续跑演练（`ResumeProbe` 干跑探测）、macOS 辅助功能权限自检与"去开权限"引导、前端 vitest、局域网看板换绑修复 |
 | v1.5 | **闭环化** | ✅ | 投递后核验落地（`ResumeOutcome` + `resume_verified`）、一个计数器拆成三个、上限从判定层挪到动作闸门、静默失败会出声、日志区分事件与状态、版本号单一来源 |
+| v1.6 | **可解释判定** | ✅ 待发布 | `InterruptReason` 与 `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权、指纹缓存、每轮最多一问）、自定义适配器 UI、跨语言枚举/i18n 门禁、SQLite 形状迁移 |
 | v2.0 | 编排层 | ⏸ | 主动搁置，与非侵入定位冲突，动工前需确认 |
 | v2.1+ | 自治层 | ⏸ | 同上 |
 
@@ -167,7 +168,7 @@ a888d91  feat(icon): regenerate the whole icon set from a vector master
 
 | 文件 | 行数 | 职责 |
 |---|---:|---|
-| `components/ConfigPanel.tsx` | 867 | 设置页，配置项最多的地方（也是唯一需要拆分的文件，见欠账） |
+| `components/ConfigPanel.tsx` | 610 | 设置页主编排；通知、成本、AI 分区已拆到 `components/config/` |
 | `i18n/index.ts` | 520 | 前端文案表（220 条 `[zh, en]`） |
 | `components/SessionList.tsx` | 406 | 会话卡片：状态、注意力标记、续跑按钮、演练结果、失败与停手标签 |
 | `stores/useAppStore.ts` | 361 | Zustand store：状态、事件、命令封装 |
@@ -298,10 +299,13 @@ AppState {
 
 | 信号 | 含义 | 来源 |
 |---|---|---|
-| `FileStale` | 会话文件在 `idle_timeout_secs` 内没更新 | `session_files` 的 mtime |
+| `FileStale` | 会话文件停更 | `session_files` 的 mtime |
 | `KeywordMatch` | 输出里命中了中断关键词 | `recent_output` |
 | `ProcessExited` | 进程没了 | 进程快照 |
 | `HeartbeatTimeout` | 心跳超时 | 会话文件时间线 |
+
+`FileStale` 与 `HeartbeatTimeout` 来自同一个时间事实，判定时合并为 `transcript_idle`；
+证据面板把它们当同源时间信号展示，不让用户误以为存在两票独立证据。
 
 曾经存在的第五种信号 `ProcessIdle`（CPU 占用为 0）**已被删除**：CPU 0% 分不清"在等 API 返回"
 和"在等人打字"，这两种情况一个不该动、一个该动，用一个分不开的信号去投票只会污染判定。
@@ -868,7 +872,7 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 | Job | 触发 | 内容 |
 |---|---|---|
 | `check-rust` | 每次 push / PR | **三平台矩阵**（ubuntu / macos / windows，`fail-fast: false`）→ `cargo clippy --all-targets -- -D warnings` → `cargo test` |
-| `check-frontend` | 每次 push / PR | pnpm 11 + Node 22 → `pnpm test`（vitest，32 个）→ `pnpm build`（`tsc && vite build`，类型错误即红） |
+| `check-frontend` | 每次 push / PR | pnpm 11 + Node 22 → `pnpm test`（vitest，38 个）→ `pnpm build`（`tsc && vite build`，类型错误即红） |
 | `build-tauri` | **仅 `v*` 标签** | 4 个目标：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc` |
 | `release` | 仅 `v*` 标签 | 汇总产物 → `softprops/action-gh-release@v2` |
 
@@ -877,11 +881,11 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 - **三个平台都跑 lint 和测试**。续跑层几乎全是 `#[cfg(target_os = …)]`，只在 ubuntu 上跑 clippy
   等于 Windows 和 macOS 分支从来没被编译过——上一版就是这么让一个 Windows 专属编译错误
   躺到打标签才暴露的。
-- **`--all-targets`**。不加它，`#[cfg(test)]` 里的代码不会被编译；115 个单元测试是跨平台脚本
+- **`--all-targets`**。不加它，`#[cfg(test)]` 里的代码不会被编译；128 个单元测试是跨平台脚本
   唯一的自动化保障，"能编译"和"测试也能编译"是两件事。
 
 还有一处后补的：**`pnpm test` 单独一步，排在 `pnpm build` 前面**。此前 `check-frontend` 只跑
-`pnpm build`，于是前端的 32 个测试在 CI 里根本没人跑——本地绿、远端从不验证，等于没有。
+`pnpm build`，于是前端的 38 个测试在 CI 里根本没人跑——本地绿、远端从不验证，等于没有。
 拆成两步还有个好处：测试挂了能一眼看出是测试挂了，而不是被埋进一次构建失败里。
 
 最近一次绿灯：run `30700566408`（Frontend / Rust macOS / Rust Ubuntu / Rust Windows 四个全绿；
@@ -1046,32 +1050,31 @@ push tag v*
 
 | 项 | 状态 |
 |---|---|
-| `docs/architecture.md` | ✅ 已重写，覆盖到 v1.5（原先停在 v1.0，读它会以为项目没有感知/洞察/远程层） |
+| `docs/architecture.md` | ✅ 已重写，覆盖到 v1.6（证据快照、AI 仲裁、形状驱动迁移） |
 | `src-tauri/tauri.conf.json` 的 `icon` 数组 | ✅ 已补 `icons/icon.png`（512px） |
 | 四处版本号漂移 | ✅ 已收成单一来源 + 测试锁死，见 11.6 |
-| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.5，配置表指向本文档 10.3） |
-| 本文档自身的计数 | ✅ 本次已重数（行数、测试数、i18n 词条数都是脚本数出来的，不是估的） |
+| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.6，配置表指向本文档 10.3） |
+| 本文档自身的计数 | ⚠️ 代码已变更，发布前再由脚本重数 |
 
 ### 12.3 结构性欠账
 
-- **`src/components/ConfigPanel.tsx` 867 行**，是前端唯一明显该拆的文件，而且它是这一版
-  唯一没动的欠账。按 Tab 内的分组（检测 / 续跑 / 通知 / 成本 / 远程 / Webhook / 高级）
-  拆成 6–7 个子组件即可，`ui/Field.tsx` 已经把表单样板抽干了，拆分是纯搬运。
-- **前端测试只覆盖到纯函数层**（`lib/display.ts`、`lib/utils.ts`、store 归约、版本一致性，
-  共 32 个）。组件渲染层没有任何测试——`SessionList` 的排序、标签显隐这类逻辑值得补
-  `@testing-library/react`。
+- **ConfigPanel 已完成第一轮拆分。** 主文件约 610 行，通用骨架、通知、成本、AI 分区已移到
+  `src/components/config/`；Webhook、远程和适配器仍在主文件，下一轮可继续按相同边界拆出。
+- **前端测试覆盖纯函数、store、版本一致性和跨语言枚举/i18n 门禁，共 38 个。**
+  组件渲染层仍缺 `@testing-library/react` 覆盖，`SessionList` 的排序、标签显隐值得补。
 - **自动更新缺失**。`045e571` 移除了 updater 插件（没配签名公钥会导致启动即崩），
   现在只能手动下载新版本。
-- **`ai_judge` 没接进自动回路**，见 12.4。
 
-### 12.4 AI 兜底判定只做了一半
+### 12.4 AI 兜底判定已接入，但保持受限权限
 
-`ai_judge/mod.rs` 存在、可配置、有 Tauri 命令入口（`lib.rs:306` 附近），
-但**没有接进自动检测回路**——`detector` 不会调它。也就是说它现在是一个"你可以手动问一句"的功能，
-不是"拿不准时自动请求二次判断"的机制。
+`ai_judge/mod.rs` 仍保持供应商中立（OpenAI-compatible `api_url` + 可换模型），同时已经接入
+自动检测回路。它只在唯一的弱证据缺口被调用，严格接受 `DONE` / `CONTINUE`：
 
-另外它刻意保持**供应商中立**（OpenAI 兼容的 `api_url` + 可换模型），这是给自建/代理端点留的口子，
-不改成任何单一供应商的专用 SDK。
+- 每轮最多问一个，会话记录指纹不变就复用答案；
+- `CONTINUE` 只能把 `Suspicious` 提升到 `ConfirmInterrupt`；
+- `DONE` 只阻止重复提问，不撤销任何已成立判定；
+- 请求失败、非标准回复、没启用或没配 Key，都等于没问过；
+- `TurnState::is_busy()` 时永远不问，保护长时间上下文压缩和工具调用。
 
 ### 12.5 主动搁置（不是欠账，是决定）
 
@@ -1133,20 +1136,20 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 |---|---|---|
 | P0 续跑演练（dry-run）按钮 | ✅ v1.4 | `Resumer::probe` + `ResumeProbe`，见 7.13 |
 | P0 三平台实机验证清单 | ✅ 清单已写 / ⚠️ **还没走完** | `docs/manual-test.md`，见 12.1 |
-| P1 拆 `ConfigPanel.tsx` | ❌ 仍未做（867 行） | 见 13.2 |
-| P1 前端 vitest | ✅ v1.4 | 32 个，见 14.2 |
+| P1 拆 `ConfigPanel.tsx` | ✅ v1.6（第一轮） | 通用骨架、通知、成本、AI 分区已拆，主文件降到约 610 行 |
+| P1 前端 vitest | ✅ v1.4 | 38 个，见 14.2 |
 | P2 重写 `docs/architecture.md` / README / `icons/icon.png` | ✅ | 见 12.2 |
 | P2 自动更新重做 | ❌ 仍未做 | 见 13.2 |
-| P1 自定义适配器 UI | ❌ 仍未做 | 见 13.2 |
+| P1 自定义适配器 UI | ✅ v1.6 | 设置页可增删改名称、进程匹配和会话文件模式 |
 | tmux / screen 通道（原属 13.3"更远"） | ✅ v1.4 **提前做了** | 它是确定性最高、且**唯一不受 macOS 签名影响**的通道，见 12.6 |
 | 健康自检（原属 13.3） | ✅ v1.4 大部分 | `ToolStatus` / `channel_health` 随演练一起给出 |
-| 判定证据面板（原 v1.5 ②） | ⚠️ 部分 | v1.5 补了「敲不进去 ×N」「已停手，等你」两个标签，把**续跑侧**的证据摊开了；**检测侧**的证据面板仍未做 |
+| 判定证据面板（原 v1.5 ②） | ✅ v1.6 | 后端 `DetectionEvidence` 快照 + 会话卡片展开，只渲染事实不重算策略 |
 | 闭环核验（原清单里没有，是 v1.5 现场加的） | ✅ v1.5 | 见 7.8–7.12 |
 
 最后一行值得单独说：它不在任何一版的候选清单里，是从"为什么每次都要等用户来报同一类问题"
 这个问题倒推出来的。**清单能列出的都是想得到的功能；想不到的那一层，只能靠追问症状的成因找到。**
 
-### 13.2 下一步候选（v1.6）
+### 13.2 v1.6 已交付与下一步候选
 
 按"先让已交付的东西可信"排序：
 
@@ -1154,19 +1157,22 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 七行还挂着 ⚠️，其中"落地核验的 6 秒窗口够不够"只有实机能回答——真机跑一次，
 看日志报的是 `Landed` 还是 `Silent`。
 
-**P1 — 拆 `ConfigPanel.tsx`（867 行）。** 前端唯一明显的结构性欠账，而且是纯搬运：
-`ui/Field.tsx` 已经把表单样板抽干，按 Tab 内的分组拆 6–7 个子组件即可。
+**已交付 — 自定义适配器 UI。** `CustomAdapterConfig` 已在设置页提供名称、进程匹配、
+会话文件模式的增删改表单；全部走组件库和 i18n。
 
-**P1 — 自定义适配器 UI。** `CustomAdapterConfig` 后端已就绪，缺一个"会话文件在哪、
-进程名叫什么、怎么判断回合"的表单。做完之后 Aider / Cline / Gemini CLI 这类工具
-用户自己就能加，不必等发版。
+**已交付 — 检测侧判定证据面板。** 后端保存 `DetectionEvidence` 事实快照：信号、进程存活、
+`TurnState`、忙碌宽限、命中的中断关键词/完成标记和 AI 第二意见。前端只展示快照，
+不复制 `make_verdict` 的策略，避免判定出现两个出处。
 
-**P1 — 检测侧的判定证据面板。** 在会话卡片上展开"为什么是这个结论"：四个信号各自的取值、
-`TurnState` 是什么、忙碌宽限有没有生效、命中了哪个关键词。检测逻辑的复杂度已经到了
-"用户看不懂它为什么这么判"的程度，而这个项目的信任成本很高，值得把推理过程摊开。
-v1.5 已经把续跑侧的证据摊开了（7.12 那张表），检测侧是同一个思路的另一半。
+**已交付 — AI 兜底接进自动回路。** 只在「关键词命中、记录仍增长、结构证据用尽」
+这一处提问，严格接受 `DONE` / `CONTINUE`，每轮最多问一个，并按记录指纹缓存。
+权限是单向的：`CONTINUE` 可以把可疑提升为确认中断；`DONE`、请求失败或非标准回复
+都不撤销已有结论。忙碌回合不问，避免重新引入上下文压缩误判。
 
-**P2 — 组件层测试。** 现在的 32 个前端测试只覆盖纯函数和 store 归约；`SessionList`
+**P1 — 继续拆 `ConfigPanel.tsx`。** 第一轮已把通用骨架、通知、成本、AI 分区拆出，主文件约 610 行；
+Webhook、远程和适配器仍可按同一边界继续拆，但不再是阻塞发布的欠账。
+
+**P2 — 组件层测试。** 现在的 38 个前端测试只覆盖纯函数和 store 归约；`SessionList`
 的排序、标签显隐这类逻辑值得补 `@testing-library/react`。
 
 **P2 — 自动更新重做。** 生成签名密钥对、配 `tauri-plugin-updater`、在 CI 的 `release` job 里
@@ -1197,8 +1203,8 @@ v1.5 已经把续跑侧的证据摊开了（7.12 那张表），检测侧是同�
 | **更多适配器** | Aider / Cline / Gemini CLI / Continue | 做完 13.2 的自定义适配器 UI 之后，这件事可以交给用户 |
 | **Windows 用 UIAutomation 取代标题匹配** | 能直接枚举标签页，把"窗口级确定性"提升到"标签级确定性"，多标签宿主不再需要靠标题猜 | 工程量不小，但这是 Windows 侧唯一的确定性天花板突破口 |
 | **从历史里学阈值** | 你每次手动续跑（说明它漏判了）和每次撤销（说明它误判了）都是标注数据，可以用来给这台机器调 `idle_timeout_secs`；v1.5 的 `ResumeOutcome` 让这件事第一次有了**自动**标注来源（`Silent` = 投递侧的问题，`Landed` 后马上又停 = 判定侧的问题） | 要小心：不能让学习结果绕过 6.4 的两条铁律 |
-| **成本报表导出** | 按周/月汇总、导出 CSV，给报销和团队分摊用 | 数据都在 SQLite 里，纯前端工作 |
-| **AI 兜底接进自动回路** | 关键词判不准时自动请求二次判断，而不是只能手动问 | 见 12.4；要先想清楚"多久问一次"和"问错了谁买单" |
+| **AI 兜底接进自动回路** | ✅ v1.6 | 唯一弱证据缺口自动提问，结构化 `DONE` / `CONTINUE`，见 12.4 |
+| **成本报表导出** | ⏸ v1.7 候选 | 按周/月汇总、导出 CSV；当前没有新增写入面 |
 
 ### 13.4 被主动搁置的两层：v2.0 编排 / v2.1 自治
 
@@ -1214,13 +1220,14 @@ v1.5 已经把续跑侧的证据摊开了（7.12 那张表），检测侧是同�
 "这个会话现在什么状态"、"帮我续一下"。AgentPulse 仍然只做它擅长的那件事，
 编排的责任和风险留在调用方。这条路值得在动工 v2.0 之前先讨论。
 
-### 13.5 需要你拍板的决策点
+### 13.5 当前决策记录
 
-1. **v1.6 是否就按 13.2 的顺序做**（走验证清单 → 拆 ConfigPanel → 适配器 UI → 检测证据面板）？
-2. **远程审批做不做**？做的话按 13.2 末尾那张表的安全设计走。
-3. **自动更新要不要现在重做**？它顺带能解掉 12.6 那个"勾还在、权限没了"的坑，但需要一个
-   Apple Developer 账号来出稳定签名。
-4. **v2.0 / v2.1 是否重新启动**？如果要，是走原设想还是 13.4 末尾的"开放 API 给外部编排器"折中路径？
+本轮已完成 v1.6 的可解释判定链路。远程审批、可写网络 API、编排层和自治层仍不实现；
+它们会改变非侵入或只读安全边界，必须单独确认。ConfigPanel 的文件级拆分和组件渲染测试
+仍是工程质量欠账，不阻塞当前判定链路发布。
+
+1. **自动更新**：仍需稳定签名材料后再做。
+2. **统计增强**：趋势对比、CSV 导出、模型分布和恢复耗时列入后续版本。
 
 ---
 
@@ -1233,11 +1240,11 @@ pnpm install                     # 装前端依赖
 pnpm tauri:dev                   # 开发（含 Rust 热重载）
 pnpm tauri:build                 # 打包，产物在 src-tauri/target/release/bundle/
 pnpm build                       # 仅前端：tsc && vite build（CI 用的就是这条）
-pnpm test                        # 前端 32 个 vitest（含四处版本号一致性）
+pnpm test                        # 前端 38 个 vitest（含四处版本号一致性）
 
 cd src-tauri
 cargo clippy --all-targets -- -D warnings   # CI 的 lint，本地务必先跑
-cargo test                                  # 115 个单元测试
+cargo test                                  # 128 个单元测试
 cargo test -- --list                        # 列出全部测试名
 
 ./scripts/gen-icons.sh           # 从 SVG 母版重出整套图标（需要 Chrome/Chromium）
@@ -1245,7 +1252,7 @@ cargo test -- --list                        # 列出全部测试名
 git tag v1.5.0 && git push origin v1.5.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
-### 14.2 测试分布（Rust 115 + 前端 32）
+### 14.2 测试分布（Rust 128 + 前端 38）
 
 | 模块 | 个数 | 守的是什么 |
 |---|---:|---|

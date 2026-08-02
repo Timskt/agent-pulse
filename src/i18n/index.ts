@@ -66,6 +66,32 @@ const TABLE = {
   "session.focus": ["跳到终端", "Jump to terminal"],
   "session.analyze": ["AI 看一眼", "Ask AI"],
 
+  // ── 判定证据 ──
+  "evidence.button": ["看判据", "Evidence"],
+  "evidence.hide": ["收起判据", "Hide evidence"],
+  "evidence.title": ["为什么是这个结论", "Why this ruling"],
+  "evidence.process": ["进程存活", "Process alive"],
+  "evidence.turn": ["回合结构", "Turn state"],
+  "evidence.signals": ["检测信号", "Signals"],
+  "evidence.signal.file_stale": ["记录停更", "Transcript stale"],
+  "evidence.signal.transcript_idle": ["记录时间信号", "Transcript time signal"],
+  "evidence.signal.keyword_match": ["命中关键词", "Keyword match"],
+  "evidence.signal.process_exited": ["进程已退出", "Process exited"],
+  "evidence.signal.heartbeat_timeout": ["心跳超时", "Heartbeat timeout"],
+  "evidence.grace": ["忙碌宽限", "Busy grace"],
+  "evidence.keyword": ["中断关键词", "Stall keyword"],
+  "evidence.completion": ["完成标记", "Completion marker"],
+  "evidence.second_opinion": ["AI 第二意见", "AI second opinion"],
+  "evidence.yes": ["是", "Yes"],
+  "evidence.no": ["否", "No"],
+  "evidence.none": ["没有", "None"],
+  "evidence.turn.unknown": ["无法识别", "Unknown"],
+  "evidence.turn.tool_running": ["工具仍在运行", "Tool still running"],
+  "evidence.turn.busy": ["回合尚未收尾", "Turn still active"],
+  "evidence.turn.awaiting_user": ["正在等人", "Waiting for you"],
+  "evidence.opinion.finished": ["这一轮已完成", "Turn finished"],
+  "evidence.opinion.unfinished": ["这一轮还没完成", "Turn unfinished"],
+
   // ── 续跑演练 ──
   //
   // 「按下去才知道会发生什么」是这个功能最大的心理负担，尤其在 IDE 内置
@@ -98,6 +124,32 @@ const TABLE = {
   "attention.completed": ["已完成", "Completed"],
   "attention.rate_limited": ["限流等待", "Rate limited"],
   "attention.error": ["出错", "Error"],
+
+  // ── 中断原因 ──
+  //
+  // 这几条要回答的不是「它怎么了」（那是上面的级别在说），而是
+  // 「所以这次我到底做了什么」。三个「按住手」的原因必须有措辞，
+  // 否则界面上一片「已中断」，用户会以为守护神漏了一次。
+  "reason.process_crashed": ["进程已退出", "Process gone"],
+  "reason.rate_limited": ["等限流过去", "Waiting out the limit"],
+  "reason.awaiting_input": ["在问你话", "Asking you"],
+  "reason.runtime_error": ["运行时报错", "Runtime error"],
+  "reason.stalled": ["活没干完", "Work unfinished"],
+  "reason.unknown": ["原因不明", "Reason unclear"],
+
+  // ── 这一轮打算怎么办 ──
+  //
+  // 措辞的落点是「所以你现在要不要动」，不是内部枚举名。两条都由后端算好的
+  // `resume_tactic` 决定，界面不再自己从原因推——推错的样子是界面上凭空
+  // 多出一句「这次没帮你按继续」，或者该说的时候不说。
+  "tactic.wait": [
+    "这次不催——{reason}，等它自己恢复就好。",
+    "Not nudging — {reason}. It will recover on its own.",
+  ],
+  "tactic.hand_off": [
+    "这次没有帮你按「继续」——{reason}，敲字帮不上忙，得你看一眼。",
+    "No nudge sent — {reason}. Typing wouldn't help; this one needs you.",
+  ],
 
   // ── 日志 ──
   "log.title": ["活动日志", "Activity log"],
@@ -183,6 +235,12 @@ const TABLE = {
     "{used} / {budget} tokens",
     "{used} / {budget} tokens",
   ],
+  "cost.period_spend": ["近 30 天花费", "Spend, last 30 days"],
+  "cost.period_tokens": ["近 30 天 tokens", "Tokens, last 30 days"],
+  "cost.cache_hit_rate": ["缓存读取占比", "Cache read share"],
+  "cost.period_requests": ["近 30 天请求", "Requests, last 30 days"],
+  "cost.models": ["模型排行", "Top models"],
+  "cost.models_desc": ["近 {days} 天按模型聚合", "Grouped by model, last {days} days"],
 
   // ── 会话历史时间线 ──
   "history.title": ["会话历史", "Session history"],
@@ -194,6 +252,10 @@ const TABLE = {
   "history.empty": ["还没有历史会话", "No past sessions yet"],
   "history.seen": ["{first} → {last}", "{first} → {last}"],
   "history.no_match": ["没有匹配的会话", "Nothing matched"],
+  "history.records": ["共 {count} 条", "{count} total"],
+  "history.previous": ["上一页", "Previous"],
+  "history.next": ["下一页", "Next"],
+  "history.page": ["第 {page} / {total} 页", "Page {page} of {total}"],
 
   // ── 设置：检测 ──
   "cfg.detection": ["检测", "Detection"],

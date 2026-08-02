@@ -3,9 +3,11 @@ import { useI18n } from "../i18n";
 import { baseName, cn, formatTokens, formatUsd } from "../lib/utils";
 import {
   selectCostDaily,
+  selectCostModels,
   selectCostProjects,
   selectRateForecast,
   selectStatus,
+  selectUsageSummary,
   useAppStore,
 } from "../stores/useAppStore";
 import type { RateLimitForecast } from "../types";
@@ -34,6 +36,8 @@ export function CostPanel() {
   const { t } = useI18n();
   const costDaily = useAppStore(selectCostDaily);
   const costProjects = useAppStore(selectCostProjects);
+  const costModels = useAppStore(selectCostModels);
+  const usageSummary = useAppStore(selectUsageSummary);
   const forecast = useAppStore(selectRateForecast);
   const status = useAppStore(selectStatus);
   const fetchCost = useAppStore((s) => s.fetchCost);
@@ -61,13 +65,18 @@ export function CostPanel() {
     () => costDaily.reduce((acc, day) => acc + day.cost_usd, 0),
     [costDaily]
   );
-  const projectMax = useMemo(
-    () => costProjects.reduce((acc, p) => Math.max(acc, p.cost_usd), 0),
-    [costProjects]
-  );
+  const cacheHitRate = usageSummary && usageSummary.total_tokens > 0
+    ? Math.round((usageSummary.cache_read_tokens / usageSummary.total_tokens) * 100)
+    : 0;
 
   return (
     <div className="mx-auto max-w-3xl space-y-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <CostStat label={t("cost.period_spend")} value={`$${formatUsd(usageSummary?.cost_usd ?? rangeTotal)}`} />
+        <CostStat label={t("cost.period_tokens")} value={formatTokens(usageSummary?.total_tokens ?? 0)} />
+        <CostStat label={t("cost.cache_hit_rate")} value={`${cacheHitRate}%`} />
+        <CostStat label={t("cost.period_requests")} value={usageSummary?.requests ?? 0} />
+      </div>
       <Card>
         <CardBody>
           <CardHeader
@@ -116,48 +125,20 @@ export function CostPanel() {
         </CardBody>
       </Card>
 
-      <Card>
-        <CardBody>
-          <CardHeader
-            className="mb-3"
-            title={t("cost.projects")}
-            desc={t("cost.projects_desc", { days: PROJECT_DAYS })}
-          />
-          {costProjects.length === 0 ? (
-            <EmptyState title={t("cost.no_data")} className="py-6" />
-          ) : (
-            <div className="space-y-2.5">
-              {costProjects.map((project) => (
-                <div key={project.project}>
-                  <div className="flex items-baseline justify-between gap-3">
-                    <Tooltip content={project.project}>
-                      <span className="truncate font-mono text-[11px] text-neutral-700">
-                        {baseName(project.project)}
-                      </span>
-                    </Tooltip>
-                    <span className="shrink-0 text-[11px] font-medium tabular-nums text-neutral-800">
-                      ${formatUsd(project.cost_usd)}
-                    </span>
-                  </div>
-                  {/* 横条按最高项归一，一眼能看出谁在吃钱 */}
-                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-neutral-100">
-                    <div
-                      className="h-full rounded-full bg-neutral-800/70"
-                      style={{
-                        width: `${projectMax === 0 ? 0 : (project.cost_usd / projectMax) * 100}%`,
-                      }}
-                    />
-                  </div>
-                  <p className="mt-1 text-[10px] tabular-nums text-neutral-400">
-                    {t("cost.tokens", { tokens: formatTokens(project.total_tokens) })} ·{" "}
-                    {t("cost.requests", { count: project.requests })}
-                  </p>
-                </div>
-              ))}
-            </div>
-          )}
-        </CardBody>
-      </Card>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <Card>
+          <CardBody>
+            <CardHeader className="mb-3" title={t("cost.projects")} desc={t("cost.projects_desc", { days: PROJECT_DAYS })} />
+            <RankList rows={costProjects.map((project) => ({ key: project.project, label: baseName(project.project), detail: `${t("cost.tokens", { tokens: formatTokens(project.total_tokens) })} · ${t("cost.requests", { count: project.requests })}`, value: project.cost_usd, tooltip: project.project }))} />
+          </CardBody>
+        </Card>
+        <Card>
+          <CardBody>
+            <CardHeader className="mb-3" title={t("cost.models")} desc={t("cost.models_desc", { days: PROJECT_DAYS })} />
+            <RankList rows={costModels.map((model) => ({ key: model.model, label: model.model, detail: `${t("cost.tokens", { tokens: formatTokens(model.total_tokens) })} · ${t("cost.requests", { count: model.requests })}`, value: model.cost_usd }))} />
+          </CardBody>
+        </Card>
+      </div>
     </div>
   );
 }
@@ -200,6 +181,17 @@ function Forecast({ forecast }: { forecast: RateLimitForecast | null }) {
       </p>
     </div>
   );
+}
+
+function CostStat({ label, value }: { label: string; value: number | string }) {
+  return <Card className="px-4 py-3"><p className="text-lg font-semibold tabular-nums text-neutral-900">{value}</p><p className="mt-0.5 truncate text-[10px] text-neutral-400">{label}</p></Card>;
+}
+
+function RankList({ rows }: { rows: readonly { key: string; label: string; detail: string; value: number; tooltip?: string }[] }) {
+  const { t } = useI18n();
+  const max = rows.reduce((acc, row) => Math.max(acc, row.value), 0);
+  if (rows.length === 0) return <EmptyState title={t("cost.no_data")} className="py-6" />;
+  return <div className="space-y-3">{rows.map((row) => <div key={row.key}><div className="flex items-baseline justify-between gap-3"><Tooltip content={row.tooltip ?? row.label}><span className="truncate font-mono text-[11px] text-neutral-700">{row.label}</span></Tooltip><span className="shrink-0 text-[11px] font-medium tabular-nums text-neutral-800">${formatUsd(row.value)}</span></div><div className="mt-1 h-1 overflow-hidden rounded-full bg-neutral-100"><div className="h-full rounded-full bg-neutral-800/70" style={{ width: `${max === 0 ? 0 : (row.value / max) * 100}%` }} /></div><p className="mt-1 text-[10px] tabular-nums text-neutral-400">{row.detail}</p></div>)}</div>;
 }
 
 /** `2026-07-30` → `07-30` */

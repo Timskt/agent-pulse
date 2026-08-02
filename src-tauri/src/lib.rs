@@ -166,7 +166,11 @@ async fn manual_resume(
     state
         .engine
         .push_event_public(EngineEvent::new(
-            if ok { LogLevel::Success } else { LogLevel::Error },
+            if ok {
+                LogLevel::Success
+            } else {
+                LogLevel::Error
+            },
             Some(session_id),
             i18n.tf("log.resume_manual", &[("detail", &text)]),
         ))
@@ -296,6 +300,29 @@ async fn get_resume_history(
     Ok(state.storage.get_recent_resumes(limit.unwrap_or(50)))
 }
 
+/// 获取分页、搜索、筛选后的续跑记录
+#[tauri::command]
+async fn get_resume_page(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    query: Option<String>,
+    outcome: Option<String>,
+) -> Result<storage::ResumeRecordPage, String> {
+    Ok(state.storage.get_resume_page(
+        limit.unwrap_or(20),
+        offset.unwrap_or(0),
+        query.as_deref().unwrap_or(""),
+        outcome.as_deref().unwrap_or("all"),
+    ))
+}
+
+/// 获取统计总览
+#[tauri::command]
+async fn get_stats_overview(state: State<'_, AppState>) -> Result<storage::StatsOverview, String> {
+    Ok(state.storage.stats_overview())
+}
+
 /// 获取总体统计：(检测数, 续跑数, 成功续跑数)
 #[tauri::command]
 async fn get_totals(state: State<'_, AppState>) -> Result<(u32, u32, u32), String> {
@@ -323,6 +350,27 @@ async fn get_cost_projects(
         .project_costs(days.unwrap_or(30), limit.unwrap_or(8)))
 }
 
+/// 按模型汇总成本
+#[tauri::command]
+async fn get_cost_models(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+    limit: Option<u32>,
+) -> Result<Vec<storage::ModelCost>, String> {
+    Ok(state
+        .storage
+        .model_costs(days.unwrap_or(30), limit.unwrap_or(8)))
+}
+
+/// 区间用量摘要
+#[tauri::command]
+async fn get_usage_summary(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<cost::UsageSnapshot, String> {
+    Ok(state.storage.usage_summary(days.unwrap_or(30)))
+}
+
 /// 限流窗口预测
 #[tauri::command]
 async fn get_rate_forecast(state: State<'_, AppState>) -> Result<cost::RateLimitForecast, String> {
@@ -346,6 +394,21 @@ async fn get_session_history(
     Ok(state
         .storage
         .session_history(limit.unwrap_or(50), query.unwrap_or_default().trim()))
+}
+
+/// 获取分页会话历史
+#[tauri::command]
+async fn get_session_history_page(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    query: Option<String>,
+) -> Result<storage::SessionHistoryPage, String> {
+    Ok(state.storage.get_session_history_page(
+        limit.unwrap_or(20),
+        offset.unwrap_or(0),
+        query.as_deref().unwrap_or(""),
+    ))
 }
 
 /// 测试外部推送通道（Slack / Discord / ntfy / Bark）
@@ -427,7 +490,13 @@ impl MonitorEngine {
 fn build_tray_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let i18n = I18n::from_code(lang);
     let show = MenuItem::with_id(app, "show", i18n.t("tray.show"), true, None::<&str>)?;
-    let start = MenuItem::with_id(app, "start_monitor", i18n.t("tray.start"), true, None::<&str>)?;
+    let start = MenuItem::with_id(
+        app,
+        "start_monitor",
+        i18n.t("tray.start"),
+        true,
+        None::<&str>,
+    )?;
     let stop = MenuItem::with_id(app, "stop_monitor", i18n.t("tray.stop"), true, None::<&str>)?;
     let scan = MenuItem::with_id(app, "scan", i18n.t("tray.scan"), true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", i18n.t("tray.quit"), true, None::<&str>)?;
@@ -452,10 +521,7 @@ pub fn run() {
     // 配置管理器进 Arc：引擎和命令层共享同一份，改完下一轮扫描即生效
     let config_manager = Arc::new(ConfigManager::new());
     let storage = Arc::new(storage::Storage::new());
-    let engine = Arc::new(MonitorEngine::new(
-        config_manager.clone(),
-        storage.clone(),
-    ));
+    let engine = Arc::new(MonitorEngine::new(config_manager.clone(), storage.clone()));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -480,11 +546,16 @@ pub fn run() {
             get_platform_info,
             get_stats,
             get_resume_history,
+            get_resume_page,
+            get_stats_overview,
             get_totals,
             get_cost_daily,
             get_cost_projects,
+            get_cost_models,
+            get_usage_summary,
             get_rate_forecast,
             get_session_history,
+            get_session_history_page,
             test_webhook,
             ai_analyze,
             get_lan_ip,
@@ -500,10 +571,7 @@ pub fn run() {
             let notifier = Arc::new(Notifier::new(app.handle().clone()));
             engine.attach_notifier(notifier.clone());
 
-            let remote = Arc::new(RemoteService::new(
-                engine.clone(),
-                config_manager.clone(),
-            ));
+            let remote = Arc::new(RemoteService::new(engine.clone(), config_manager.clone()));
 
             app.manage(AppState {
                 engine: engine.clone(),

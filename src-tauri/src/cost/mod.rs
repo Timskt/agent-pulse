@@ -204,7 +204,10 @@ impl CostTracker {
     /// 增量扫描所有 Claude Code 会话日志，返回新增的用量记录与更新后的游标
     ///
     /// 只解析每个文件上次读取位置之后追加的字节；文件被截断（长度变小）时重置游标。
-    pub fn refresh(&self, overrides: &[ModelPriceOverride]) -> (Vec<UsageEntry>, Vec<(String, u64)>) {
+    pub fn refresh(
+        &self,
+        overrides: &[ModelPriceOverride],
+    ) -> (Vec<UsageEntry>, Vec<(String, u64)>) {
         *self.last_refresh.lock().unwrap() = Some(std::time::Instant::now());
 
         let files = claude_session_files();
@@ -329,8 +332,14 @@ fn parse_usage_line(
     let message = value.get("message")?;
     let usage = message.get("usage")?;
 
-    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let cache_write_tokens = usage
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
@@ -340,7 +349,8 @@ fn parse_usage_line(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    if input_tokens == 0 && output_tokens == 0 && cache_write_tokens == 0 && cache_read_tokens == 0 {
+    if input_tokens == 0 && output_tokens == 0 && cache_write_tokens == 0 && cache_read_tokens == 0
+    {
         return None;
     }
 
@@ -355,13 +365,19 @@ fn parse_usage_line(
         return None;
     }
 
-    let request_id = value.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
+    let request_id = value
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let message_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let dedup_key = if request_id.is_empty() && message_id.is_empty() {
         // 没有任何 ID 时退化为「文件 + 时间戳 + token 数」，仍能挡住重复解析
         format!(
             "{session_file}#{}#{input_tokens}/{output_tokens}",
-            value.get("timestamp").and_then(|v| v.as_str()).unwrap_or("")
+            value
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
         )
     } else {
         format!("{request_id}:{message_id}")
@@ -407,13 +423,11 @@ fn parse_usage_line(
 
 /// ISO8601（UTC）→ 本地 `%Y-%m-%d %H:%M:%S`
 fn to_local_timestamp(iso: &str) -> Option<String> {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .ok()
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
+    chrono::DateTime::parse_from_rfc3339(iso).ok().map(|dt| {
+        dt.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    })
 }
 
 /// 由已用量与窗口预算推算限流风险
@@ -462,8 +476,18 @@ mod tests {
 
     #[test]
     fn applies_sonnet5_intro_window() {
-        assert_eq!(price_for("claude-sonnet-5", "2026-07-30", &[]).unwrap().input, 2.0);
-        assert_eq!(price_for("claude-sonnet-5", "2026-09-01", &[]).unwrap().input, 3.0);
+        assert_eq!(
+            price_for("claude-sonnet-5", "2026-07-30", &[])
+                .unwrap()
+                .input,
+            2.0
+        );
+        assert_eq!(
+            price_for("claude-sonnet-5", "2026-09-01", &[])
+                .unwrap()
+                .input,
+            3.0
+        );
     }
 
     #[test]

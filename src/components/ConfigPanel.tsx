@@ -4,28 +4,25 @@ import { useNotice, type Notice } from "../lib/useNotice";
 import { cn } from "../lib/utils";
 import { selectConfig, useAppStore } from "../stores/useAppStore";
 import type {
-  AiJudgeConfig,
   AppConfig,
-  CostConfig,
   CustomAdapterConfig,
-  NotificationConfig,
   RemoteConfig,
   WebhookConfig,
   WebhookProvider,
 } from "../types";
+import { AiSection } from "./config/AiSection";
+import { ConfigNested as Nested, ConfigSection as Section } from "./config/ConfigSection";
+import { CostSection } from "./config/CostSection";
+import { NotifySection } from "./config/NotifySection";
 import {
   Badge,
   Button,
-  Card,
-  CardBody,
-  CardHeader,
   Chip,
   CommaListInput,
   EmptyState,
   Field,
   NumberInput,
   Select,
-  Slider,
   TextArea,
   TextInput,
   ToggleRow,
@@ -276,205 +273,6 @@ export function ConfigPanel() {
   );
 }
 
-/** 配置分区：卡片 + 标题 + 说明，全站一个样子 */
-function Section({
-  title,
-  desc,
-  children,
-}: {
-  title: React.ReactNode;
-  desc?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <Card>
-      <CardBody>
-        <CardHeader className="mb-4" title={title} desc={desc} />
-        {children}
-      </CardBody>
-    </Card>
-  );
-}
-
-/** 分区里的次级容器，用来放「开关打开后才出现」的一组字段 */
-function Nested({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="space-y-3 rounded-lg border border-neutral-100 bg-neutral-50/60 p-3">
-      {children}
-    </div>
-  );
-}
-/** 提醒（v1.1 感知层的开关都在这里） */
-function NotifySection({
-  config,
-  set,
-  onNotice,
-}: SectionProps & { onNotice: (notice: Notice) => void }) {
-  const { t } = useI18n();
-  const testNotify = useAppStore((s) => s.testNotify);
-  const n = config.notification;
-  const setN = (partial: Partial<NotificationConfig>) => set("notification", { ...n, ...partial });
-
-  // 逐条写死而不是拿字段名拼，是为了让 TS 真的检查这些字段存在
-  const events = [
-    {
-      label: t("cfg.notify_needs_input"),
-      on: n.on_needs_input,
-      toggle: () => setN({ on_needs_input: !n.on_needs_input }),
-    },
-    {
-      label: t("cfg.notify_completed"),
-      on: n.on_completed,
-      toggle: () => setN({ on_completed: !n.on_completed }),
-    },
-    {
-      label: t("cfg.notify_rate_limited"),
-      on: n.on_rate_limited,
-      toggle: () => setN({ on_rate_limited: !n.on_rate_limited }),
-    },
-    {
-      label: t("cfg.notify_error"),
-      on: n.on_error,
-      toggle: () => setN({ on_error: !n.on_error }),
-    },
-    {
-      label: t("cfg.notify_resumed"),
-      on: n.on_resumed,
-      toggle: () => setN({ on_resumed: !n.on_resumed }),
-    },
-  ];
-
-  return (
-    <Section title={t("cfg.notify")} desc={t("cfg.notify.desc")}>
-      <div className="space-y-3">
-        <ToggleRow
-          label={t("cfg.notify_enabled")}
-          desc={t("cfg.notify_enabled.desc")}
-          checked={n.enabled}
-          onCheckedChange={(v) => setN({ enabled: v })}
-        />
-        {n.enabled && (
-          <Nested>
-            <div className="flex flex-wrap gap-2">
-              {events.map((event) => (
-                <Chip key={event.label} active={event.on} onClick={event.toggle}>
-                  {event.label}
-                </Chip>
-              ))}
-            </div>
-            <ToggleRow
-              label={t("cfg.notify_sound")}
-              desc={t("cfg.notify_sound.desc")}
-              checked={n.sound_enabled}
-              onCheckedChange={(v) => setN({ sound_enabled: v })}
-            />
-            {n.sound_enabled && (
-              <Field label={t("cfg.notify_volume", { value: n.sound_volume })}>
-                <Slider
-                  value={n.sound_volume}
-                  min={0}
-                  max={100}
-                  onValueChange={(v) => setN({ sound_volume: v })}
-                />
-              </Field>
-            )}
-            <ToggleRow
-              label={t("cfg.notify_badge")}
-              desc={t("cfg.notify_badge.desc")}
-              checked={n.tray_badge}
-              onCheckedChange={(v) => setN({ tray_badge: v })}
-            />
-            <Field label={t("cfg.notify_throttle")}>
-              <NumberInput
-                value={n.throttle_secs}
-                min={0}
-                max={3600}
-                onValueChange={(v) => setN({ throttle_secs: v })}
-              />
-            </Field>
-            <Button
-              size="sm"
-              onClick={async () => {
-                const result = await testNotify();
-                if (result.message) onNotice(result);
-              }}
-            >
-              {t("cfg.notify_test")}
-            </Button>
-          </Nested>
-        )}
-      </div>
-    </Section>
-  );
-}
-/** 花费与预算（v1.2 洞察层） */
-function CostSection({ config, set }: SectionProps) {
-  const { t } = useI18n();
-  const c = config.cost;
-  const setC = (partial: Partial<CostConfig>) => set("cost", { ...c, ...partial });
-
-  return (
-    <Section title={t("cfg.cost")} desc={t("cfg.cost.desc")}>
-      <div className="space-y-3">
-        <ToggleRow
-          label={t("cfg.cost_enabled")}
-          desc={t("cfg.cost_enabled.desc")}
-          checked={c.enabled}
-          onCheckedChange={(v) => setC({ enabled: v })}
-        />
-        {c.enabled && (
-          <Nested>
-            <div className="grid grid-cols-2 gap-4">
-              <Field label={t("cfg.daily_budget")}>
-                <NumberInput
-                  value={c.daily_budget_usd}
-                  min={0}
-                  max={10_000}
-                  step={1}
-                  onValueChange={(v) => setC({ daily_budget_usd: v })}
-                />
-              </Field>
-              <Field label={t("cfg.session_budget")}>
-                <NumberInput
-                  value={c.session_budget_usd}
-                  min={0}
-                  max={1_000}
-                  step={0.5}
-                  onValueChange={(v) => setC({ session_budget_usd: v })}
-                />
-              </Field>
-              <Field label={t("cfg.alert_percent")}>
-                <NumberInput
-                  value={c.alert_at_percent}
-                  min={10}
-                  max={100}
-                  onValueChange={(v) => setC({ alert_at_percent: v })}
-                />
-              </Field>
-              <Field label={t("cfg.rate_window")}>
-                <NumberInput
-                  value={c.rate_limit_window_hours}
-                  min={1}
-                  max={24}
-                  onValueChange={(v) => setC({ rate_limit_window_hours: v })}
-                />
-              </Field>
-              <Field label={t("cfg.rate_budget")} className="col-span-2">
-                <NumberInput
-                  value={c.rate_limit_token_budget}
-                  min={0}
-                  step={100_000}
-                  onValueChange={(v) => setC({ rate_limit_token_budget: v })}
-                />
-              </Field>
-            </div>
-          </Nested>
-        )}
-      </div>
-    </Section>
-  );
-}
-
 /** 各渠道的地址示例。URL 不是文案，两种语言下都长这样，所以不进 i18n 表 */
 const WEBHOOK_URL_HINT: Record<WebhookProvider, string> = {
   slack: "https://hooks.slack.com/services/…",
@@ -585,61 +383,6 @@ function WebhookSection({
             >
               {t("cfg.webhook_test")}
             </Button>
-          </Nested>
-        )}
-      </div>
-    </Section>
-  );
-}
-/** AI 辅助判断：关键词判不准时才调一次模型 */
-function AiSection({ config, set }: SectionProps) {
-  const { t } = useI18n();
-  const ai = config.ai_judge;
-  const setAi = (partial: Partial<AiJudgeConfig>) => set("ai_judge", { ...ai, ...partial });
-
-  return (
-    <Section title={t("cfg.ai")} desc={t("cfg.ai.desc")}>
-      <div className="space-y-3">
-        <ToggleRow
-          label={t("cfg.ai_enabled")}
-          desc={t("cfg.ai_enabled.desc")}
-          checked={ai.enabled}
-          onCheckedChange={(v) => setAi({ enabled: v })}
-        />
-        {ai.enabled && (
-          <Nested>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Field label={t("cfg.ai_endpoint")}>
-                <TextInput
-                  value={ai.api_url}
-                  onChange={(e) => setAi({ api_url: e.target.value })}
-                />
-              </Field>
-              <Field label={t("cfg.ai_model")}>
-                <TextInput value={ai.model} onChange={(e) => setAi({ model: e.target.value })} />
-              </Field>
-            </div>
-            {/* 密钥用 password 输入框，截图和录屏时不至于直接漏出去 */}
-            <Field label={t("cfg.ai_key")}>
-              <TextInput
-                type="password"
-                autoComplete="off"
-                value={ai.api_key}
-                placeholder="sk-…"
-                onChange={(e) => setAi({ api_key: e.target.value })}
-              />
-            </Field>
-            <Field
-              label={t("cfg.ai_confidence", { value: ai.confidence_threshold })}
-              hint={t("cfg.ai_confidence.hint")}
-            >
-              <Slider
-                value={ai.confidence_threshold}
-                min={50}
-                max={99}
-                onValueChange={(v) => setAi({ confidence_threshold: v })}
-              />
-            </Field>
           </Nested>
         )}
       </div>

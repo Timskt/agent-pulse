@@ -86,6 +86,18 @@ const TABLE: &[(&str, &str, &str)] = &[
         "[{agent}] {count} nudges in a row with no movement — standing down; this one needs you",
     ),
     ("log.suspicious", "疑似中断，继续观察", "Possibly interrupted — keeping watch"),
+    (
+        "log.arbitration_answered",
+        "[{agent}] AI 第二意见：{verdict}",
+        "[{agent}] AI second opinion: {verdict}",
+    ),
+    (
+        "log.arbitration_failed",
+        "[{agent}] AI 第二意见没拿到，维持原判：{detail}",
+        "[{agent}] AI second opinion unavailable; keeping the original ruling: {detail}",
+    ),
+    ("arbitration.finished", "这一轮已完成", "this turn is finished"),
+    ("arbitration.unfinished", "这一轮还没完成", "this turn is unfinished"),
     ("log.resume_sent", "已触发续跑（{mode}，第 {count} 次）：{detail}", "Resume sent ({mode}, attempt {count}): {detail}"),
     ("log.resume_failed", "续跑失败：{detail}", "Resume failed: {detail}"),
     ("log.resume_manual", "手动续跑：{detail}", "Manual resume: {detail}"),
@@ -388,6 +400,55 @@ const TABLE: &[(&str, &str, &str)] = &[
         "attention.detail.silent",
         "会话长时间没有输出，疑似卡住了",
         "The session has been silent for a long time — it may be stuck",
+    ),
+    // ── 中断原因（进日志，也进通知的「为什么」一行）──
+    //
+    // 这些句子直接对应 `InterruptReason`，措辞的落点是「接下来会发生什么」，
+    // 而不是内部枚举名——用户关心的是「它会自己好，还是要我去看一眼」。
+    ("reason.none", "没有中断", "Not interrupted"),
+    (
+        "reason.process_crashed",
+        "进程已经不在了",
+        "The process is gone",
+    ),
+    (
+        "reason.rate_limited",
+        "撞上限流，等窗口过去就会自己恢复",
+        "Rate limited — it will recover once the window passes",
+    ),
+    (
+        "reason.awaiting_input",
+        "它在问你一个具体的问题",
+        "It is asking you a specific question",
+    ),
+    (
+        "reason.runtime_error",
+        "运行时报了故障",
+        "The runtime reported a failure",
+    ),
+    (
+        "reason.stalled",
+        "活儿没干完就自己停了",
+        "It stopped with the work unfinished",
+    ),
+    (
+        "reason.unknown",
+        "确实停了，但说不出为什么",
+        "It has stopped, but the reason is unclear",
+    ),
+    // ── 按原因分派手段之后，闸门要说清楚「为什么这次不敲字」──
+    //
+    // 这两条是新增的「不动手」路径。上一版只有「动手」和「冷却中」两种说法，
+    // 于是不该敲字的场合只能靠不敲来表达，用户在日志里什么也看不到。
+    (
+        "log.resume_hand_off",
+        "{agent}：{reason}，敲「继续」帮不上忙，交给你处理",
+        "{agent}: {reason} — typing \"continue\" won't help, handing it to you",
+    ),
+    (
+        "log.resume_wait",
+        "{agent}：{reason}，这次不催，等它自己恢复",
+        "{agent}: {reason} — not nudging, waiting for it to recover",
     ),
 ];
 

@@ -8,7 +8,13 @@
 
 import type { BadgeTone } from "../components/ui";
 import type { I18nKey } from "../i18n";
-import type { AttentionLevel, LogLevel, SessionStatus } from "../types";
+import type {
+  AttentionLevel,
+  InterruptReason,
+  LogLevel,
+  ResumeTactic,
+  SessionStatus,
+} from "../types";
 
 export const STATUS_TONE: Record<SessionStatus, BadgeTone> = {
   active: "green",
@@ -55,6 +61,27 @@ export const ATTENTION_ICON: Record<Exclude<AttentionLevel, "none">, string> = {
 export function attentionKey(level: Exclude<AttentionLevel, "none">): I18nKey {
   return `attention.${level}`;
 }
+
+export function reasonKey(reason: Exclude<InterruptReason, "none">): I18nKey {
+  return `reason.${reason}`;
+}
+
+/**
+ * 「这次故意没敲字」该怎么说
+ *
+ * 注意这里查的是**手段**，不是原因。第一版写的是一份原因名单
+ * （`process_crashed` / `rate_limited` / `awaiting_input`），照着 Rust 的
+ * `tactic()` 抄的——那就是同一条策略存了两份：下次加一个原因，
+ * 两边的类型都还是通的，界面却会凭空多出一句「这次没帮你按继续」，
+ * 或者更糟，该说的时候不说。
+ *
+ * 现在手段由后端算好一起发上来（`session.resume_tactic`），界面只负责画。
+ * `nudge` 不在表里是因为那是默认动作，没什么可解释的。
+ */
+export const TACTIC_NOTE: Record<Exclude<ResumeTactic, "nudge">, I18nKey> = {
+  wait: "tactic.wait",
+  hand_off: "tactic.hand_off",
+};
 
 /** 日志级别的文字颜色 */
 export const LOG_TONE: Record<LogLevel, string> = {

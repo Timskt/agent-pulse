@@ -106,8 +106,14 @@ impl WebhookNotifier {
         if !self.config.enabled || !self.config.notify_on_interrupt {
             return;
         }
-        self.push("push.verdict_interrupt", agent_name, session_id, message, true)
-            .await;
+        self.push(
+            "push.verdict_interrupt",
+            agent_name,
+            session_id,
+            message,
+            true,
+        )
+        .await;
     }
 
     /// 续跑推送
@@ -115,8 +121,14 @@ impl WebhookNotifier {
         if !self.config.enabled || !self.config.notify_on_resume {
             return;
         }
-        self.push("push.verdict_resume", agent_name, session_id, message, false)
-            .await;
+        self.push(
+            "push.verdict_resume",
+            agent_name,
+            session_id,
+            message,
+            false,
+        )
+        .await;
     }
 
     /// 完成推送
@@ -125,8 +137,14 @@ impl WebhookNotifier {
             return;
         }
         let body = self.i18n.t("push.complete_body").to_string();
-        self.push("push.verdict_complete", agent_name, session_id, &body, false)
-            .await;
+        self.push(
+            "push.verdict_complete",
+            agent_name,
+            session_id,
+            &body,
+            false,
+        )
+        .await;
     }
 
     async fn push(
@@ -238,17 +256,18 @@ impl WebhookNotifier {
                 .body(body),
         };
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| self.i18n.tf("err.push_request", &[("detail", &e.to_string())]))?;
+        let response = request.send().await.map_err(|e| {
+            self.i18n
+                .tf("err.push_request", &[("detail", &e.to_string())])
+        })?;
         let status = response.status();
         if status.is_success() {
             Ok(status.as_u16())
         } else {
-            Err(self
-                .i18n
-                .tf("err.push_status", &[("status", &status.as_u16().to_string())]))
+            Err(self.i18n.tf(
+                "err.push_status",
+                &[("status", &status.as_u16().to_string())],
+            ))
         }
     }
 
@@ -330,8 +349,10 @@ mod tests {
 
     #[test]
     fn bark_key_uses_the_push_endpoint() {
-        let notifier =
-            WebhookNotifier::new(config("bark", "https://api.day.app/AbCd123", "AbCd123"), Lang::Zh);
+        let notifier = WebhookNotifier::new(
+            config("bark", "https://api.day.app/AbCd123", "AbCd123"),
+            Lang::Zh,
+        );
         let (url, payload) = notifier.build("标题", "正文", false).expect("应当可发送");
         // 地址里已经带了 Key 也不该拼成 /AbCd123/push
         assert_eq!(url, "https://api.day.app/push");

@@ -56,12 +56,7 @@ impl AgentAdapter for CodexAdapter {
         let sessions_dir = home.join(".codex").join("sessions");
         if sessions_dir.exists() {
             std::fs::read_dir(sessions_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.path())
-                        .collect()
-                })
+                .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
                 .unwrap_or_default()
         } else {
             vec![]

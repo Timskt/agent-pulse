@@ -117,6 +117,25 @@ pub struct AgentSession {
     /// 触发该注意力级别的依据
     #[serde(default)]
     pub attention_detail: Option<String>,
+    /// 检测侧结构性证据；只供界面解释判定，不参与动作层重算
+    #[serde(default)]
+    pub detection_evidence: Option<crate::detector::DetectionEvidence>,
+    /// 它为什么停下来（v1.6）
+    ///
+    /// 跟 `attention` 放在一起是因为两者是同一件事的两面：级别说「要不要叫人」，
+    /// 原因说「叫来了能干什么」。界面上必须能看出后者——应用有三种情况会
+    /// **故意不催**（进程没了、撞限流、它在问一个具体问题），如果界面上只写着
+    /// 「已中断」，用户看到的就是守护神漏了一次，而不是它做了一个正确的决定。
+    #[serde(default)]
+    pub interrupt_reason: crate::detector::InterruptReason,
+    /// 针对上面那个原因，这一轮打算怎么办（v1.6）
+    ///
+    /// 由判定层算好再发上来，**不让界面照着原因表再推一遍**。原因和手段之间
+    /// 不是一一对应的显然关系（`RuntimeError` 要敲、`RateLimited` 不敲），
+    /// 前端抄一份判断就等于同一条策略存了两份，下次加原因时漏改一处
+    /// 编译器一句话都不会说，用户看到的却是「该说的时候没说」。
+    #[serde(default)]
+    pub resume_tactic: crate::detector::ResumeTactic,
     /// 所在终端的 TTY（如 `/dev/ttys003`）
     ///
     /// 痛点 #2「多会话混乱」的关键：同一个目录下开两个 Claude Code 时，
@@ -150,6 +169,9 @@ impl Default for AgentSession {
             resume_failures: 0,
             attention: crate::detector::AttentionLevel::None,
             attention_detail: None,
+            detection_evidence: None,
+            interrupt_reason: crate::detector::InterruptReason::None,
+            resume_tactic: crate::detector::ResumeTactic::Nudge,
             tty: None,
             terminal_app: None,
             usage: None,
@@ -203,7 +225,8 @@ impl std::fmt::Display for SessionStatus {
 ///
 /// 回合有没有收尾是结构上看得见的：工具调用发出去还没等到结果、
 /// 或者最后一条是真人刚敲的提示词，都说明 agent 这会儿正忙。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnState {
     /// 认不出来（记录里没有可判断的结构，或适配器不支持）
     #[default]

@@ -27,6 +27,17 @@ pub struct DetectionResult {
     pub attention: AttentionLevel,
     /// 触发该注意力级别的具体依据（用于通知正文）
     pub attention_detail: Option<String>,
+    /// 检测侧的结构性证据快照；前端只展示，不重新参与判定
+    pub evidence: DetectionEvidence,
+    /// 它为什么停下来 —— 决定该用什么手段（见 [`InterruptReason::tactic`]）
+    pub interrupt_reason: InterruptReason,
+    /// 结构性证据到这儿就用尽了：去问一句 [`Arbitration`] 有可能改变结论
+    ///
+    /// 由判定层置位，动作层照着做——**不在动作层重新推一遍「哪里算用尽」**。
+    /// 只在「答案真的能改变结果」的地方为真：已经在动手的会话不问，
+    /// 因为仲裁没有权力叫停，问了也只是花钱。
+    #[serde(default)]
+    pub wants_second_opinion: bool,
     /// 检测时间
     pub detected_at: String,
 }
@@ -90,6 +101,21 @@ pub struct DetectionSignal {
     pub description: String,
 }
 
+/// 给人看的判定证据快照
+///
+/// 这里存**事实**，不存解释后的策略：进程是否活着、记录结构是什么、命中了什么。
+/// UI 可以把它摊开回答「为什么是这个结论」，但不能拿它再推一次 verdict。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionEvidence {
+    pub process_alive: bool,
+    pub turn_state: TurnState,
+    pub busy_grace_multiplier: u64,
+    pub signal_kinds: Vec<SignalKind>,
+    pub matched_interrupt_keyword: Option<String>,
+    pub matched_completion_marker: Option<String>,
+    pub second_opinion: Option<Arbitration>,
+}
+
 /// 信号类型
 ///
 /// 这里曾经有一个 `ProcessIdle`（"CPU 无活动"），从来没有任何代码构造过它，
@@ -123,6 +149,158 @@ pub enum Verdict {
     TaskCompleted,
 }
 
+/// 它为什么停下来
+///
+/// 加这个枚举是为了修一处**动作层的错**：在此之前，判定层只能说出
+/// 「确认中断」这一句话，于是所有停顿共用同一个手段——往终端里敲一句「继续」。
+/// 可「进程已经死了」和「活没干完自己停了」需要的不是同一件事：
+/// 对着一个死掉的进程敲字，字会落到它身后的 shell 里，
+/// 我们却把这次投递记成「催过了」。
+///
+/// 分类的判据全部来自本轮已经采到的证据，**没有新增任何探测手段**：
+/// 进程存活位、记录里标成故障的行、散文里的问句、回合结构。
+/// 刻意没有的两个分类：
+/// - `ContextExhausted`（上下文用尽）—— 现在没有任何证据源能认出它，
+///   加一个永远构造不出来的分支，就是重犯 `SignalKind::ProcessIdle` 那个错。
+/// - `NetworkError` 单列 —— 判据只有 `error_keywords`，而连接错误和
+///   500 混在同一张表里分不开；就算分开了，两者的下一步动作也一样。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptReason {
+    /// 没有中断，或者判定还没到「确认」那一档
+    #[default]
+    None,
+    /// 进程没了
+    ProcessCrashed,
+    /// 撞上限流，会自己恢复
+    RateLimited,
+    /// 它在问一个具体的问题（要授权、要选 y/n）
+    AwaitingInput,
+    /// 运行时把某一行标成了故障
+    RuntimeError,
+    /// 回合收尾了、记录也不动了、又没有完成标记 —— 活没干完自己停了
+    Stalled,
+    /// 停是真的，但说不出为什么
+    Unknown,
+}
+
+/// 知道原因之后该拿它怎么办
+///
+/// 这个枚举**要发到前端**，而不是让界面照着 `tactic()` 的分支再抄一份名单。
+/// 抄一份的代价很具体：下次加一个原因，界面上要么凭空多出一句
+/// 「这次故意没帮你按继续」，要么该说的时候不说，而且两处都编译通过。
+/// 手段只有一个出处——判定层说了算，界面只负责把它画出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeTactic {
+    /// 敲字：这一类停顿就是「少一句继续」
+    ///
+    /// 默认值故意选它而不是「什么都不做」：这个产品存在的理由就是
+    /// 「它停了就替我按一下继续」，缺省到不作为等于默认把功能关掉。
+    #[default]
+    Nudge,
+    /// 等着：它会自己恢复，敲字只会在同一个限流窗口里再撞一次
+    Wait,
+    /// 交回人手上：敲字帮不上忙，甚至会帮倒忙
+    HandOff,
+}
+
+/// 第二意见：结构性证据用尽时，去问一个模型「这一轮活干完了没有」
+///
+/// 只有两个取值，而且**只有两个**——这是这条设计的全部价值。问出去的是一道
+/// 是非题，回来的必须是一个可判定的信号，而不是一段还要再解析的散文。
+/// 旁边那个 [`crate::ai_judge::AiJudge::analyze`] 就是散文版：它让模型回一段
+/// JSON，解析失败时只能靠 `contains("true")` 猜——同一份记录这轮说中断、
+/// 下轮说没中断，而且没人看得出它是猜的。
+///
+/// # 权限是单向的
+///
+/// 仲裁**只能把「不敢下结论」变成「下结论」，不能反过来**。理由是两边的代价
+/// 不对称：多敲一句「继续」最坏是浪费一次对话，而少敲一句就是用户又得自己
+/// 去发一遍——那正是这个产品存在的理由。所以：
+///
+/// - 拿不到答案（没开、没配、网络不通、回了别的字）一律当没问过，
+///   判定退回今天的样子。**缺一个第二意见，永远不改变任何结论。**
+/// - 拿到 `Finished` 也不会去撤销任何已经成立的判定。
+///
+/// [`Arbitration::Finished`] 的用处只有一个：记住这段记录已经问过了，
+/// 别每轮再问一次。它不参与任何决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Arbitration {
+    /// 活干完了 —— 只用来记「问过了」，不做决定
+    Finished,
+    /// 活没干完 —— 就是「它其实没干完，每次都要我去发继续」那一类
+    Unfinished,
+}
+
+/// 一次判定的产出
+///
+/// 比单独一个 [`Verdict`] 多一句话：**结构性证据是不是到这儿就用尽了**。
+/// 这一位由判定层给，而不是让调用方照着信号列表自己推——「哪里算证据用尽」
+/// 跟「怎么下结论」是同一条逻辑的两面，分给两个地方写，下次改判定条件时
+/// 就会有一处漏改，而且两边都编译通过。
+struct Ruling {
+    verdict: Verdict,
+    /// 再问一句有可能改变上面那个结论
+    wants_second_opinion: bool,
+}
+
+impl InterruptReason {
+    /// 稳定字符串键（落库、前端映射、日志去重都用它）
+    pub fn key(&self) -> &'static str {
+        match self {
+            InterruptReason::None => "none",
+            InterruptReason::ProcessCrashed => "process_crashed",
+            InterruptReason::RateLimited => "rate_limited",
+            InterruptReason::AwaitingInput => "awaiting_input",
+            InterruptReason::RuntimeError => "runtime_error",
+            InterruptReason::Stalled => "stalled",
+            InterruptReason::Unknown => "unknown",
+        }
+    }
+
+    /// i18n 表里的键；原因要出现在日志和通知里，不能硬编码中文
+    pub fn i18n_key(&self) -> &'static str {
+        match self {
+            InterruptReason::None => "reason.none",
+            InterruptReason::ProcessCrashed => "reason.process_crashed",
+            InterruptReason::RateLimited => "reason.rate_limited",
+            InterruptReason::AwaitingInput => "reason.awaiting_input",
+            InterruptReason::RuntimeError => "reason.runtime_error",
+            InterruptReason::Stalled => "reason.stalled",
+            InterruptReason::Unknown => "reason.unknown",
+        }
+    }
+
+    /// 这个原因该配什么手段
+    ///
+    /// 只有三个原因**不**敲字，每一个都有具体的坏处可说：
+    ///
+    /// - `ProcessCrashed`：进程没了，那个终端里现在是 shell。敲进去的
+    ///   「继续」会变成一条命令，而我们还会把它记成一次成功的续跑。
+    /// - `RateLimited`：限流会自己过去。这时候敲字既不能让它提前恢复，
+    ///   又会在冷却里白烧一次额度——真正该做的是把这条知会给人，然后等。
+    /// - `AwaitingInput`：它在问一个具体的问题。「继续」不是那个问题的答案；
+    ///   往一个 `(y/n)` 提示里敲回车，等于替用户批准了一件他没看过的事。
+    ///   **这是权限边界问题，不只是效果问题。**
+    ///
+    /// 其余一律 `Nudge`，包括 `Unknown`——说不清为什么停，但「停了就催一下」
+    /// 本来就是这个产品的默认动作，不该因为分不出原因就变成不作为。
+    /// 尤其 `Stalled` 必须敲：那正是「它其实没有干完活，每次都要我去发继续」。
+    pub fn tactic(&self) -> ResumeTactic {
+        match self {
+            InterruptReason::ProcessCrashed => ResumeTactic::HandOff,
+            InterruptReason::AwaitingInput => ResumeTactic::HandOff,
+            InterruptReason::RateLimited => ResumeTactic::Wait,
+            InterruptReason::RuntimeError
+            | InterruptReason::Stalled
+            | InterruptReason::Unknown
+            | InterruptReason::None => ResumeTactic::Nudge,
+        }
+    }
+}
+
 /// 回合还没收尾时，把「多久算卡住」的阈值放大多少倍
 ///
 /// 压缩上下文、跑一条几分钟的构建、拉一个大仓库，记录文件都不会落盘。
@@ -143,6 +321,10 @@ pub struct Detector {
 /// 而且有两个 `Option<&str>`、两个 `bool`，散着传特别容易在调用点串位——
 /// 把 `recent_output` 和 `error_output` 传反了编译器一句话都不会说，
 /// 但散文就会重新变成报错的证据。
+///
+/// `Copy` 是为了让同一份证据能同时喂给 [`Detector::grade_attention`] 和
+/// [`Detector::classify_reason`]：两者看的是同一轮扫描，凑第二份必然走偏。
+#[derive(Clone, Copy)]
 struct AttentionInput<'a> {
     /// 记录尾部的散文（agent 说的话）
     recent_output: Option<&'a str>,
@@ -153,6 +335,12 @@ struct AttentionInput<'a> {
     process_alive: bool,
     verdict: &'a Verdict,
     turn_state: TurnState,
+    /// 上一轮问来的第二意见；`None` = 没问过，或者拿不到答案
+    ///
+    /// 放进这个包里而不是单独传，是为了让分级和定因看到的是**同一份**证据：
+    /// 只有一处知道「模型说活没干完」，界面上就不会出现分级说不清、
+    /// 原因却说得出来这种自相矛盾的组合。
+    second_opinion: Option<Arbitration>,
 }
 
 /// ASCII 单词字符（判断词边界用；多字节字符一律算边界）
@@ -220,6 +408,11 @@ impl Detector {
     /// `error_output` 只包含记录里明确标成故障的行（见
     /// [`AgentAdapter::error_output`](crate::adapters::AgentAdapter::error_output)）：
     /// 「出错 / 限流」两级只看它，散文里提到 500 不算出错。
+    ///
+    /// `second_opinion` 是**上一轮**问来的答案（见 [`Arbitration`]）：这一层是纯的，
+    /// 不会自己去发网络请求。判定要用第二意见时先把 `wants_second_opinion` 立起来，
+    /// 由动作层去问、把答案缓存住，下一轮再喂回来。多等一个轮询周期，
+    /// 换来的是这条流水线仍然是同步、可测、网络再慢也拖不住的。
     pub fn detect(
         &self,
         session: &AgentSession,
@@ -227,11 +420,13 @@ impl Detector {
         error_output: Option<&str>,
         process_alive: bool,
         turn_state: TurnState,
+        second_opinion: Option<Arbitration>,
     ) -> DetectionResult {
         let now = Local::now();
         let mut signals = Vec::new();
         let mut has_completion_marker = false;
         let mut matched_marker: Option<String> = None;
+        let mut matched_interrupt_keyword: Option<String> = None;
         let mut has_active_goal = false;
 
         // 回合没收尾时把「不动」的容忍度放宽：压缩上下文、跑几分钟的构建、
@@ -246,9 +441,10 @@ impl Detector {
         if !process_alive {
             signals.push(DetectionSignal {
                 kind: SignalKind::ProcessExited,
-                description: self
-                    .i18n
-                    .tf("signal.process_exited", &[("pid", &session.pid.to_string())]),
+                description: self.i18n.tf(
+                    "signal.process_exited",
+                    &[("pid", &session.pid.to_string())],
+                ),
             });
         }
 
@@ -286,6 +482,7 @@ impl Detector {
             if !has_completion_marker {
                 let lower = output.to_lowercase();
                 if let Some(keyword) = first_match(&lower, &self.config.custom_keywords) {
+                    matched_interrupt_keyword = Some(keyword.clone());
                     signals.push(DetectionSignal {
                         kind: SignalKind::KeywordMatch,
                         description: self
@@ -328,31 +525,120 @@ impl Detector {
         }
 
         // 综合判定
-        let verdict =
-            self.make_verdict(process_alive, &signals, has_completion_marker, session, turn_state);
+        let Ruling {
+            verdict,
+            wants_second_opinion,
+        } = self.make_verdict(
+            process_alive,
+            &signals,
+            has_completion_marker,
+            session,
+            turn_state,
+            second_opinion,
+        );
 
         // 注意力分级（与续跑判定正交）
-        let (attention, attention_detail) = self.grade_attention(AttentionInput {
+        let evidence = AttentionInput {
             recent_output,
             error_output,
             completion_marker: matched_marker.as_deref(),
             process_alive,
             verdict: &verdict,
             turn_state,
-        });
+            second_opinion,
+        };
+        let (attention, attention_detail) = self.grade_attention(evidence);
+        let interrupt_reason = self.classify_reason(evidence);
+        let signal_kinds = signals.iter().map(|signal| signal.kind.clone()).collect();
 
         DetectionResult {
             session_id: session.id.clone(),
             interrupted: verdict == Verdict::ConfirmInterrupt,
             signals,
             has_completion_marker,
-            matched_marker,
+            matched_marker: matched_marker.clone(),
             has_active_goal,
             verdict,
             attention,
             attention_detail,
+            evidence: DetectionEvidence {
+                process_alive,
+                turn_state,
+                busy_grace_multiplier: stale_grace,
+                signal_kinds,
+                matched_interrupt_keyword,
+                matched_completion_marker: matched_marker.clone(),
+                second_opinion,
+            },
+            interrupt_reason,
+            wants_second_opinion,
             detected_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         }
+    }
+
+    /// 它为什么停下来 —— 只在判定为「确认中断」时才有意义
+    ///
+    /// 与 [`Self::grade_attention`] 用同一份证据，但**顺序不同，而且必须不同**。
+    /// 分级把「记录里标成故障的行」排在「进程没了」前面，那是对的：两者都是
+    /// ⚫出错，谁先命中都不影响颜色。可原因这里反过来——一个崩掉的进程往往
+    /// 正好留下最后一行错误，照分级的顺序走就会被认成 `RuntimeError`，
+    /// 于是又开始往一个死进程里敲字。**进程存活位是事实，散文和日志行是线索，
+    /// 事实优先。**
+    ///
+    /// 判定不到「确认中断」就一律 `None`：这个字段是给动作层用的，
+    /// 而动作层只在确认时才动手。给一个还在正常跑的会话贴上原因标签，
+    /// 只会让日志里出现「原因：说不清」这种没有信息量的噪音。
+    fn classify_reason(&self, input: AttentionInput<'_>) -> InterruptReason {
+        let AttentionInput {
+            recent_output,
+            error_output,
+            completion_marker,
+            process_alive,
+            verdict,
+            turn_state,
+            second_opinion,
+        } = input;
+
+        if completion_marker.is_some() || *verdict != Verdict::ConfirmInterrupt {
+            return InterruptReason::None;
+        }
+
+        // 事实优先：进程没了就是没了，哪怕它临死前还留了一行错误
+        if !process_alive {
+            return InterruptReason::ProcessCrashed;
+        }
+
+        if let Some(errors) = error_output {
+            let lower = errors.to_lowercase();
+            // 限流排在故障前面：限流行本身常被运行时标成故障，
+            // 而两者的手段相反（等 vs 敲），认错了就会在限流窗口里白撞一次。
+            if first_match(&lower, &self.config.rate_limit_keywords).is_some() {
+                return InterruptReason::RateLimited;
+            }
+            return InterruptReason::RuntimeError;
+        }
+
+        if let Some(output) = recent_output {
+            let lower = output.to_lowercase();
+            if first_match(&lower, &self.config.input_keywords).is_some() {
+                return InterruptReason::AwaitingInput;
+            }
+        }
+
+        // 回合结构说「这一轮已经收尾」，记录却还是不动，又没有完成标记：
+        // 活没干完自己停了，这才是该敲一句「继续」的那一类。
+        //
+        // 第二个条件走的是另一条路到同一个结论：读不出回合结构的适配器
+        // （Codex / OpenCode 这类不落盘的）只能一路落到「说不出为什么」，
+        // 而这恰好是那道问题问出来的东西——模型说的就是「活没干完」。
+        // 注意它只会把 `Unknown` 换成 `Stalled`，上面每一条都比它先走，
+        // 事实和日志行永远排在一个模型的意见前面。
+        if turn_state == TurnState::AwaitingUser || second_opinion == Some(Arbitration::Unfinished)
+        {
+            return InterruptReason::Stalled;
+        }
+
+        InterruptReason::Unknown
     }
 
     /// 注意力分级：决定「要不要现在叫人 + 用什么颜色叫」
@@ -377,6 +663,7 @@ impl Detector {
             process_alive,
             verdict,
             turn_state,
+            second_opinion,
         } = input;
 
         if let Some(marker) = completion_marker {
@@ -394,13 +681,19 @@ impl Detector {
             if let Some(kw) = first_match(&lower, &self.config.error_keywords) {
                 return (
                     AttentionLevel::Error,
-                    Some(self.i18n.tf("attention.detail.keyword", &[("keyword", &kw)])),
+                    Some(
+                        self.i18n
+                            .tf("attention.detail.keyword", &[("keyword", &kw)]),
+                    ),
                 );
             }
             if let Some(kw) = first_match(&lower, &self.config.rate_limit_keywords) {
                 return (
                     AttentionLevel::RateLimited,
-                    Some(self.i18n.tf("attention.detail.keyword", &[("keyword", &kw)])),
+                    Some(
+                        self.i18n
+                            .tf("attention.detail.keyword", &[("keyword", &kw)]),
+                    ),
                 );
             }
             // 标成故障但一条关键词都没对上：仍然是故障，别把它咽下去
@@ -436,12 +729,19 @@ impl Detector {
         if *verdict == Verdict::ConfirmInterrupt {
             // 回合收尾了却还是被判成中断，说明是「活没干完自己停了」——
             // 这正是用户每次得手动去发「继续」的那种情况，措辞要说清楚。
-            let key = if turn_state == TurnState::AwaitingUser {
+            // 问过一句并且得到「活没干完」时，走的是同一句措辞——那句话
+            // 本来就是这个意思，没必要为「模型说的」再造一个说法。
+            let key = if turn_state == TurnState::AwaitingUser
+                || second_opinion == Some(Arbitration::Unfinished)
+            {
                 "attention.detail.stalled"
             } else {
                 "attention.detail.silent"
             };
-            return (AttentionLevel::NeedsInput, Some(self.i18n.t(key).to_string()));
+            return (
+                AttentionLevel::NeedsInput,
+                Some(self.i18n.t(key).to_string()),
+            );
         }
 
         (AttentionLevel::None, None)
@@ -483,20 +783,27 @@ impl Detector {
         has_completion_marker: bool,
         session: &AgentSession,
         turn_state: TurnState,
-    ) -> Verdict {
+        second_opinion: Option<Arbitration>,
+    ) -> Ruling {
+        // 除了下面唯一那一处，所有出口都不需要第二意见
+        let settled = |verdict| Ruling {
+            verdict,
+            wants_second_opinion: false,
+        };
+
         // 已完成 → 不续跑
         if has_completion_marker {
-            return Verdict::TaskCompleted;
+            return settled(Verdict::TaskCompleted);
         }
 
         // 会话已标记完成或退出
         if session.status == SessionStatus::Completed || session.status == SessionStatus::Exited {
-            return Verdict::Running;
+            return settled(Verdict::Running);
         }
 
         // 进程已退出且无完成标记 → 确认中断
         if !process_alive {
-            return Verdict::ConfirmInterrupt;
+            return settled(Verdict::ConfirmInterrupt);
         }
 
         // 这里**故意不看续跑额度**。
@@ -515,12 +822,9 @@ impl Detector {
         // 判定层只管说实话。
 
         // 记录文件停更（这两个信号同源，取其一即可）
-        let transcript_idle = signals.iter().any(|s| {
-            matches!(
-                s.kind,
-                SignalKind::FileStale | SignalKind::HeartbeatTimeout
-            )
-        });
+        let transcript_idle = signals
+            .iter()
+            .any(|s| matches!(s.kind, SignalKind::FileStale | SignalKind::HeartbeatTimeout));
         let keyword_hit = signals
             .iter()
             .any(|s| matches!(s.kind, SignalKind::KeywordMatch));
@@ -528,27 +832,47 @@ impl Detector {
         // 正在干活 → 什么都不做。这时的停更是压缩上下文或长命令造成的，
         // 阈值本身已经放宽到 BUSY_GRACE_MULTIPLIER 倍；仍然超时说明真的可疑，
         // 但也只到「继续观察」，不至于动手。
+        //
+        // 这一处的「可疑」**故意不去问第二意见**。回合结构说它正在跑一个工具
+        // 调用，那是事实，不是猜测；拿一个模型的意见去盖掉它，等于把
+        // `long_compaction_pause_is_not_a_stall` 钉住的那件事重新放开——
+        // 压缩上下文的会话又会被当成卡住，然后被敲一句「继续」。
         if turn_state.is_busy() {
-            return if transcript_idle {
+            return settled(if transcript_idle {
                 Verdict::Suspicious
             } else {
                 Verdict::Running
-            };
+            });
         }
 
         match (turn_state, transcript_idle) {
             // 回合收尾 + 记录停更 + 没有完成标记 → 它确实停在那儿等人了
-            (TurnState::AwaitingUser, true) => Verdict::ConfirmInterrupt,
+            (TurnState::AwaitingUser, true) => settled(Verdict::ConfirmInterrupt),
             // 刚收尾还没到阈值：正常的一问一答间隙，别催
-            (TurnState::AwaitingUser, false) => Verdict::Running,
+            (TurnState::AwaitingUser, false) => settled(Verdict::Running),
             // 读不出回合结构（Codex / OpenCode 这类不落盘的）：沿用超时兜底
-            (_, true) => Verdict::ConfirmInterrupt,
+            (_, true) => settled(Verdict::ConfirmInterrupt),
             // 没有停更信号时，光靠关键词只能到「可疑」
+            //
+            // **这是整个判定里唯一一处「结构性证据用尽」。** 关键词是弱证据：
+            // 记录还在长（所以它没停更），可里面又确实出现了一句像在等人的话。
+            // 单看这两样谁都不够，于是今天的结果是「可疑」——不动手、也不出声，
+            // 一直挂到记录真的停更为止。那段等待就是用户自己去发「继续」的窗口。
+            //
+            // 所以第二意见只加在这儿：拿到「活没干完」就把这一票凑上去，
+            // 提前几分钟动手；拿不到就一个字不改，退回上面那段等待。
             (_, false) => {
-                if keyword_hit {
-                    Verdict::Suspicious
-                } else {
-                    Verdict::Running
+                if !keyword_hit {
+                    return settled(Verdict::Running);
+                }
+                match second_opinion {
+                    Some(Arbitration::Unfinished) => settled(Verdict::ConfirmInterrupt),
+                    // 问过了说干完了：不改结论（仲裁没有叫停的权力），也不再问
+                    Some(Arbitration::Finished) => settled(Verdict::Suspicious),
+                    None => Ruling {
+                        verdict: Verdict::Suspicious,
+                        wants_second_opinion: true,
+                    },
                 }
             }
         }
@@ -589,6 +913,179 @@ mod tests {
     }
     // TESTS_PLACEHOLDER_DETECTOR
 
+    // ── 中断原因与手段 ──
+
+    /// 造一份「确认中断」的证据，只有需要改的那几项要写出来
+    fn evidence<'a>(
+        recent_output: Option<&'a str>,
+        error_output: Option<&'a str>,
+        process_alive: bool,
+        turn_state: TurnState,
+        verdict: &'a Verdict,
+    ) -> AttentionInput<'a> {
+        AttentionInput {
+            recent_output,
+            error_output,
+            completion_marker: None,
+            process_alive,
+            verdict,
+            turn_state,
+            second_opinion: None,
+        }
+    }
+
+    /// 这条是加 `InterruptReason` 的**全部理由**。
+    ///
+    /// 一个崩掉的进程往往正好留下最后一行错误。分级层把「标成故障的行」排在
+    /// 「进程没了」前面（那里无所谓，两者都是 ⚫出错），照那个顺序分类原因
+    /// 就会认成 `RuntimeError` → `Nudge`，于是继续往一个死进程里敲字：
+    /// 字落进它身后的 shell，我们还把这次投递记成一次成功的续跑。
+    #[test]
+    fn a_dead_process_that_also_logged_an_error_is_still_dead() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            None,
+            Some("fatal error: connection error"),
+            false,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::ProcessCrashed);
+        assert_eq!(reason.tactic(), ResumeTactic::HandOff);
+    }
+
+    /// 限流行本身常被运行时标成故障。认成 `RuntimeError` 就会去敲字，
+    /// 而敲字既不能让它提前恢复，又在同一个限流窗口里白烧一次额度。
+    #[test]
+    fn rate_limits_are_waited_out_not_nudged() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            None,
+            Some("429 rate limit reached, retrying in 30s"),
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::RateLimited);
+        assert_eq!(reason.tactic(), ResumeTactic::Wait);
+    }
+
+    /// 往一个 `(y/n)` 提示里敲「继续」，等于替用户批准了一件他没看过的事。
+    /// 这是权限边界，不只是效果问题。
+    #[test]
+    fn a_pending_approval_is_never_answered_for_the_user() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            Some("Do you want to delete these files? (y/n)"),
+            None,
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::AwaitingInput);
+        assert_eq!(reason.tactic(), ResumeTactic::HandOff);
+    }
+
+    /// 「它其实没有干完活，每次都要我去发继续」——这一类必须照敲，
+    /// 分派逻辑不能把它一起挡掉。
+    #[test]
+    fn the_stall_we_built_this_for_still_gets_nudged() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            Some("我先看一下这个文件。"),
+            None,
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::Stalled);
+        assert_eq!(reason.tactic(), ResumeTactic::Nudge);
+    }
+
+    /// 读不出回合结构（Codex / OpenCode 这类）时走超时兜底：说不清为什么停，
+    /// 但「停了就催一下」本来就是默认动作，不该因为分不出原因就变成不作为。
+    #[test]
+    fn an_unexplained_stop_still_gets_nudged() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason =
+            detector().classify_reason(evidence(None, None, true, TurnState::Unknown, &verdict));
+        assert_eq!(reason, InterruptReason::Unknown);
+        assert_eq!(reason.tactic(), ResumeTactic::Nudge);
+    }
+
+    /// 原因是给动作层用的，而动作层只在「确认中断」时才动手。
+    /// 给一个还在正常跑的会话贴原因标签，只会往日志里灌噪音。
+    #[test]
+    fn a_running_session_has_no_reason_to_explain() {
+        for verdict in [
+            Verdict::Running,
+            Verdict::Suspicious,
+            Verdict::TaskCompleted,
+        ] {
+            let reason = detector().classify_reason(evidence(
+                Some("Do you want to continue? (y/n)"),
+                Some("fatal error"),
+                false,
+                TurnState::AwaitingUser,
+                &verdict,
+            ));
+            assert_eq!(reason, InterruptReason::None, "verdict={verdict:?}");
+        }
+    }
+
+    /// 完成标记在场时不谈原因：活干完了，没有「为什么停」这个问题。
+    #[test]
+    fn a_finished_task_has_no_reason_to_explain() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(AttentionInput {
+            recent_output: None,
+            error_output: None,
+            completion_marker: Some("任务完成"),
+            process_alive: true,
+            verdict: &verdict,
+            turn_state: TurnState::AwaitingUser,
+            second_opinion: None,
+        });
+        assert_eq!(reason, InterruptReason::None);
+    }
+
+    /// 散文里提到 500 不算出错，这条规则在原因层也得成立——
+    /// 否则一句正常的用量统计就能把「该催」变成「交给你」。
+    #[test]
+    fn prose_about_errors_does_not_change_the_reason() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            Some("这次不会再撞上 500 了"),
+            None,
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::Stalled);
+    }
+
+    /// 只有三个原因不敲字，而且每一个都有具体的坏处可说。
+    /// 这条锁住那份名单：以后新增原因，默认必须落在 `Nudge` 一侧。
+    #[test]
+    fn only_three_reasons_hold_their_fire() {
+        let silent = [
+            InterruptReason::ProcessCrashed,
+            InterruptReason::AwaitingInput,
+            InterruptReason::RateLimited,
+        ];
+        for reason in silent {
+            assert_ne!(reason.tactic(), ResumeTactic::Nudge, "{}", reason.key());
+        }
+        for reason in [
+            InterruptReason::None,
+            InterruptReason::RuntimeError,
+            InterruptReason::Stalled,
+            InterruptReason::Unknown,
+        ] {
+            assert_eq!(reason.tactic(), ResumeTactic::Nudge, "{}", reason.key());
+        }
+    }
+
     // ── 关键词边界 ──
 
     #[test]
@@ -614,7 +1111,14 @@ mod tests {
     #[test]
     fn token_counts_do_not_look_like_errors() {
         let out = "Wrote 1500 lines, used 14290 output tokens in total.";
-        let r = detector().detect(&session(), Some(out), None, true, TurnState::AwaitingUser);
+        let r = detector().detect(
+            &session(),
+            Some(out),
+            None,
+            true,
+            TurnState::AwaitingUser,
+            None,
+        );
         assert_eq!(r.attention, AttentionLevel::None);
         assert_eq!(r.verdict, Verdict::Running);
     }
@@ -627,7 +1131,14 @@ mod tests {
         // 会话立刻被标成 ⚫出错。词边界拦不住——那确实是个独立的 500。
         let d = detector();
         let out = "修完之后就不会再撞上错误关键词 500 了，429 同理。";
-        let r = d.detect(&session(), Some(out), None, true, TurnState::AwaitingUser);
+        let r = d.detect(
+            &session(),
+            Some(out),
+            None,
+            true,
+            TurnState::AwaitingUser,
+            None,
+        );
         assert_eq!(
             r.attention,
             AttentionLevel::None,
@@ -645,6 +1156,7 @@ mod tests {
             Some("API Error: 500"),
             true,
             TurnState::AwaitingUser,
+            None,
         );
         assert_eq!(r.attention, AttentionLevel::Error);
 
@@ -654,6 +1166,7 @@ mod tests {
             Some("API Error: 429 rate limit exceeded"),
             true,
             TurnState::AwaitingUser,
+            None,
         );
         assert_eq!(limited.attention, AttentionLevel::RateLimited);
     }
@@ -668,6 +1181,7 @@ mod tests {
             Some("upstream connect failure"),
             true,
             TurnState::AwaitingUser,
+            None,
         );
         assert_eq!(r.attention, AttentionLevel::Error);
         assert!(r
@@ -684,7 +1198,14 @@ mod tests {
         // 会话在问话（散文里确实是它在等人）：可以叫人，但不能动手
         let d = detector();
         let out = "需要确认这一步再继续，是否继续执行？";
-        let r = d.detect(&session(), Some(out), None, true, TurnState::AwaitingUser);
+        let r = d.detect(
+            &session(),
+            Some(out),
+            None,
+            true,
+            TurnState::AwaitingUser,
+            None,
+        );
         assert_eq!(r.attention, AttentionLevel::NeedsInput);
         assert!(!r.interrupted, "关键词命中不足以确认中断");
     }
@@ -699,13 +1220,16 @@ mod tests {
                 &signal(SignalKind::FileStale),
                 false,
                 &s,
-                TurnState::AwaitingUser
-            ),
+                TurnState::AwaitingUser,
+                None
+            )
+            .verdict,
             Verdict::ConfirmInterrupt,
             "回合收尾 + 记录停更 = 用户每次得去发「继续」的那种停"
         );
         assert_eq!(
-            d.make_verdict(true, &[], false, &s, TurnState::AwaitingUser),
+            d.make_verdict(true, &[], false, &s, TurnState::AwaitingUser, None)
+                .verdict,
             Verdict::Running,
             "刚收尾还没到阈值只是一问一答的间隙"
         );
@@ -717,12 +1241,13 @@ mod tests {
         let s = session();
         for turn in [TurnState::ToolRunning, TurnState::Busy] {
             assert_eq!(
-                d.make_verdict(true, &signal(SignalKind::FileStale), false, &s, turn),
+                d.make_verdict(true, &signal(SignalKind::FileStale), false, &s, turn, None)
+                    .verdict,
                 Verdict::Suspicious,
                 "{turn:?}：放宽后的阈值仍超时，最多到「继续观察」"
             );
             assert_eq!(
-                d.make_verdict(true, &[], false, &s, turn),
+                d.make_verdict(true, &[], false, &s, turn, None).verdict,
                 Verdict::Running
             );
         }
@@ -739,8 +1264,10 @@ mod tests {
                 &signal(SignalKind::HeartbeatTimeout),
                 false,
                 &session(),
-                TurnState::Unknown
-            ),
+                TurnState::Unknown,
+                None
+            )
+            .verdict,
             Verdict::ConfirmInterrupt
         );
     }
@@ -750,11 +1277,13 @@ mod tests {
         let d = detector();
         let s = session();
         assert_eq!(
-            d.make_verdict(true, &[], true, &s, TurnState::AwaitingUser),
+            d.make_verdict(true, &[], true, &s, TurnState::AwaitingUser, None)
+                .verdict,
             Verdict::TaskCompleted
         );
         assert_eq!(
-            d.make_verdict(false, &[], false, &s, TurnState::ToolRunning),
+            d.make_verdict(false, &[], false, &s, TurnState::ToolRunning, None)
+                .verdict,
             Verdict::ConfirmInterrupt,
             "进程没了就是事实，不用再看回合结构"
         );
@@ -778,8 +1307,10 @@ mod tests {
                 &signal(SignalKind::FileStale),
                 false,
                 &exhausted,
-                TurnState::AwaitingUser
-            ),
+                TurnState::AwaitingUser,
+                None
+            )
+            .verdict,
             Verdict::ConfirmInterrupt,
             "催不动了也要照实说它停着——不然注意力分级就不叫人了"
         );
@@ -802,14 +1333,62 @@ mod tests {
                 &signal(SignalKind::FileStale),
                 false,
                 &veteran,
-                TurnState::AwaitingUser
-            ),
+                TurnState::AwaitingUser,
+                None
+            )
+            .verdict,
             Verdict::ConfirmInterrupt
         );
     }
-    // TESTS_PLACEHOLDER_DETECTOR
 
-    // ── 阈值放宽：压缩上下文期间不算卡住 ──
+    #[test]
+    fn arbiter_only_votes_at_the_weak_evidence_gap() {
+        let d = detector();
+        let s = session();
+        let weak = signal(SignalKind::KeywordMatch);
+
+        let unanswered = d.make_verdict(true, &weak, false, &s, TurnState::Unknown, None);
+        assert_eq!(unanswered.verdict, Verdict::Suspicious);
+        assert!(unanswered.wants_second_opinion);
+
+        let unfinished = d.make_verdict(
+            true,
+            &weak,
+            false,
+            &s,
+            TurnState::Unknown,
+            Some(Arbitration::Unfinished),
+        );
+        assert_eq!(unfinished.verdict, Verdict::ConfirmInterrupt);
+        assert!(!unfinished.wants_second_opinion);
+
+        let finished = d.make_verdict(
+            true,
+            &weak,
+            false,
+            &s,
+            TurnState::Unknown,
+            Some(Arbitration::Finished),
+        );
+        assert_eq!(finished.verdict, Verdict::Suspicious);
+        assert!(!finished.wants_second_opinion, "同一版记录不能反复花钱问");
+    }
+
+    #[test]
+    fn busy_turn_never_asks_the_arbiter() {
+        let ruling = detector().make_verdict(
+            true,
+            &signal(SignalKind::KeywordMatch),
+            false,
+            &session(),
+            TurnState::Busy,
+            None,
+        );
+        assert_eq!(ruling.verdict, Verdict::Running);
+        assert!(!ruling.wants_second_opinion);
+    }
+
+    // TESTS_PLACEHOLDER_DETECTOR
 
     #[test]
     fn long_compaction_pause_is_not_a_stall() {
@@ -821,14 +1400,14 @@ mod tests {
             ..session()
         };
 
-        let judged = d.detect(&quiet, None, None, true, TurnState::AwaitingUser);
+        let judged = d.detect(&quiet, None, None, true, TurnState::AwaitingUser, None);
         assert!(judged
             .signals
             .iter()
             .any(|s| matches!(s.kind, SignalKind::HeartbeatTimeout)));
         assert_eq!(judged.verdict, Verdict::ConfirmInterrupt);
 
-        let busy = d.detect(&quiet, None, None, true, TurnState::Busy);
+        let busy = d.detect(&quiet, None, None, true, TurnState::Busy, None);
         assert!(
             busy.signals.is_empty(),
             "回合没收尾时阈值放宽 10 倍，400s 还够不上"
@@ -846,14 +1425,14 @@ mod tests {
             ..session()
         };
 
-        let stalled = d.detect(&quiet, None, None, true, TurnState::AwaitingUser);
+        let stalled = d.detect(&quiet, None, None, true, TurnState::AwaitingUser, None);
         assert_eq!(stalled.attention, AttentionLevel::NeedsInput);
         assert_eq!(
             stalled.attention_detail.as_deref(),
             Some(d.i18n.t("attention.detail.stalled"))
         );
 
-        let silent = d.detect(&quiet, None, None, true, TurnState::Unknown);
+        let silent = d.detect(&quiet, None, None, true, TurnState::Unknown, None);
         assert_eq!(
             silent.attention_detail.as_deref(),
             Some(d.i18n.t("attention.detail.silent"))
@@ -875,7 +1454,7 @@ mod tests {
             ..session()
         };
 
-        let r = d.detect(&exhausted, None, None, true, TurnState::AwaitingUser);
+        let r = d.detect(&exhausted, None, None, true, TurnState::AwaitingUser, None);
         assert_eq!(r.verdict, Verdict::ConfirmInterrupt, "它确实还停在那儿");
         assert_eq!(r.attention, AttentionLevel::NeedsInput);
         assert!(r.attention.is_pending(), "托盘角标上得有它这一个");

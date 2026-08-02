@@ -4,7 +4,7 @@
 > 配置项逐条说明、路线图、开发红线在 [PROJECT_STATUS.md](../PROJECT_STATUS.md)；
 > 三平台手动验收清单在 [manual-test.md](./manual-test.md)。
 >
-> 最后一次与代码对齐：2026-08-01（`v1.5` 已交付）。
+> 最后一次与代码对齐：2026-08-02（`v1.6` 开发完成，待发布）。
 
 ## 1. 一条不能越过的线
 
@@ -55,7 +55,7 @@ AgentPulse 是 **AI Agent 的守护神，不是它的容器**。整套架构都�
 | `src-tauri/src/lib.rs` | 627 | Tauri 装配：命令、托盘、事件泵、窗口行为 |
 | `src-tauri/src/i18n/mod.rs` | 531 | 后端文案（通知、托盘、日志、报错） |
 | `src-tauri/src/cost/mod.rs` | 512 | 模型价目表、增量读用量、限流预测 |
-| `src/components/ConfigPanel.tsx` | 867 | 设置页十个分区（**待拆**） |
+| `src/components/ConfigPanel.tsx` | 610 | 设置页主编排（通知 / 成本 / AI 分区已拆到 `components/config/`） |
 | `src/i18n/index.ts` | 520 | 前端文案（界面上的字） |
 
 ## 4. ① 感知层：会话是怎么被认出来的
@@ -108,28 +108,39 @@ AwaitingUser 回合收尾了，确实停在等人
 
 ### 信号与判定
 
-| 信号 `SignalKind` | 触发条件 | 强度 |
+| 信号 `SignalKind` | 触发条件 | 证据性质 |
 |---|---|---|
-| `ProcessExited` | 进程不在快照里 | 强（单独即可确认） |
-| `KeywordMatch` | `recent_output` 命中中断关键词 | 强 |
-| `HeartbeatTimeout` | `last_activity` 超过 `阈值 × 超时` | 强 |
-| `FileStale` | 记录文件超过 `idle_timeout` 未更新 | 弱（需组合） |
+| `ProcessExited` | 进程不在快照里 | 系统事实，单独即可确认 |
+| `HeartbeatTimeout` / `FileStale` | 记录时间线超阈值；两者是同源事实，展示时合并为时间信号 | 时间线 / 文件 mtime |
+| `KeywordMatch` | `recent_output` 命中中断关键词 | 输出文本，单独只到可疑 |
+
+判定层不靠信号数量“凑票”：进程存活、回合结构和完成标记先处理，时间信号只作为停更事实。
+当记录仍在增长、只命中关键词时，判定进入唯一的弱证据缺口：`Suspicious`，并置位
+`wants_second_opinion`。监控层下一轮把记录尾部交给配置的 OpenAI-compatible 端点，严格要求
+`DONE` / `CONTINUE` 两个词；只有 `CONTINUE` 能把结论提升为 `ConfirmInterrupt`，失败、超时或
+`DONE` 都不改变原结论。忙碌回合永远不问，避免把上下文压缩误判重新打开。
+
+`DetectionEvidence` 是后端发出的事实快照：信号种类、进程存活、`TurnState`、忙碌宽限、命中
+关键词/完成标记和第二意见。前端证据面板只渲染它，不复制判定策略。
 
 ```
 命中完成标记                    → TaskCompleted（永不续跑）
 进程已退出 且 无完成标记        → ConfirmInterrupt
-有强信号 或 信号数 ≥ 2          → ConfirmInterrupt
-只有弱信号                      → Suspicious（再看一轮）
+回合忙碌且停更                  → Suspicious（宽限后继续观察）
+只有关键词 + 记录仍在增长       → Suspicious + 请求第二意见
+关键词 + 第二意见 CONTINUE      → ConfirmInterrupt
 没有信号                        → Running
 ```
-
-### 两个救过命的细节
 
 **忙时宽限（`BUSY_GRACE_MULTIPLIER = 10`）**：`TurnState::is_busy()` 为真时，
 「多久不写文件算卡住」放大 10 倍（默认 60s → 600s）。这条专门用来躲开长时间的
 上下文压缩 —— 但**只放大 `FileStale` 这类时间信号**，不会让一个真正停在
 `AwaitingUser` 的会话不再产生续跑。两个方向的失败都被用户实际报过，所以两边
 都不能松：压缩不能被判成卡住，真卡住也不能不管。
+
+数据库演进采用形状驱动迁移：启动时 `migrate()` 通过 `pragma_table_info` 检查列，
+`ensure_column()` 只补缺失列。旧安装不会因为 `CREATE TABLE IF NOT EXISTS` 对已存在表
+无效而永远缺字段；重复启动也保持幂等。
 
 **词边界匹配（`contains_keyword`）**：裸 `contains` 会让 `"500"` 命中
 `"1500 tokens"`、`"429"` 命中 `"14290"` —— 一句正常的用量统计就能把会话判成
@@ -408,7 +419,7 @@ UI elements enabled'` 查一次（只读、不弹窗、不会把用户拽进设�
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 115 passed |
+| Rust 单测 | `cargo test` | 128 passed |
 | 前端单测 | `pnpm test`（vitest） | 32 passed |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |
@@ -447,7 +458,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 - 环境自检目前长在 `collect_tools` 里，**没有覆盖会话目录可读性**，也还没有独立面板。
 - 判定证据面板（把每条信号的具体值、`TurnState`、忙时宽限有没有生效、命中哪个
   关键词摊开给用户看）**还没做**。
-- 前端测试只到纯函数层（工具函数、显示映射、store 归约、版本一致性，共 32 个），
+- 前端测试只到纯函数层（工具函数、显示映射、store 归约、版本一致性，共 38 个），
   **组件渲染层没有任何测试**。
 
 ## 15. 版本轨迹

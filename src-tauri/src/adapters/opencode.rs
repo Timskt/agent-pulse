@@ -59,12 +59,7 @@ impl AgentAdapter for OpenCodeAdapter {
         let global_dir = home.join(".opencode").join("sessions");
         if global_dir.exists() {
             std::fs::read_dir(global_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.path())
-                        .collect()
-                })
+                .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
                 .unwrap_or_default()
         } else {
             vec![]

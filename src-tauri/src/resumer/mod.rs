@@ -641,10 +641,7 @@ async fn collect_tools(i18n: &I18n) -> Vec<ToolStatus> {
 
     #[cfg(unix)]
     {
-        for (name, purpose) in [
-            ("tmux", "probe.tool_tmux"),
-            ("screen", "probe.tool_screen"),
-        ] {
+        for (name, purpose) in [("tmux", "probe.tool_tmux"), ("screen", "probe.tool_screen")] {
             tools.push(ToolStatus {
                 name: name.to_string(),
                 available: unix_tool_present(name),
@@ -863,10 +860,7 @@ pub async fn open_accessibility_settings(lang: &str) -> Result<String, String> {
             "cmd.failed",
             &[
                 ("program", "open"),
-                (
-                    "detail",
-                    String::from_utf8_lossy(&out.stderr).trim(),
-                ),
+                ("detail", String::from_utf8_lossy(&out.stderr).trim()),
             ],
         ))
     }
@@ -1271,7 +1265,11 @@ impl Resumer {
     /// 复用器那条路按 pane id 寻址、不经输入法、不需要前台窗口，
     /// 确定性比任何 AppleScript / SendKeys / xdotool 路径都高一档，
     /// 所以只要认得出来就用它，认不出来才退回到窗口定位。
-    pub async fn resume(&self, session: &AgentSession, use_goal_prompt: bool) -> Result<String, String> {
+    pub async fn resume(
+        &self,
+        session: &AgentSession,
+        use_goal_prompt: bool,
+    ) -> Result<String, String> {
         let prompt = if use_goal_prompt {
             &self.config.goal_resume_prompt
         } else {
@@ -1333,7 +1331,8 @@ impl Resumer {
             return (ResumeOutcome::Unverifiable, detail);
         };
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(VERIFY_WINDOW_SECS);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(VERIFY_WINDOW_SECS);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(VERIFY_POLL_MS)).await;
             if activity_fingerprint(session).is_some_and(|now| now != before) {
@@ -1342,7 +1341,7 @@ impl Resumer {
         }
         (ResumeOutcome::Silent, detail)
     }
-    
+
     /// 尝试通过 tmux/screen 投递；`None` = 这个会话不在复用器里，请走别的路
     ///
     /// 返回 `Some(Err(..))` 只在「认出了复用器但投递失败」时发生——那种情况不该
@@ -1421,8 +1420,7 @@ impl Resumer {
         );
 
         // 4. 根据终端类型生成精确的 AppleScript
-        let Some(script) =
-            self.macos_script(&terminal_app, tty.as_deref(), &project_name, prompt)
+        let Some(script) = self.macos_script(&terminal_app, tty.as_deref(), &project_name, prompt)
         else {
             // 定位不到又没开盲敲：到此为止，连 osascript 都不启动
             return Err(self.i18n.t("resume.blind_refused").to_string());
@@ -1445,13 +1443,9 @@ impl Resumer {
 
         match run_osascript(&script, &self.i18n).await {
             // 脚本自己判断出「不知道该敲哪儿」，回传 refused
-            Ok(raw) if raw == "refused" => {
-                Err(self.i18n.t("resume.blind_refused").to_string())
-            }
+            Ok(raw) if raw == "refused" => Err(self.i18n.t("resume.blind_refused").to_string()),
             // 认出来是哪个应用，但那个应用已经退了（窗口标题匹配这条路才可能出现）
-            Ok(raw) if raw == "no-app" => {
-                Err(self.i18n.t("resume.app_not_running").to_string())
-            }
+            Ok(raw) if raw == "no-app" => Err(self.i18n.t("resume.app_not_running").to_string()),
             Ok(raw) => {
                 let terminal = if terminal_app.is_empty() {
                     self.i18n.t("resume.frontmost_app")
@@ -1476,9 +1470,7 @@ impl Resumer {
             Err(stderr) if is_accessibility_error(&stderr) => {
                 Err(self.i18n.t("resume.needs_accessibility").to_string())
             }
-            Err(stderr) => Err(self
-                .i18n
-                .tf("resume.script_failed", &[("detail", &stderr)])),
+            Err(stderr) => Err(self.i18n.tf("resume.script_failed", &[("detail", &stderr)])),
         }
     }
 
@@ -1914,12 +1906,8 @@ return "refused""#
     #[cfg(target_os = "windows")]
     async fn resume_windows(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
         let project_name = project_name_of(&session.working_dir);
-        let ps_script = Self::windows_resume_script(
-            session.pid,
-            prompt,
-            project_name,
-            self.allow_blind(),
-        );
+        let ps_script =
+            Self::windows_resume_script(session.pid, prompt, project_name, self.allow_blind());
 
         tracing::info!(
             "[Resumer] 会话 {} → PID {}, 项目: {}",
@@ -1951,14 +1939,13 @@ return "refused""#
         }
 
         if output.status.success() {
-            Ok(self
-                .i18n
-                .tf("resume.sent_simple", &[("outcome", &self.outcome_text(raw))]))
+            Ok(self.i18n.tf(
+                "resume.sent_simple",
+                &[("outcome", &self.outcome_text(raw))],
+            ))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(self
-                .i18n
-                .tf("resume.script_failed", &[("detail", &stderr)]))
+            Err(self.i18n.tf("resume.script_failed", &[("detail", &stderr)]))
         }
     }
 
@@ -2164,9 +2151,13 @@ if ($multiTab -contains $hostName) {{
         match window_id {
             Some(wid) => {
                 // 激活窗口
-                let _ =
-                    run_with_timeout("xdotool", &["windowactivate", "--sync", &wid], 10, &self.i18n)
-                        .await;
+                let _ = run_with_timeout(
+                    "xdotool",
+                    &["windowactivate", "--sync", &wid],
+                    10,
+                    &self.i18n,
+                )
+                .await;
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
@@ -2225,7 +2216,8 @@ if ($multiTab -contains $hostName) {{
             }
 
             // 向上查找父进程
-            let ppid_output = std::fs::read_to_string(format!("/proc/{}/stat", current_pid)).ok()?;
+            let ppid_output =
+                std::fs::read_to_string(format!("/proc/{}/stat", current_pid)).ok()?;
             // stat 格式: pid (comm) state ppid ...
             let after_comm = ppid_output.rsplit(')').next()?;
             let fields: Vec<&str> = after_comm.split_whitespace().collect();
@@ -2264,8 +2256,7 @@ if ($multiTab -contains $hostName) {{
             let mut paste_args = vec!["key"];
             paste_args.extend_from_slice(&YDOTOOL_PASTE_KEYS);
             Self::set_clipboard_linux(prompt, &self.i18n).await?;
-            let pasted =
-                run_with_timeout("ydotool", &paste_args, 10, &self.i18n).await?;
+            let pasted = run_with_timeout("ydotool", &paste_args, 10, &self.i18n).await?;
             if !pasted.status.success() {
                 return Err(self.i18n.tf("resume.tool_failed", &[("tool", "ydotool")]));
             }
@@ -2416,7 +2407,8 @@ mod tests {
 
     #[test]
     fn screen_session_is_matched_by_pid() {
-        let ls = "There are screens on:\n\t4242.pts-1.mac\t(Detached)\n\t99.pts-0.mac\t(Attached)\n";
+        let ls =
+            "There are screens on:\n\t4242.pts-1.mac\t(Detached)\n\t99.pts-0.mac\t(Attached)\n";
         assert_eq!(
             match_screen_session(ls, 4242),
             Some("4242.pts-1.mac".to_string())
@@ -2487,7 +2479,11 @@ mod tests {
         // BLIND 是「标题没对上但开了盲敲」：会敲，但不是定位成功，
         // 报成 window 就等于骗用户说找到了
         for code in ["BLIND", "REFUSED", "NO_WINDOW", ""] {
-            assert_eq!(windows_locate_certainty(code), "none", "{code} 不该算定位成功");
+            assert_eq!(
+                windows_locate_certainty(code),
+                "none",
+                "{code} 不该算定位成功"
+            );
         }
     }
 
@@ -2547,9 +2543,15 @@ mod tests {
         // Windows Terminal / VS Code 里开的要往上走三四层才碰得到。
         // 旧版只在「进程根本不存在」时才看父进程，于是正常情况一律 NO_WINDOW。
         let script = win_script("agent-pulse", false);
-        assert!(script.contains("for ($i = 0; $i -lt 8; $i++)"), "要沿父进程链往上找");
+        assert!(
+            script.contains("for ($i = 0; $i -lt 8; $i++)"),
+            "要沿父进程链往上找"
+        );
         assert!(script.contains("Win32_Process -Filter \"ProcessId=$cur\""));
-        assert!(script.contains("if ($cur -le 4) { break }"), "走到 System/Idle 就该停");
+        assert!(
+            script.contains("if ($cur -le 4) { break }"),
+            "走到 System/Idle 就该停"
+        );
     }
 
     #[test]
@@ -2557,7 +2559,9 @@ mod tests {
         // SendKeys 打的是「当时的前台窗口」，SetForegroundWindow 在后台进程里经常被拒。
         // 不核一下，这段提示词就会落进用户正在看的窗口
         let script = win_script("agent-pulse", true);
-        let focus_at = script.find("GetForegroundWindow() -ne $hwnd").expect("要核前台窗口");
+        let focus_at = script
+            .find("GetForegroundWindow() -ne $hwnd")
+            .expect("要核前台窗口");
         let paste_at = script.find("SendWait(\"^v\")").unwrap();
         assert!(focus_at < paste_at, "确认前台必须在按键之前");
         // 剪贴板也一样：切不过去就别动用户的剪贴板
@@ -2571,13 +2575,19 @@ mod tests {
         // 一个窗口挂好几个标签，认到窗口只等于认到应用
         let script = win_script("agent-pulse", false);
         for host in ["windowsterminal", "code", "cursor", "idea64", "pycharm64"] {
-            assert!(script.contains(&format!("'{host}'")), "{host} 应当算多标签宿主");
+            assert!(
+                script.contains(&format!("'{host}'")),
+                "{host} 应当算多标签宿主"
+            );
         }
         assert!(
-            !WINDOWS_MULTI_TAB_HOSTS.contains(&"conhost") && !WINDOWS_MULTI_TAB_HOSTS.contains(&"cmd"),
+            !WINDOWS_MULTI_TAB_HOSTS.contains(&"conhost")
+                && !WINDOWS_MULTI_TAB_HOSTS.contains(&"cmd"),
             "cmd / conhost 一个窗口就是一个会话，不该被要求核标题"
         );
-        let refuse_at = script.find(r#"Write-Output "REFUSED""#).expect("默认要能拒绝");
+        let refuse_at = script
+            .find(r#"Write-Output "REFUSED""#)
+            .expect("默认要能拒绝");
         let stage_at = script.find("Set-Clipboard -Value").unwrap();
         assert!(refuse_at < stage_at, "拒绝之前不要碰剪贴板");
     }
@@ -2613,8 +2623,14 @@ mod tests {
         // Windows 上 cwd 是 `C:\code\agent-pulse`；只按 `/` 切会把整条路径当项目名，
         // 于是窗口标题永远对不上，每次续跑都被判成「定位不到」
         assert_eq!(project_name_of(r"C:\code\git\agent-pulse"), "agent-pulse");
-        assert_eq!(project_name_of("/Users/sky/code/agent-pulse"), "agent-pulse");
-        assert_eq!(project_name_of("/Users/sky/code/agent-pulse/"), "agent-pulse");
+        assert_eq!(
+            project_name_of("/Users/sky/code/agent-pulse"),
+            "agent-pulse"
+        );
+        assert_eq!(
+            project_name_of("/Users/sky/code/agent-pulse/"),
+            "agent-pulse"
+        );
         assert_eq!(project_name_of(r"C:\code\agent-pulse\"), "agent-pulse");
         assert_eq!(project_name_of(""), "");
     }
@@ -2877,8 +2893,18 @@ mod tests {
         let prompts = ["继续", r#"接着干 "goal" \ 别重来"#];
         // (进程名, TTY, 项目名, 编译前要确认已安装的应用)
         let cases: Vec<(&str, Option<&str>, &str, Option<&str>)> = vec![
-            ("iTerm2", Some("/dev/ttys003"), "agent-pulse", Some("iTerm2")),
-            ("Terminal", Some("/dev/ttys003"), "agent-pulse", Some("Terminal")),
+            (
+                "iTerm2",
+                Some("/dev/ttys003"),
+                "agent-pulse",
+                Some("iTerm2"),
+            ),
+            (
+                "Terminal",
+                Some("/dev/ttys003"),
+                "agent-pulse",
+                Some("Terminal"),
+            ),
             ("Code", None, "agent-pulse", None),
             ("Code", None, "", None),
             ("Cursor", Some("/dev/ttys001"), "agent-pulse", None),
@@ -2901,8 +2927,7 @@ mod tests {
                     if needs.map(|n| !app_installed(n)).unwrap_or(false) {
                         continue;
                     }
-                    let Some(script) =
-                        resumer_with(blind).macos_script(app, *tty, project, prompt)
+                    let Some(script) = resumer_with(blind).macos_script(app, *tty, project, prompt)
                     else {
                         continue;
                     };
@@ -2958,8 +2983,14 @@ mod tests {
     fn windows_locate_walks_up_to_the_host_window() {
         // 与真续跑脚本同一条链路：agent 是控制台程序，窗口属于宿主，要往上找
         let script = win_locate("agent-pulse", false);
-        assert!(script.contains("for ($i = 0; $i -lt 8; $i++)"), "要沿父进程链往上找");
-        assert!(script.contains("Write-Output \"HOST="), "要报宿主进程名供诊断");
+        assert!(
+            script.contains("for ($i = 0; $i -lt 8; $i++)"),
+            "要沿父进程链往上找"
+        );
+        assert!(
+            script.contains("Write-Output \"HOST="),
+            "要报宿主进程名供诊断"
+        );
     }
 
     #[test]
@@ -2967,7 +2998,10 @@ mod tests {
         // 演练绝不能有副作用：不前台化、不碰剪贴板、不发按键
         for blind in [false, true] {
             let script = win_locate("agent-pulse", blind);
-            assert!(!script.contains("SetForegroundWindow"), "不许前台化 {blind}");
+            assert!(
+                !script.contains("SetForegroundWindow"),
+                "不许前台化 {blind}"
+            );
             assert!(!script.contains("ShowWindow"), "不许还原窗口 {blind}");
             assert!(!script.contains("SendKeys"), "不许发按键 {blind}");
             assert!(!script.contains("Set-Clipboard"), "不许写剪贴板 {blind}");
@@ -3033,8 +3067,12 @@ mod tests {
     #[test]
     fn macos_locate_unknown_terminal_has_no_script() {
         // 连是哪个终端都认不出时，连 osascript 都不启动
-        assert!(resumer_with(false).macos_locate_script("", None, "agent-pulse").is_none());
-        assert!(resumer_with(true).macos_locate_script("SomethingElse", None, "agent-pulse").is_none());
+        assert!(resumer_with(false)
+            .macos_locate_script("", None, "agent-pulse")
+            .is_none());
+        assert!(resumer_with(true)
+            .macos_locate_script("SomethingElse", None, "agent-pulse")
+            .is_none());
     }
 
     /// 演练脚本也是生成的 AppleScript，语法同样要真编译一遍才放心
@@ -3062,8 +3100,18 @@ mod tests {
         }
 
         let cases: Vec<(&str, Option<&str>, &str, Option<&str>)> = vec![
-            ("iTerm2", Some("/dev/ttys003"), "agent-pulse", Some("iTerm2")),
-            ("Terminal", Some("/dev/ttys003"), "agent-pulse", Some("Terminal")),
+            (
+                "iTerm2",
+                Some("/dev/ttys003"),
+                "agent-pulse",
+                Some("iTerm2"),
+            ),
+            (
+                "Terminal",
+                Some("/dev/ttys003"),
+                "agent-pulse",
+                Some("Terminal"),
+            ),
             ("Code", None, "agent-pulse", None),
             ("Code", None, "", None),
             ("Cursor", None, "agent-pulse", None),

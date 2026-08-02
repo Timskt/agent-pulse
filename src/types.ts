@@ -16,6 +16,52 @@ export type SessionStatus =
 export type AttentionLevel =
   "none" | "needs_input" | "completed" | "rate_limited" | "error";
 
+/**
+ * 中断原因（v1.6）：它为什么停下来
+ *
+ * 跟 `AttentionLevel` 是同一件事的两面——级别说「要不要叫人」，
+ * 原因说「叫来了能干什么」。有三个原因后端会**故意不催**
+ * （`process_crashed` / `rate_limited` / `awaiting_input`），
+ * 界面必须把这层意思说出来，否则用户看到的是漏了一次，
+ * 而不是一个正确的决定。
+ */
+/**
+ * 这一轮打算怎么办（v1.6）
+ *
+ * 由后端的判定层算好一起发上来，界面**不再照着原因表推一遍**：原因和手段
+ * 之间不是显然的一一对应（运行时报错要敲，撞限流不敲），两边各存一份判断
+ * 就是同一条策略有两个出处，下次加原因时漏改一处编译器不会响。
+ */
+export type ResumeTactic = "nudge" | "wait" | "hand_off";
+
+export type InterruptReason =
+  | "none"
+  | "process_crashed"
+  | "rate_limited"
+  | "awaiting_input"
+  | "runtime_error"
+  | "stalled"
+  | "unknown";
+
+export type TurnState = "unknown" | "tool_running" | "busy" | "awaiting_user";
+export type Arbitration = "finished" | "unfinished";
+export type SignalKind =
+  | "file_stale"
+  | "keyword_match"
+  | "process_exited"
+  | "heartbeat_timeout";
+
+/** 检测时采到的事实快照；界面用来解释结论，不在前端重做判定 */
+export interface DetectionEvidence {
+  process_alive: boolean;
+  turn_state: TurnState;
+  busy_grace_multiplier: number;
+  signal_kinds: SignalKind[];
+  matched_interrupt_keyword: string | null;
+  matched_completion_marker: string | null;
+  second_opinion: Arbitration | null;
+}
+
 /** 用量汇总，可用于单会话、单项目或单日 */
 export interface UsageSnapshot {
   input_tokens: number;
@@ -48,6 +94,11 @@ export interface AgentSession {
   resume_failures: number;
   attention: AttentionLevel;
   attention_detail: string | null;
+  detection_evidence: DetectionEvidence | null;
+  /** 它为什么停下来 */
+  interrupt_reason: InterruptReason;
+  /** 针对那个原因这一轮打算怎么办；不是 `nudge` 就该在界面上解释一句 */
+  resume_tactic: ResumeTactic;
   /** 所在终端的 TTY，如 `/dev/ttys003`——多标签页时靠它认人 */
   tty: string | null;
   terminal_app: string | null;
@@ -232,6 +283,13 @@ export interface ProjectCost {
   requests: number;
 }
 
+export interface ModelCost {
+  model: string;
+  total_tokens: number;
+  cost_usd: number;
+  requests: number;
+}
+
 export interface RateLimitForecast {
   window_hours: number;
   used_tokens: number;
@@ -256,6 +314,25 @@ export interface SessionHistoryEntry {
   resume_count: number;
   total_tokens: number;
   cost_usd: number;
+}
+
+export interface ResumeRecordPage {
+  records: ResumeRecord[];
+  total: number;
+}
+
+export interface SessionHistoryPage {
+  entries: SessionHistoryEntry[];
+  total: number;
+}
+
+export interface StatsOverview {
+  total_scans: number;
+  total_detections: number;
+  total_resumes: number;
+  successful_resumes: number;
+  failed_resumes: number;
+  active_sessions: number;
 }
 
 export interface AiVerdict {

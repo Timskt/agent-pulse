@@ -13,9 +13,12 @@
 //! 文案一律走 `i18n`：日志面板是用户界面的一部分，不该在代码里写死中文。
 
 use crate::adapters::{self, AgentSession, SessionStatus};
+use crate::ai_judge::AiJudge;
 use crate::config::{AppConfig, ConfigManager};
 use crate::cost::{self, CostTracker, RateLimitForecast};
-use crate::detector::{AttentionLevel, DetectionResult, Detector, Verdict};
+use crate::detector::{
+    Arbitration, AttentionLevel, DetectionResult, Detector, ResumeTactic, Verdict,
+};
 use crate::i18n::{I18n, Lang};
 use crate::notify::Notifier;
 use crate::resumer::{ResumeOutcome, Resumer};
@@ -95,12 +98,22 @@ pub struct MonitorState {
 struct ScanOutcome {
     sessions: Vec<AgentSession>,
     detections: Vec<(AgentSession, DetectionResult)>,
+    /// 判定层明确说「再问一句可能改变结果」的候选；异步侧每轮最多问一个
+    to_arbitrate: Vec<ArbitrationRequest>,
     /// 本轮新落库的用量记录条数
     usage_added: usize,
     /// 今日累计花费（美元）
     cost_today: f64,
     /// 限流窗口预测；没配 token 预算时为 None
     forecast: Option<RateLimitForecast>,
+}
+
+/// 一次待问的第二意见。指纹把答案绑定到这一版记录，记录一变就重新判断。
+struct ArbitrationRequest {
+    session_id: String,
+    agent_name: String,
+    recent_output: String,
+    fingerprint: u64,
 }
 
 /// PID → (TTY, 终端应用名)
@@ -122,6 +135,8 @@ pub struct MonitorEngine {
     ///
     /// 见 [`MonitorEngine::push_event_on_change`]。
     said: std::sync::Mutex<HashMap<String, String>>,
+    /// 会话 →（记录指纹，第二意见）。指纹变化即失效，避免旧答案跨回合生效。
+    arbitrations: std::sync::Mutex<HashMap<String, (u64, Arbitration)>>,
 }
 
 impl MonitorEngine {
@@ -137,6 +152,7 @@ impl MonitorEngine {
             cost: Arc::new(CostTracker::new(cursors)),
             terminal_cache: std::sync::Mutex::new(HashMap::new()),
             said: std::sync::Mutex::new(HashMap::new()),
+            arbitrations: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -197,6 +213,15 @@ impl MonitorEngine {
         format!("nudges_exhausted:{session_id}")
     }
 
+    /// 「这次故意不敲字」这条话题的键
+    ///
+    /// 跟 [`Self::exhausted_topic`] 分开：一个会话可以先撞限流（等），
+    /// 限流过去之后变成额度用光（催不动了）。两件事共用一个话题的话，
+    /// 后一件会被前一件的指纹压住，说不出口。
+    fn tactic_topic(session_id: &str) -> String {
+        format!("resume_tactic:{session_id}")
+    }
+
     /// 启动监控循环
     pub async fn start(&self) {
         {
@@ -220,7 +245,8 @@ impl MonitorEngine {
 
         // 先体检投递通道，再开始扫描：权限失效这件事该在用户还没等它干活时就说
         let config = self.config();
-        self.check_resume_channel(&config, &I18n::from_code(&lang)).await;
+        self.check_resume_channel(&config, &I18n::from_code(&lang))
+            .await;
 
         let mut poll_secs = self.config().poll_interval_secs.max(1);
         let mut ticker = new_ticker(poll_secs);
@@ -300,6 +326,7 @@ impl MonitorEngine {
         let ScanOutcome {
             mut sessions,
             detections,
+            to_arbitrate,
             usage_added,
             cost_today,
             forecast,
@@ -344,6 +371,7 @@ impl MonitorEngine {
                             "ConfirmInterrupt",
                             &signals,
                             detection.has_active_goal,
+                            detection.interrupt_reason.key(),
                         );
                         self.push_event(EngineEvent::new(
                             LogLevel::Warn,
@@ -358,6 +386,50 @@ impl MonitorEngine {
                             hook.notify_interrupt(&session.agent_name, &session.id, &signals)
                                 .await;
                         }
+                    }
+
+                    // ── 先问「该用什么手段」，再问「现在能不能动手」──
+                    //
+                    // 这两个问题不是一个问题，上一版把它们合成了一个：只要判定是
+                    // 确认中断，手段就固定是「往终端里敲一句继续」，三道闸门只管
+                    // 拦时机。于是三类停顿被同一个动作误伤——
+                    // 进程已经死了（字落进它身后的 shell，还被记成一次成功续跑）、
+                    // 撞上限流（敲了也不会提前恢复，白烧一次额度）、
+                    // 它在问一个 `(y/n)`（敲回车等于替用户批准了一件他没看过的事）。
+                    //
+                    // 手段来自判定层给出的原因（[`InterruptReason::tactic`]），
+                    // 不在这儿重新猜：这一层只有会话状态，没有本轮的证据。
+                    let tactic = detection.interrupt_reason.tactic();
+                    if tactic != ResumeTactic::Nudge {
+                        // 不敲字要说出来。上一版只有「动手」和「冷却中」两种说法，
+                        // 于是「这次故意不动手」只能靠沉默表达，用户在日志里看不到
+                        // 任何解释，只会觉得守护神漏了一次。
+                        //
+                        // 走 `on_change`：原因是**状态**，会一直成立到情况变化，
+                        // 每 10 秒重播一遍等于自己刷屏。指纹用原因键——原因变了
+                        // （限流过去了却变成了报错）要能重新开口。
+                        let key = if tactic == ResumeTactic::Wait {
+                            "log.resume_wait"
+                        } else {
+                            "log.resume_hand_off"
+                        };
+                        self.push_event_on_change(
+                            Self::tactic_topic(&session.id),
+                            detection.interrupt_reason.key(),
+                            EngineEvent::new(
+                                LogLevel::Warn,
+                                Some(session.id.clone()),
+                                i18n.tf(
+                                    key,
+                                    &[
+                                        ("agent", &session.agent_name),
+                                        ("reason", i18n.t(detection.interrupt_reason.i18n_key())),
+                                    ],
+                                ),
+                            ),
+                        )
+                        .await;
+                        continue;
                     }
 
                     // ── 该不该动手，在这里决定 ──
@@ -437,6 +509,9 @@ impl MonitorEngine {
             if let Some((_, detection)) = detections.iter().find(|(s, _)| s.id == session.id) {
                 session.attention = detection.attention;
                 session.attention_detail = detection.attention_detail.clone();
+                session.detection_evidence = Some(detection.evidence.clone());
+                session.interrupt_reason = detection.interrupt_reason;
+                session.resume_tactic = detection.interrupt_reason.tactic();
                 match detection.verdict {
                     Verdict::TaskCompleted => session.status = SessionStatus::Completed,
                     Verdict::ConfirmInterrupt => session.status = SessionStatus::Interrupted,
@@ -452,6 +527,11 @@ impl MonitorEngine {
                         session.resume_streak = 0;
                         // 额度回来了，「催不动了」这句话下次卡住时要能重新说出口
                         self.forget_topic(&Self::exhausted_topic(&session.id));
+                        // 「这次不敲字」同理。它的指纹是原因键，而同一个原因
+                        // 完全可能隔一小时再来一次（限流窗口就是这样）：
+                        // 中间恢复过就得让它重新开口，否则第二次撞限流时
+                        // 日志里一片安静，看着像守护神睡着了。
+                        self.forget_topic(&Self::tactic_topic(&session.id));
                     }
                 }
             }
@@ -535,6 +615,10 @@ impl MonitorEngine {
             state.sessions = sessions;
         }
 
+        // 仲裁只加速「弱证据」的结论，不阻塞本轮状态合并。答案缓存到下一轮使用；
+        // 每轮最多问一个，避免多个会话同时可疑时突然并发烧额度。
+        self.ask_one_arbitration(&config, &i18n, to_arbitrate).await;
+
         // ── 执行续跑：AppleScript 一次可能要几秒，放最后，别拖着状态更新 ──
         self.run_resumes(&config, &i18n, &webhook, &resume_actions)
             .await;
@@ -569,6 +653,7 @@ impl MonitorEngine {
         let cost = self.cost.clone();
         // 缓存按值进出：小 map 拷贝一次比把锁塞进闭包干净
         let cache_in = self.terminal_cache.lock().unwrap().clone();
+        let arbitrations_in = self.arbitrations.lock().unwrap().clone();
 
         let joined = tokio::task::spawn_blocking(move || {
             let mut cache = cache_in;
@@ -640,6 +725,7 @@ impl MonitorEngine {
             // 5. 逐会话检测（进程存活直接从快照判定，不再额外问系统）
             let detector = Detector::new(config.clone());
             let mut detections: Vec<(AgentSession, DetectionResult)> = Vec::new();
+            let mut to_arbitrate = Vec::new();
             for adapter in &adapter_list {
                 for session in &sessions {
                     if session.adapter_id != adapter.id() {
@@ -653,13 +739,30 @@ impl MonitorEngine {
                     // 回合结构：区分「正在跑工具/压缩上下文」和「真的停下来等人」，
                     // 光看文件 mtime 这两者长得一样
                     let turn = adapter.turn_state(session);
+                    let fingerprint = output.as_deref().map(transcript_fingerprint);
+                    let second_opinion = fingerprint.and_then(|fingerprint| {
+                        arbitrations_in
+                            .get(&session.id)
+                            .and_then(|(seen, answer)| (*seen == fingerprint).then_some(*answer))
+                    });
                     let result = detector.detect(
                         session,
                         output.as_deref(),
                         errors.as_deref(),
                         alive,
                         turn,
+                        second_opinion,
                     );
+                    if result.wants_second_opinion {
+                        if let (Some(recent_output), Some(fingerprint)) = (output, fingerprint) {
+                            to_arbitrate.push(ArbitrationRequest {
+                                session_id: session.id.clone(),
+                                agent_name: session.agent_name.clone(),
+                                recent_output,
+                                fingerprint,
+                            });
+                        }
+                    }
                     detections.push((session.clone(), result));
                 }
             }
@@ -711,6 +814,7 @@ impl MonitorEngine {
             let outcome = ScanOutcome {
                 sessions,
                 detections,
+                to_arbitrate,
                 usage_added,
                 cost_today,
                 forecast,
@@ -727,6 +831,58 @@ impl MonitorEngine {
             Err(e) => {
                 tracing::error!("[AgentPulse] 扫描任务失败: {e}");
                 None
+            }
+        }
+    }
+
+    /// 每轮最多问一个第二意见；失败只写日志，不改变已有判定。
+    async fn ask_one_arbitration(
+        &self,
+        config: &AppConfig,
+        i18n: &I18n,
+        requests: Vec<ArbitrationRequest>,
+    ) {
+        if !config.ai_judge.enabled {
+            return;
+        }
+        let Some(request) = requests.into_iter().next() else {
+            return;
+        };
+
+        let judge = AiJudge::new(config.ai_judge.clone());
+        match judge
+            .arbitrate(&request.agent_name, &request.recent_output)
+            .await
+        {
+            Ok(answer) => {
+                self.arbitrations
+                    .lock()
+                    .unwrap()
+                    .insert(request.session_id.clone(), (request.fingerprint, answer));
+                let verdict = i18n.t(match answer {
+                    Arbitration::Finished => "arbitration.finished",
+                    Arbitration::Unfinished => "arbitration.unfinished",
+                });
+                self.push_event(EngineEvent::new(
+                    LogLevel::Info,
+                    Some(request.session_id),
+                    i18n.tf(
+                        "log.arbitration_answered",
+                        &[("agent", &request.agent_name), ("verdict", verdict)],
+                    ),
+                ))
+                .await;
+            }
+            Err(error) => {
+                self.push_event(EngineEvent::new(
+                    LogLevel::Warn,
+                    Some(request.session_id),
+                    i18n.tf(
+                        "log.arbitration_failed",
+                        &[("agent", &request.agent_name), ("detail", &error)],
+                    ),
+                ))
+                .await;
             }
         }
     }
@@ -778,7 +934,10 @@ impl MonitorEngine {
                         &[
                             ("mode", mode),
                             ("count", &(session.resume_count + 1).to_string()),
-                            ("detail", &format!("{} · {}", i18n.t(outcome.i18n_key()), detail)),
+                            (
+                                "detail",
+                                &format!("{} · {}", i18n.t(outcome.i18n_key()), detail),
+                            ),
                         ],
                     ),
                 ))
@@ -956,13 +1115,16 @@ impl MonitorEngine {
                     ],
                 );
                 notifier.notify_alert(cfg, "budget:daily", i18n.t("notify.budget.title"), &body);
-                self.push_event(EngineEvent::new(LogLevel::Warn, None, body)).await;
+                self.push_event(EngineEvent::new(LogLevel::Warn, None, body))
+                    .await;
             }
         }
 
         if config.cost.session_budget_usd > 0.0 {
             for session in sessions {
-                let Some(usage) = &session.usage else { continue };
+                let Some(usage) = &session.usage else {
+                    continue;
+                };
                 if usage.cost_usd < config.cost.session_budget_usd {
                     continue;
                 }
@@ -1000,7 +1162,8 @@ impl MonitorEngine {
                     i18n.t("notify.rate_forecast.title"),
                     &body,
                 );
-                self.push_event(EngineEvent::new(LogLevel::Warn, None, body)).await;
+                self.push_event(EngineEvent::new(LogLevel::Warn, None, body))
+                    .await;
             }
         }
     }
@@ -1037,6 +1200,15 @@ fn session_label(session: &AgentSession) -> String {
         label.push_str(&format!(" ({short})"));
     }
     label
+}
+
+/// 记录指纹：只需要稳定地区分「同一段」和「已经变化」，不用于安全边界。
+fn transcript_fingerprint(output: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    output.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 续跑冷却判定：距上次续跑不足冷却时间就先忍着

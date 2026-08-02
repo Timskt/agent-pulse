@@ -852,7 +852,10 @@ mod tests {
         // CI 上可能完全没有可路由的地址，那时返回 None 是对的；
         // 但只要给了地址，就绝不能是 127.x —— 手机连那个地址永远连不上
         if let Some(ip) = lan_ipv4() {
-            assert!(!ip.starts_with("127."), "算出来的局域网地址是 loopback：{ip}");
+            assert!(
+                !ip.starts_with("127."),
+                "算出来的局域网地址是 loopback：{ip}"
+            );
             assert!(ip != "0.0.0.0");
         }
     }

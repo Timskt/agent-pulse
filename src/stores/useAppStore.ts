@@ -14,7 +14,10 @@ import type {
   RateLimitForecast,
   ResumeProbe,
   ResumeRecord,
+  ResumeRecordPage,
   SessionHistoryEntry,
+  SessionHistoryPage,
+  StatsOverview,
 } from "../types";
 
 export type TabId = "dashboard" | "stats" | "cost" | "history" | "config";
@@ -37,14 +40,19 @@ interface AppStore {
 
   dailyStats: DailyStats[];
   resumeHistory: ResumeRecord[];
+  resumeHistoryTotal: number;
+  statsOverview: StatsOverview | null;
   /** (检测数, 续跑数, 成功数) */
   totals: [number, number, number] | null;
 
   costDaily: DailyCost[];
   costProjects: ProjectCost[];
+  costModels: import("../types").ModelCost[];
+  usageSummary: import("../types").UsageSnapshot | null;
   rateForecast: RateLimitForecast | null;
 
   sessionHistory: SessionHistoryEntry[];
+  sessionHistoryTotal: number;
   historyQuery: string;
 
   setActiveTab: (tab: TabId) => void;
@@ -53,7 +61,7 @@ interface AppStore {
   fetchConfig: () => Promise<void>;
   fetchStats: () => Promise<void>;
   fetchCost: () => Promise<void>;
-  fetchSessionHistory: (query?: string) => Promise<void>;
+  fetchSessionHistory: (query?: string, offset?: number) => Promise<void>;
   startMonitoring: () => Promise<void>;
   stopMonitoring: () => Promise<void>;
   scanNow: () => Promise<void>;
@@ -118,11 +126,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
   focusedSessionId: null,
   dailyStats: [],
   resumeHistory: [],
+  resumeHistoryTotal: 0,
+  statsOverview: null,
   totals: null,
   costDaily: [],
   costProjects: [],
+  costModels: [],
+  usageSummary: null,
   rateForecast: null,
   sessionHistory: [],
+  sessionHistoryTotal: 0,
   historyQuery: "",
 
   setActiveTab: (tab) => set({ activeTab: tab }),
@@ -146,12 +159,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   fetchStats: async () => {
     try {
-      const [dailyStats, resumeHistory, totals] = await Promise.all([
+      const [dailyStats, resumeHistory, totals, statsOverview] = await Promise.all([
         invoke<DailyStats[]>("get_stats", { days: 30 }),
-        invoke<ResumeRecord[]>("get_resume_history", { limit: 50 }),
+        invoke<ResumeRecordPage>("get_resume_page", { limit: 20, offset: 0, outcome: "all" }),
         invoke<[number, number, number]>("get_totals"),
+        invoke<StatsOverview>("get_stats_overview"),
       ]);
-      set({ dailyStats, resumeHistory, totals });
+      set({ dailyStats, resumeHistory: resumeHistory.records, resumeHistoryTotal: resumeHistory.total, totals, statsOverview });
     } catch (e) {
       console.error("get_stats", e);
     }
@@ -159,30 +173,26 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   fetchCost: async () => {
     try {
-      const [costDaily, costProjects, rateForecast] = await Promise.all([
+      const [costDaily, costProjects, costModels, usageSummary, rateForecast] = await Promise.all([
         invoke<DailyCost[]>("get_cost_daily", { days: 14 }),
         invoke<ProjectCost[]>("get_cost_projects", { days: 30, limit: 8 }),
+        invoke<import("../types").ModelCost[]>("get_cost_models", { days: 30, limit: 8 }),
+        invoke<import("../types").UsageSnapshot>("get_usage_summary", { days: 30 }),
         invoke<RateLimitForecast>("get_rate_forecast"),
       ]);
-      set({ costDaily, costProjects, rateForecast });
+      set({ costDaily, costProjects, costModels, usageSummary, rateForecast });
     } catch (e) {
       console.error("get_cost_daily", e);
     }
   },
 
-  fetchSessionHistory: async (query) => {
+  fetchSessionHistory: async (query, offset = 0) => {
     const next = query ?? get().historyQuery;
     try {
-      const sessionHistory = await invoke<SessionHistoryEntry[]>(
-        "get_session_history",
-        {
-          limit: 100,
-          query: next,
-        },
-      );
-      set({ sessionHistory, historyQuery: next });
+      const page = await invoke<SessionHistoryPage>("get_session_history_page", { limit: 20, offset, query: next });
+      set({ sessionHistory: page.entries, sessionHistoryTotal: page.total, historyQuery: next });
     } catch (e) {
-      console.error("get_session_history", e);
+      console.error("get_session_history_page", e);
     }
   },
 
@@ -353,9 +363,14 @@ export const selectLoading = (s: AppStore) => s.loading;
 export const selectFocusedSessionId = (s: AppStore) => s.focusedSessionId;
 export const selectDailyStats = (s: AppStore) => s.dailyStats;
 export const selectResumeHistory = (s: AppStore) => s.resumeHistory;
+export const selectResumeHistoryTotal = (s: AppStore) => s.resumeHistoryTotal;
+export const selectStatsOverview = (s: AppStore) => s.statsOverview;
 export const selectTotals = (s: AppStore) => s.totals;
 export const selectCostDaily = (s: AppStore) => s.costDaily;
 export const selectCostProjects = (s: AppStore) => s.costProjects;
+export const selectCostModels = (s: AppStore) => s.costModels;
+export const selectUsageSummary = (s: AppStore) => s.usageSummary;
 export const selectRateForecast = (s: AppStore) => s.rateForecast;
 export const selectSessionHistory = (s: AppStore) => s.sessionHistory;
+export const selectSessionHistoryTotal = (s: AppStore) => s.sessionHistoryTotal;
 export const selectHistoryQuery = (s: AppStore) => s.historyQuery;

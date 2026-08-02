@@ -1,9 +1,9 @@
+use crate::ai_judge::AiJudgeConfig;
+use crate::webhook::WebhookConfig;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use crate::webhook::WebhookConfig;
-use crate::ai_judge::AiJudgeConfig;
 
 /// 自定义适配器配置
 #[derive(Debug, Clone, Serialize, Deserialize)]

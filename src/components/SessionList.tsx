@@ -4,9 +4,11 @@ import {
   ATTENTION_ICON,
   ATTENTION_TONE,
   attentionKey,
+  reasonKey,
   STATUS_DOT,
   STATUS_TONE,
   statusKey,
+  TACTIC_NOTE,
 } from "../lib/display";
 import { baseName, cn, formatTokens, formatUsd } from "../lib/utils";
 import { useNotice, type Notice } from "../lib/useNotice";
@@ -16,7 +18,12 @@ import {
   selectSessions,
   useAppStore,
 } from "../stores/useAppStore";
-import type { AgentSession, AttentionLevel, ResumeProbe } from "../types";
+import type {
+  AgentSession,
+  AttentionLevel,
+  DetectionEvidence,
+  ResumeProbe,
+} from "../types";
 import { Badge, Button, Card, CardBar, EmptyState, Tooltip } from "./ui";
 
 /**
@@ -126,10 +133,25 @@ function SessionRow({
   const [busy, setBusy] = useState(false);
   const [probe, setProbe] = useState<ResumeProbe | null>(null);
   const [probing, setProbing] = useState(false);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
 
   const stalled =
     session.status === "interrupted" || session.status === "suspended";
   const attention = session.attention;
+
+  /**
+   * 「为什么停」和「这次怎么办」
+   *
+   * 两个都由后端算好发上来，这里一个字都不推。`tacticNote` 是那句解释，
+   * 它的措辞里已经把原因念了一遍，所以下面那枚原因小标签只在**没有**
+   * 解释句的时候才挂——同一句话在同一行出现两遍，看着像两件事。
+   */
+  const reason =
+    session.interrupt_reason === "none" ? null : session.interrupt_reason;
+  const tacticNote =
+    session.resume_tactic === "nudge"
+      ? null
+      : TACTIC_NOTE[session.resume_tactic];
 
   /** 三个按钮的公共部分：跑的时候整行按钮禁用，回来的一句话原样展示 */
   const act = async (run: () => Promise<Notice>) => {
@@ -246,6 +268,11 @@ function SessionRow({
                 })}
               </span>
             )}
+            {/* 「为什么停」放在这一行而不是上面的徽标区：级别徽标是在叫人，
+                原因只是陈述事实，两者抢同一种颜色只会让人分不清哪个要理。 */}
+            {reason && !tacticNote && (
+              <span className="text-neutral-500">{t(reasonKey(reason))}</span>
+            )}
           </div>
 
           {session.attention_detail && (
@@ -253,9 +280,29 @@ function SessionRow({
               {session.attention_detail}
             </p>
           )}
+
+          {/* 「这次故意没敲字」必须写出来。三种情况下敲字帮不上忙甚至帮倒忙
+              （进程没了、撞限流、它在问一个具体问题），可界面上只写「已中断」
+              的话，用户看到的是守护神漏了一次，而不是它做了一个正确的决定。
+              手段由后端算好发上来，这里只画，不重推一遍原因表。 */}
+          {tacticNote && reason && (
+            <p className="mt-1 text-[10px] leading-relaxed text-amber-600">
+              {t(tacticNote, { reason: t(reasonKey(reason)) })}
+            </p>
+          )}
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center gap-1">
+          {session.detection_evidence && (
+            <Button
+              size="xs"
+              variant="ghost"
+              disabled={busy || probing}
+              onClick={() => setEvidenceOpen((open) => !open)}
+            >
+              {evidenceOpen ? t("evidence.hide") : t("evidence.button")}
+            </Button>
+          )}
           <Tooltip content={t("probe.nothing_typed")}>
             <Button
               size="xs"
@@ -301,6 +348,40 @@ function SessionRow({
       </div>
 
       {probe && <ProbePanel probe={probe} onClose={() => setProbe(null)} />}
+      {evidenceOpen && session.detection_evidence && (
+        <EvidencePanel evidence={session.detection_evidence} />
+      )}
+    </div>
+  );
+}
+
+/** 判定证据：展示事实，不在前端重算结论 */
+function EvidencePanel({ evidence }: { evidence: DetectionEvidence }) {
+  const { t } = useI18n();
+  const turn = t(`evidence.turn.${evidence.turn_state}` as Parameters<typeof t>[0]);
+  const signalKinds = Array.from(
+    new Set(
+      evidence.signal_kinds.map((kind) =>
+        kind === "file_stale" || kind === "heartbeat_timeout"
+          ? "evidence.signal.transcript_idle"
+          : `evidence.signal.${kind}`,
+      ),
+    ),
+  )
+    .map((key) => t(key as Parameters<typeof t>[0]))
+    .join("、");
+  return (
+    <div className="border-t border-neutral-100 bg-sky-50/50 px-4 py-3">
+      <p className="text-[11px] font-semibold text-neutral-700">{t("evidence.title")}</p>
+      <div className="mt-1.5 grid grid-cols-1 gap-1 text-[10px] text-neutral-600 sm:grid-cols-2">
+        <span>{t("evidence.signals")}: {signalKinds || t("evidence.none")}</span>
+        <span>{t("evidence.process")}: {evidence.process_alive ? t("evidence.yes") : t("evidence.no")}</span>
+        <span>{t("evidence.turn")}: {turn}</span>
+        <span>{t("evidence.grace")}: ×{evidence.busy_grace_multiplier}</span>
+        <span>{t("evidence.keyword")}: {evidence.matched_interrupt_keyword ?? t("evidence.none")}</span>
+        <span>{t("evidence.completion")}: {evidence.matched_completion_marker ?? t("evidence.none")}</span>
+        <span>{t("evidence.second_opinion")}: {evidence.second_opinion ? t(`evidence.opinion.${evidence.second_opinion}` as Parameters<typeof t>[0]) : t("evidence.none")}</span>
+      </div>
     </div>
   );
 }
