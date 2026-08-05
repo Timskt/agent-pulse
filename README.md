@@ -144,8 +144,8 @@ git push origin main
 gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 
 # 3. 打标签并推标签（必须以 v 开头，且与 package.json 的版本一致——src/version.test.ts 会替你查）
-git tag v1.7.0
-git push origin v1.7.0
+git tag v1.8.0
+git push origin v1.8.0
 
 # 4. 盯打包
 gh run list --limit 3

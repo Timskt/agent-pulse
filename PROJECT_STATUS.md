@@ -40,7 +40,7 @@
 
 | 维度 | 现状 |
 |---|---|
-| 版本 | `1.7.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死） |
+| 版本 | `1.8.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死；**标签未推，尚未发 Release**） |
 | 后端 | Rust，19 个文件，约 16.3k 行 |
 | 前端 | TypeScript + React 19，44 个文件，约 7.4k 行 |
 | 单元测试 | Rust **243 个**（`cargo test`）+ 前端 **93 个**（`pnpm test`，vitest，7 个文件）；两者都在三个平台的 CI 里跑 |
@@ -949,8 +949,8 @@ git push origin main
 gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 
 # 3. 打标签并推标签（标签必须以 v 开头，且和 package.json 的版本一致）
-git tag v1.5.0
-git push origin v1.5.0
+git tag v1.8.0
+git push origin v1.8.0
 
 # 4. 盯打包
 gh run list --limit 3
@@ -1352,7 +1352,7 @@ cargo test -- --list                        # 列出全部测试名
 
 ./scripts/gen-icons.sh           # 从 SVG 母版重出整套图标（需要 Chrome/Chromium）
 
-git tag v1.5.0 && git push origin v1.5.0    # 触发 4 目标打包 + 建 Release，见 11.4
+git tag v1.8.0 && git push origin v1.8.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
 ### 14.2 测试分布（Rust 243 + 前端 93）

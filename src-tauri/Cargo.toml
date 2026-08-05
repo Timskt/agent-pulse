@@ -1,6 +1,6 @@
 [package]
 name = "agent-pulse"
-version = "1.7.0"
+version = "1.8.0"
 description = "AI Coding Agent 守护与自动续跑工具"
 authors = ["Timskt"]
 edition = "2021"
