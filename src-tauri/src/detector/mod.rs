@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+pub mod rate_limit;
+
 /// 检测结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionResult {
@@ -31,6 +33,13 @@ pub struct DetectionResult {
     pub evidence: DetectionEvidence,
     /// 它为什么停下来 —— 决定该用什么手段（见 [`InterruptReason::tactic`]）
     pub interrupt_reason: InterruptReason,
+    /// 限流保持窗口；`Some` 表示这段时间内一律不敲字
+    ///
+    /// 由判定层算好交给动作层保存，下一轮再喂回来——**跟
+    /// [`Self::wants_second_opinion`] 同一个套路**：这一层是纯的，
+    /// 不持有状态、不看时钟以外的东西，谁记住这件事由调用方决定。
+    #[serde(default)]
+    pub rate_limit_hold: Option<RateLimitHold>,
     /// 结构性证据到这儿就用尽了：去问一句 [`Arbitration`] 有可能改变结论
     ///
     /// 由判定层置位，动作层照着做——**不在动作层重新推一遍「哪里算用尽」**。
@@ -174,6 +183,18 @@ pub enum InterruptReason {
     ProcessCrashed,
     /// 撞上限流，会自己恢复
     RateLimited,
+    /// 上游把请求挡回来了，但说不清是不是限流
+    ///
+    /// 跟 [`Self::RateLimited`] **刻意分开**，尽管两者的手段一样（都是 `Wait`）。
+    /// 分开的理由不是策略，是**这个字段要在界面上向用户解释判定**：
+    /// `reason.rate_limited` 那句话写的是「等窗口过去就会自己恢复」，
+    /// 而一个中转站回的 `503` 完全可能是上游真的挂了——那句话对它就是假的，
+    /// 用户照着等，等到的是什么都不会发生。
+    ///
+    /// 两者的下一步也确实不同：限流等一会儿就好，上游挡回来则可能要换一家。
+    /// 手段相同不是合并的理由——[`Self::RuntimeError`] 和 [`Self::Stalled`]
+    /// 也都是 `Nudge`，一样分开写着。
+    UpstreamRejected,
     /// 它在问一个具体的问题（要授权、要选 y/n）
     AwaitingInput,
     /// 运行时把某一行标成了故障
@@ -253,6 +274,7 @@ impl InterruptReason {
             InterruptReason::None => "none",
             InterruptReason::ProcessCrashed => "process_crashed",
             InterruptReason::RateLimited => "rate_limited",
+            InterruptReason::UpstreamRejected => "upstream_rejected",
             InterruptReason::AwaitingInput => "awaiting_input",
             InterruptReason::RuntimeError => "runtime_error",
             InterruptReason::Stalled => "stalled",
@@ -266,6 +288,7 @@ impl InterruptReason {
             InterruptReason::None => "reason.none",
             InterruptReason::ProcessCrashed => "reason.process_crashed",
             InterruptReason::RateLimited => "reason.rate_limited",
+            InterruptReason::UpstreamRejected => "reason.upstream_rejected",
             InterruptReason::AwaitingInput => "reason.awaiting_input",
             InterruptReason::RuntimeError => "reason.runtime_error",
             InterruptReason::Stalled => "reason.stalled",
@@ -281,6 +304,9 @@ impl InterruptReason {
     ///   「继续」会变成一条命令，而我们还会把它记成一次成功的续跑。
     /// - `RateLimited`：限流会自己过去。这时候敲字既不能让它提前恢复，
     ///   又会在冷却里白烧一次额度——真正该做的是把这条知会给人，然后等。
+    /// - `UpstreamRejected`：上游把请求挡回来了。**这一条的代价是不对称的**：
+    ///   猜错方向当成限流，最坏是多等一个冷却；猜错方向继续敲字，而对面其实
+    ///   在限流，有的供应商会直接封号。所以这里取保守侧。
     /// - `AwaitingInput`：它在问一个具体的问题。「继续」不是那个问题的答案；
     ///   往一个 `(y/n)` 提示里敲回车，等于替用户批准了一件他没看过的事。
     ///   **这是权限边界问题，不只是效果问题。**
@@ -292,13 +318,95 @@ impl InterruptReason {
         match self {
             InterruptReason::ProcessCrashed => ResumeTactic::HandOff,
             InterruptReason::AwaitingInput => ResumeTactic::HandOff,
-            InterruptReason::RateLimited => ResumeTactic::Wait,
+            InterruptReason::RateLimited | InterruptReason::UpstreamRejected => ResumeTactic::Wait,
             InterruptReason::RuntimeError
             | InterruptReason::Stalled
             | InterruptReason::Unknown
             | InterruptReason::None => ResumeTactic::Nudge,
         }
     }
+
+    /// 这个原因该不该起一个限流保持窗口
+    ///
+    /// 存在的理由是**证据会滚出视野**。适配器只读记录尾部 40 行
+    /// （`read_tail_lines(path, 40)`），而 agent 撞上限流之后往往还会继续写
+    /// 几十行——重试日志、状态刷新。等那行 `429` 被顶出这 40 行，下一轮
+    /// 判定就再也看不见它了，原因掉回 `Stalled` 或 `Unknown`，手段变回
+    /// `Nudge`，于是应用**正好在限流窗口还没过去的时候**开始敲字。
+    ///
+    /// 这就是需求里那个封号场景的真实形状：不是没有 `Wait`，是 `Wait` 只
+    /// 维持到那行字滚走为止。所以认出限流的那一轮要记一个截止时刻，
+    /// 之后靠它说话，不靠证据还在不在。
+    pub fn starts_rate_limit_hold(&self) -> bool {
+        matches!(
+            self,
+            InterruptReason::RateLimited | InterruptReason::UpstreamRejected
+        )
+    }
+}
+
+/// 认出限流之后，至少保持多少秒不敲字
+///
+/// 这是**下限**，不是固定值：消息里自带的等待时间（`retrying in 34s`）比它长
+/// 就用那个。取 60 秒的理由是它比默认冷却（`resume_cooldown_secs`，30 秒）长——
+/// 短于冷却的保持窗口等于没有保持，冷却一到照样敲进去。
+///
+/// 刻意不做成按供应商配的开关。「敲字对限流没用」这条知识对所有供应商一样，
+/// 做成开关就等于允许用户把自己配到危险的那一侧，而那一侧的代价是号被封。
+pub const RATE_LIMIT_HOLD_FLOOR_SECS: u64 = 60;
+
+/// 一个还没过期的限流保持窗口
+///
+/// 带着**当初是哪个原因把它按下去的**，而不只是一个截止时刻。这一位是必需的：
+/// 窗口存在的意义就是「证据已经滚出视野之后还能说出为什么不敲字」，而
+/// [`InterruptReason::RateLimited`] 和 [`InterruptReason::UpstreamRejected`]
+/// 对用户说的是两句不同的话（「等窗口过去就会自己恢复」vs「上游把请求挡回来了」）。
+/// 只存时刻的话，恢复时就得挑一句说——挑错了就是拿一句假话解释一个正确的决定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitHold {
+    /// 按到什么时候（`%Y-%m-%d %H:%M:%S`，本地时区，跟 `last_activity` 同一格式）
+    pub until: String,
+    /// 当初按下去的原因；窗口内每轮照原话解释
+    pub reason: InterruptReason,
+    /// 那一轮命中的证据片段，给界面和日志用
+    pub marker: Option<String>,
+}
+
+/// 限流保持：这一轮该不该继续按住不敲
+///
+/// 分成纯函数是因为它要判的是时间，而时间是这个仓库里最容易写出「本机全绿、
+/// CI 随机红」的东西（见 `docs/architecture.md` §13 那条时钟纪律）。
+/// 把「现在几点」作为参数传进来，测试就不用跟真实时钟赛跑。
+///
+/// 返回 `true` 表示保持窗口还没过去。调用方据此把手段压回 `Wait`，
+/// **不管这一轮还看不看得见那行限流日志**。
+pub fn hold_is_active(until: Option<&str>, now: NaiveDateTime) -> bool {
+    let Some(until) = until else {
+        return false;
+    };
+    match NaiveDateTime::parse_from_str(until, "%Y-%m-%d %H:%M:%S") {
+        Ok(deadline) => now < deadline,
+        // 解析不了就当没有这个窗口。这里**故意不保守**：一个存坏了的时间戳
+        // 如果被当成「一直保持」，会让某个会话再也不被续跑，而且没有任何
+        // 出口——那比多敲一次更糟，因为它是永久的、静默的。
+        Err(_) => false,
+    }
+}
+
+/// 这次限流该按住多久（秒）
+///
+/// 三个数取最大值，理由各不相同：
+/// - [`RATE_LIMIT_HOLD_FLOOR_SECS`]：保底，且必须长于冷却，否则形同没有。
+/// - `cooldown`：用户把冷却调到 5 分钟时，保持窗口不该比它还短。
+/// - `hint`：agent 自己说的等待时间，这是最准的一个（见
+///   [`rate_limit::parse_wait_hint`]）。
+///
+/// 取最大而不是取 hint 优先：hint 可能是 `retrying in 500ms`，那说的是这一次
+/// 重试很快，不是「限流已经过去了」——按 0.5 秒放开就又开始敲了。
+pub fn hold_duration_secs(cooldown: u64, hint: Option<u64>) -> u64 {
+    RATE_LIMIT_HOLD_FLOOR_SECS
+        .max(cooldown)
+        .max(hint.unwrap_or(0))
 }
 
 /// 回合还没收尾时，把「多久算卡住」的阈值放大多少倍
@@ -548,7 +656,9 @@ impl Detector {
             second_opinion,
         };
         let (attention, attention_detail) = self.grade_attention(evidence);
-        let interrupt_reason = self.classify_reason(evidence);
+        let classified = self.classify_reason(evidence);
+        let (interrupt_reason, rate_limit_hold) =
+            self.apply_rate_limit_hold(session, classified, error_output, now.naive_local());
         let signal_kinds = signals.iter().map(|signal| signal.kind.clone()).collect();
 
         DetectionResult {
@@ -571,9 +681,68 @@ impl Detector {
                 second_opinion,
             },
             interrupt_reason,
+            rate_limit_hold,
             wants_second_opinion,
             detected_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         }
+    }
+
+    /// 限流保持窗口：起一个新的，或者继续按住旧的
+    ///
+    /// 这一步是**证据滚出视野**那个问题的答案。适配器只读记录尾部 40 行，而
+    /// agent 撞上限流之后往往还会写几十行重试日志——等那行 `429` 被顶出去，
+    /// 下一轮判定就再也看不见它，原因掉回 `Stalled`，手段变回 `Nudge`，
+    /// 应用**正好在限流窗口还没过去的时候**开始敲字。需求里那个「一直重复请求
+    /// 就把号封了」的场景，真实形状就是这个：不是没有 `Wait`，是 `Wait` 只
+    /// 维持到那行字滚走为止。
+    ///
+    /// 两条路：
+    /// - 这一轮**认出**限流 → 按 [`hold_duration_secs`] 算一个截止时刻记下来。
+    ///   每次认出都重算，所以限流持续期间窗口会一直往后推。
+    /// - 这一轮**没认出**、但上一轮的窗口还没到 → 照原样返回当初那个原因。
+    ///   说的是当初那句话，不是现编一个——见 [`RateLimitHold::reason`]。
+    ///
+    /// 保持只压住「敲不敲字」，**不碰注意力分级**：窗口里该叫人还是要叫人。
+    /// 应用打算按住不动的时候，正是最该让用户知道的时候。
+    fn apply_rate_limit_hold(
+        &self,
+        session: &AgentSession,
+        classified: InterruptReason,
+        error_output: Option<&str>,
+        now: NaiveDateTime,
+    ) -> (InterruptReason, Option<RateLimitHold>) {
+        if classified.starts_rate_limit_hold() {
+            let lower = error_output.map(|e| e.to_lowercase());
+            let hint = lower.as_deref().and_then(rate_limit::parse_wait_hint);
+            let marker = lower
+                .as_deref()
+                .and_then(|l| first_match(l, &self.config.rate_limit_keywords))
+                .or_else(|| {
+                    lower
+                        .as_deref()
+                        .and_then(rate_limit::upstream_rejection)
+                        .map(|shape| shape.marker)
+                });
+            let secs = hold_duration_secs(self.config.resume_cooldown_secs, hint);
+            let until = now + chrono::Duration::seconds(secs as i64);
+            return (
+                classified,
+                Some(RateLimitHold {
+                    until: until.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    reason: classified,
+                    marker,
+                }),
+            );
+        }
+
+        // 窗口还在：照当初那个原因说话，把手段按回 `Wait`
+        if let Some(hold) = &session.rate_limit_hold {
+            if hold_is_active(Some(&hold.until), now) {
+                return (hold.reason, Some(hold.clone()));
+            }
+        }
+
+        (classified, None)
     }
 
     /// 它为什么停下来 —— 只在判定为「确认中断」时才有意义
@@ -614,6 +783,19 @@ impl Detector {
             // 而两者的手段相反（等 vs 敲），认错了就会在限流窗口里白撞一次。
             if first_match(&lower, &self.config.rate_limit_keywords).is_some() {
                 return InterruptReason::RateLimited;
+            }
+            // 关键词一条都没对上，再问一句「这行长得像不像上游把请求挡回来了」。
+            //
+            // 这是那八条关键词漏掉的那一大类：中转站把限流写成
+            // 「上游负载已饱和」、或者只回一个 `upstream_busy` / 一个裸 `429`。
+            // 漏掉的后果不是少一条日志——是原因掉到 `RuntimeError`，手段变成
+            // `Nudge`，应用按冷却一遍遍往里敲字，而有的供应商对此的反应是封号。
+            //
+            // 顺序在故障之前、在用户关键词之后：用户配的永远最优先（那是
+            // 「我们家中转站这么说」的直接解法），兜底只管用户没配到的。
+            if let Some(shape) = rate_limit::upstream_rejection(&lower) {
+                tracing::debug!("[AgentPulse] 上游拒绝形状命中：{}", shape.marker);
+                return InterruptReason::UpstreamRejected;
             }
             return InterruptReason::RuntimeError;
         }
@@ -911,7 +1093,223 @@ mod tests {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string()
     }
-    // TESTS_PLACEHOLDER_DETECTOR
+    /// 把「几秒之后」写成保持窗口那个格式
+    fn until(secs: i64) -> String {
+        (Local::now() + chrono::Duration::seconds(secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    // ── 限流保持窗口 ──
+
+    #[test]
+    fn a_future_deadline_keeps_the_hold_active() {
+        let now = Local::now().naive_local();
+        assert!(hold_is_active(Some(&until(120)), now));
+    }
+
+    #[test]
+    fn a_passed_deadline_releases_the_hold() {
+        let now = Local::now().naive_local();
+        assert!(!hold_is_active(Some(&until(-1)), now));
+    }
+
+    #[test]
+    fn no_deadline_means_no_hold() {
+        assert!(!hold_is_active(None, Local::now().naive_local()));
+    }
+
+    /// 存坏了的时间戳**故意不保守**：当成「一直按住」会让这个会话再也不被
+    /// 续跑，而且没有出口——永久的静默失败比多敲一次糟得多。
+    #[test]
+    fn a_corrupt_deadline_releases_rather_than_sticks() {
+        let now = Local::now().naive_local();
+        assert!(
+            !hold_is_active(Some("not a timestamp"), now),
+            "解析不了的时间戳要放开，否则一个存坏的值就能让某个会话永久沉默"
+        );
+    }
+
+    /// 保持窗口必须长于冷却，否则形同没有：冷却一到照样敲进去
+    #[test]
+    fn the_hold_floor_outlasts_the_default_cooldown() {
+        let cooldown = AppConfig::default().resume_cooldown_secs;
+        assert!(
+            hold_duration_secs(cooldown, None) > cooldown,
+            "保持窗口短于冷却等于没有保持"
+        );
+    }
+
+    /// 消息里说的等待时间更长时听它的——那是最准的一个数
+    #[test]
+    fn a_longer_hint_wins() {
+        assert_eq!(hold_duration_secs(30, Some(900)), 900);
+    }
+
+    /// `retrying in 500ms` 说的是这一次重试很快，不是「限流已经过去」。
+    /// 取最大而不是 hint 优先，就是为了拦住这个。
+    #[test]
+    fn a_tiny_hint_does_not_shorten_the_hold() {
+        assert_eq!(
+            hold_duration_secs(30, Some(0)),
+            RATE_LIMIT_HOLD_FLOOR_SECS,
+            "按 0.5 秒放开就又开始敲了"
+        );
+    }
+
+    /// 用户把冷却调得比保底还长时，保持窗口不该比冷却短
+    #[test]
+    fn a_long_cooldown_stretches_the_hold() {
+        assert_eq!(hold_duration_secs(600, None), 600);
+    }
+
+    // ── 保持窗口跨轮生效（这一组是这个功能的全部理由）──
+
+    /// 这条守的是**证据滚出视野**那个场景，也就是需求里那个封号场景的真实形状。
+    ///
+    /// 适配器只读记录尾部 40 行，agent 撞上限流后还会继续写重试日志，那行
+    /// `429` 很快被顶出去。没有保持窗口的话，下一轮判定看不见任何限流证据，
+    /// 原因掉回 `Stalled` → `Nudge`，于是应用**正好在限流窗口还没过去的时候**
+    /// 开始一遍遍敲字。
+    #[test]
+    fn a_scrolled_away_rate_limit_still_holds_the_line() {
+        let d = detector();
+        let mut session = session();
+        // 第一轮：看得见那行 429
+        let (reason, hold) = d.apply_rate_limit_hold(
+            &session,
+            InterruptReason::RateLimited,
+            Some("429 rate limit reached, retrying in 30s"),
+            Local::now().naive_local(),
+        );
+        assert_eq!(reason, InterruptReason::RateLimited);
+        session.rate_limit_hold = hold;
+        assert!(
+            session.rate_limit_hold.is_some(),
+            "认出限流那一轮要记下窗口"
+        );
+
+        // 第二轮：那行字已经被顶出 40 行，判定只看得出「活没干完」
+        let (reason, hold) = d.apply_rate_limit_hold(
+            &session,
+            InterruptReason::Stalled,
+            None,
+            Local::now().naive_local(),
+        );
+        assert_eq!(
+            reason.tactic(),
+            ResumeTactic::Wait,
+            "限流证据滚出视野后仍在窗口内，绝不能因为看不见就改成敲字"
+        );
+        assert!(hold.is_some(), "窗口没过去就得继续带着");
+    }
+
+    /// 窗口内照**当初那句话**解释，不现编一个
+    ///
+    /// `rate_limited` 对用户说的是「等窗口过去就会自己恢复」，而
+    /// `upstream_rejected` 说的是「上游把请求挡回来了」——后者完全可能是上游
+    /// 真的挂了。恢复时挑错一句，就是拿一句假话解释一个正确的决定。
+    #[test]
+    fn the_hold_replays_the_original_reason() {
+        let d = detector();
+        let mut session = session();
+        let (_, hold) = d.apply_rate_limit_hold(
+            &session,
+            InterruptReason::UpstreamRejected,
+            Some("upstream_busy"),
+            Local::now().naive_local(),
+        );
+        session.rate_limit_hold = hold;
+
+        let (reason, _) = d.apply_rate_limit_hold(
+            &session,
+            InterruptReason::Stalled,
+            None,
+            Local::now().naive_local(),
+        );
+        assert_eq!(
+            reason,
+            InterruptReason::UpstreamRejected,
+            "窗口里要说当初那个原因，不能悄悄换成另一条对用户不成立的说法"
+        );
+    }
+
+    /// 窗口过去就得放开：`Wait` 是「它会自己好」，不是「永远别管它」
+    #[test]
+    fn an_expired_hold_lets_the_nudge_through() {
+        let d = detector();
+        let mut session = session();
+        session.rate_limit_hold = Some(RateLimitHold {
+            until: until(-1),
+            reason: InterruptReason::RateLimited,
+            marker: Some("429".to_string()),
+        });
+        let (reason, hold) = d.apply_rate_limit_hold(
+            &session,
+            InterruptReason::Stalled,
+            None,
+            Local::now().naive_local(),
+        );
+        assert_eq!(
+            reason.tactic(),
+            ResumeTactic::Nudge,
+            "窗口过去了还按着，就是把一次限流变成了永久沉默"
+        );
+        assert!(hold.is_none(), "过期的窗口不该继续带着");
+    }
+
+    /// 限流持续期间每认出一次都把窗口往后推
+    #[test]
+    fn a_fresh_hit_pushes_the_deadline_back() {
+        let d = detector();
+        let mut session = session();
+        session.rate_limit_hold = Some(RateLimitHold {
+            until: until(5),
+            reason: InterruptReason::RateLimited,
+            marker: None,
+        });
+        let (_, hold) = d.apply_rate_limit_hold(
+            &session,
+            InterruptReason::RateLimited,
+            Some("429 too many requests"),
+            Local::now().naive_local(),
+        );
+        let pushed = hold.expect("认出限流就该有窗口").until;
+        assert!(pushed > until(5), "又撞了一次，窗口得往后推而不是维持原样");
+    }
+
+    /// 窗口要带上证据片段：日志里说「不敲字」而不说凭什么，
+    /// 用户没法判断它是不是认错了
+    #[test]
+    fn the_hold_carries_the_evidence_that_armed_it() {
+        let (_, hold) = detector().apply_rate_limit_hold(
+            &session(),
+            InterruptReason::RateLimited,
+            Some("429 rate limit reached"),
+            Local::now().naive_local(),
+        );
+        assert_eq!(
+            hold.and_then(|h| h.marker),
+            Some("rate limit".to_string()),
+            "用户配的关键词优先当证据出处"
+        );
+    }
+
+    /// 不该起窗口的原因不许起：`Stalled` 起了窗口就等于把该敲的那一类也按住了
+    #[test]
+    fn an_ordinary_stall_arms_no_hold() {
+        let (reason, hold) = detector().apply_rate_limit_hold(
+            &session(),
+            InterruptReason::Stalled,
+            None,
+            Local::now().naive_local(),
+        );
+        assert_eq!(reason, InterruptReason::Stalled);
+        assert!(
+            hold.is_none(),
+            "「活没干完」正是该敲的那一类，不能给它上窗口"
+        );
+    }
 
     // ── 中断原因与手段 ──
 
@@ -968,6 +1366,83 @@ mod tests {
         ));
         assert_eq!(reason, InterruptReason::RateLimited);
         assert_eq!(reason.tactic(), ResumeTactic::Wait);
+    }
+
+    /// 这条是需求里那个封号场景的另一半：**一条关键词都没对上**。
+    ///
+    /// 中转站把限流写成「上游负载已饱和」时，`rate_limit_keywords` 那八条
+    /// 全部落空，原因掉到 `RuntimeError` → `Nudge`，应用就按冷却一遍遍往里
+    /// 敲字——正是会让号被封的那个行为。兜底形状识别要接住它。
+    #[test]
+    fn an_unrecognized_relay_limit_is_not_nudged() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            None,
+            Some("请求失败：上游负载已饱和，请稍后重试"),
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::UpstreamRejected);
+        assert_eq!(
+            reason.tactic(),
+            ResumeTactic::Wait,
+            "认不出是限流就继续敲字，是这个需求要拦的那个封号行为"
+        );
+    }
+
+    /// 用户配的关键词永远排在兜底前面：那是「我们家中转站这么说」的直接解法，
+    /// 兜底只管用户没配到的
+    #[test]
+    fn a_configured_keyword_outranks_the_fallback_shape() {
+        let config = AppConfig {
+            rate_limit_keywords: vec!["上游负载".to_string()],
+            ..Default::default()
+        };
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = Detector::new(config).classify_reason(evidence(
+            None,
+            // 同时含 503（兜底形状）和用户配的词
+            Some("503 上游负载已饱和"),
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(
+            reason,
+            InterruptReason::RateLimited,
+            "用户配了词就该走 RateLimited，不能被兜底抢走"
+        );
+    }
+
+    /// 事实仍然优先：一个死进程留下的 503 不该被认成「等等就好」，
+    /// 否则又在往一个死进程里等一个不会来的恢复
+    #[test]
+    fn a_dead_process_outranks_a_rejection_shape() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            None,
+            Some("503 service unavailable"),
+            false,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::ProcessCrashed);
+    }
+
+    /// 普通故障不该被兜底顺手改判：那会让真正该叫人的时候没人来
+    #[test]
+    fn an_ordinary_failure_is_still_a_runtime_error() {
+        let verdict = Verdict::ConfirmInterrupt;
+        let reason = detector().classify_reason(evidence(
+            None,
+            Some("error: cannot find module 'foo'"),
+            true,
+            TurnState::AwaitingUser,
+            &verdict,
+        ));
+        assert_eq!(reason, InterruptReason::RuntimeError);
+        assert_eq!(reason.tactic(), ResumeTactic::Nudge);
     }
 
     /// 往一个 `(y/n)` 提示里敲「继续」，等于替用户批准了一件他没看过的事。
@@ -1064,25 +1539,73 @@ mod tests {
         assert_eq!(reason, InterruptReason::Stalled);
     }
 
-    /// 只有三个原因不敲字，而且每一个都有具体的坏处可说。
-    /// 这条锁住那份名单：以后新增原因，默认必须落在 `Nudge` 一侧。
+    /// 每个原因配什么手段，一个不漏地钉住
+    ///
+    /// **这里用 `match` 而不是手写两张名单，是故意的。** 手写名单的版本
+    /// （这条测试的上一版）有个静默失效的毛病：新增一个原因时它照样全绿，
+    /// 只是不再覆盖那一个——加 `UpstreamRejected` 的时候就是这样，
+    /// 测试通过，而新原因的手段没有任何东西在看着。
+    ///
+    /// 换成 `match` 之后，新增变体会让这里**编译不过**，逼着人回答一次
+    /// 「这个原因该不该敲字」。这个问题答错的代价是往一个不该敲的会话里敲字，
+    /// 不值得靠自觉去记。
     #[test]
-    fn only_three_reasons_hold_their_fire() {
-        let silent = [
-            InterruptReason::ProcessCrashed,
-            InterruptReason::AwaitingInput,
-            InterruptReason::RateLimited,
-        ];
-        for reason in silent {
-            assert_ne!(reason.tactic(), ResumeTactic::Nudge, "{}", reason.key());
-        }
+    fn every_reason_pins_its_tactic() {
+        use InterruptReason as R;
+        use ResumeTactic as T;
         for reason in [
-            InterruptReason::None,
-            InterruptReason::RuntimeError,
-            InterruptReason::Stalled,
-            InterruptReason::Unknown,
+            R::None,
+            R::ProcessCrashed,
+            R::RateLimited,
+            R::UpstreamRejected,
+            R::AwaitingInput,
+            R::RuntimeError,
+            R::Stalled,
+            R::Unknown,
         ] {
-            assert_eq!(reason.tactic(), ResumeTactic::Nudge, "{}", reason.key());
+            // 这个 match 就是那道闸门：漏一个变体这里就编译不过
+            let expected = match reason {
+                R::ProcessCrashed | R::AwaitingInput => T::HandOff,
+                R::RateLimited | R::UpstreamRejected => T::Wait,
+                R::None | R::RuntimeError | R::Stalled | R::Unknown => T::Nudge,
+            };
+            assert_eq!(reason.tactic(), expected, "{}", reason.key());
+        }
+    }
+
+    /// 起保持窗口的原因跟「不敲字」的原因**不是同一份名单**，别顺手对齐
+    ///
+    /// `ProcessCrashed` 和 `AwaitingInput` 也不敲字，但它们不该起限流窗口：
+    /// 一个死进程不会「等一会儿就好」，一个待批准的问题更不会自己过去。
+    /// 给它们上窗口只会把一件该立刻交给人的事又推迟一分钟。
+    #[test]
+    fn only_the_two_upstream_reasons_arm_a_hold() {
+        use InterruptReason as R;
+        for reason in [
+            R::None,
+            R::ProcessCrashed,
+            R::RateLimited,
+            R::UpstreamRejected,
+            R::AwaitingInput,
+            R::RuntimeError,
+            R::Stalled,
+            R::Unknown,
+        ] {
+            let expected = match reason {
+                R::RateLimited | R::UpstreamRejected => true,
+                R::None
+                | R::ProcessCrashed
+                | R::AwaitingInput
+                | R::RuntimeError
+                | R::Stalled
+                | R::Unknown => false,
+            };
+            assert_eq!(
+                reason.starts_rate_limit_hold(),
+                expected,
+                "{}",
+                reason.key()
+            );
         }
     }
 

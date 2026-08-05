@@ -128,6 +128,17 @@ pub struct AgentSession {
     /// 「已中断」，用户看到的就是守护神漏了一次，而不是它做了一个正确的决定。
     #[serde(default)]
     pub interrupt_reason: crate::detector::InterruptReason,
+    /// 限流保持窗口：按到这个时刻之前一律不敲字（v1.8）
+    ///
+    /// 进程内状态，不落库。跟 `resume_streak` 一样由 `scan_once` 逐轮合并：
+    /// 会话消失重现就重新开始，那是对的——重新出现的会话该重新看证据。
+    ///
+    /// 存在的理由是**限流的证据会滚出视野**：适配器只读记录尾部 40 行，
+    /// 而 agent 撞上限流后还会继续写重试日志，那行 `429` 很快被顶出去。
+    /// 没有这个字段的话，手段就只能维持到那行字滚走为止，然后在窗口还没过去
+    /// 的时候重新开始敲——那正是会让号被封的行为。
+    #[serde(default)]
+    pub rate_limit_hold: Option<crate::detector::RateLimitHold>,
     /// 针对上面那个原因，这一轮打算怎么办（v1.6）
     ///
     /// 由判定层算好再发上来，**不让界面照着原因表再推一遍**。原因和手段之间
@@ -218,6 +229,7 @@ impl Default for AgentSession {
             attention_detail: None,
             detection_evidence: None,
             interrupt_reason: crate::detector::InterruptReason::None,
+            rate_limit_hold: None,
             resume_tactic: crate::detector::ResumeTactic::Nudge,
             tty: None,
             terminal_app: None,

@@ -20,8 +20,8 @@ export type AttentionLevel =
  * 中断原因（v1.6）：它为什么停下来
  *
  * 跟 `AttentionLevel` 是同一件事的两面——级别说「要不要叫人」，
- * 原因说「叫来了能干什么」。有三个原因后端会**故意不催**
- * （`process_crashed` / `rate_limited` / `awaiting_input`），
+ * 原因说「叫来了能干什么」。有四个原因后端会**故意不催**
+ * （`process_crashed` / `rate_limited` / `upstream_rejected` / `awaiting_input`），
  * 界面必须把这层意思说出来，否则用户看到的是漏了一次，
  * 而不是一个正确的决定。
  */
@@ -38,6 +38,15 @@ export type InterruptReason =
   | "none"
   | "process_crashed"
   | "rate_limited"
+  /**
+   * 上游把请求挡回来了，但说不清是不是限流（v1.8）
+   *
+   * 跟 `rate_limited` 分开是因为两者对用户说的不是同一句话：限流「等窗口
+   * 过去就会自己恢复」，而一个中转站回的 503 完全可能是上游真的挂了。
+   * 手段一样（都不敲字）不是合并的理由——`runtime_error` 和 `stalled`
+   * 也都是 `nudge`，一样分开写着。
+   */
+  | "upstream_rejected"
   | "awaiting_input"
   | "runtime_error"
   | "stalled"

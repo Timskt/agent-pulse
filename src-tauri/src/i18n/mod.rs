@@ -429,6 +429,11 @@ const TABLE: &[(&str, &str, &str)] = &[
         "撞上限流，等窗口过去就会自己恢复",
         "Rate limited — it will recover once the window passes",
     ),
+        (
+        "reason.upstream_rejected",
+        "上游把请求挡回来了",
+        "The upstream rejected the request",
+    ),
     (
         "reason.awaiting_input",
         "它在问你一个具体的问题",
@@ -462,6 +467,14 @@ const TABLE: &[(&str, &str, &str)] = &[
         "log.resume_wait",
         "{agent}：{reason}，这次不催，等它自己恢复",
         "{agent}: {reason} — not nudging, waiting for it to recover",
+    ),
+    // 带上截止时刻和证据。「不催」这件事如果只说「在等」，用户看到的是一个
+    // 没有尽头的沉默，跟守护神漏了一次分不出来——所以要说到什么时候为止。
+    // 写「至少到」而不是「到」：限流持续期间每认出一次都会把窗口往后推。
+    (
+        "log.rate_limit_hold",
+        "{agent}：{reason}（{marker}），至少按到 {until} 之前都不敲字",
+        "{agent}: {reason} ({marker}) — holding off typing until at least {until}",
     ),
     // ── CSV 表头 ──
     //
@@ -640,5 +653,88 @@ mod tests {
         let before = keys.len();
         keys.dedup();
         assert_eq!(before, keys.len(), "i18n 表里有重复 key");
+    }
+
+    /// 每个枚举的 `i18n_key()` 都得在表里查得到
+    ///
+    /// [`I18n::t`] 查不到时返回**键名本身**，那是给「表里暂时没这条」留的
+    /// 安全出口，代价是漏一条不会有任何报错——用户在活动日志里看到的是
+    /// `reason.upstream_rejected` 这种字符串。加一个枚举变体时 `cargo build`
+    /// 过、`clippy` 过、别的测试也全绿，只有真跑到那个分支才看得见。
+    ///
+    /// 前端那边已经有一道同类的门（`display.test.ts` 直接读 Rust 的 `key()`
+    /// 匹配臂当事实来源），后端一直没有。这条把它补上。
+    ///
+    /// 用 `match` 逐个变体列出来而不是找一个 `ALL` 常量：新增变体时这里
+    /// **编译不过**，逼着人回答「这条在界面上怎么说」。
+    #[test]
+    fn every_enum_key_resolves_to_real_wording() {
+        use crate::detector::{AttentionLevel, InterruptReason};
+        use crate::resumer::ResumeOutcome;
+
+        let keys: Vec<&'static str> = {
+            let mut out = Vec::new();
+            for reason in [
+                InterruptReason::None,
+                InterruptReason::ProcessCrashed,
+                InterruptReason::RateLimited,
+                InterruptReason::UpstreamRejected,
+                InterruptReason::AwaitingInput,
+                InterruptReason::RuntimeError,
+                InterruptReason::Stalled,
+                InterruptReason::Unknown,
+            ] {
+                // 这个 match 只为让漏掉的变体编译不过
+                match reason {
+                    InterruptReason::None
+                    | InterruptReason::ProcessCrashed
+                    | InterruptReason::RateLimited
+                    | InterruptReason::UpstreamRejected
+                    | InterruptReason::AwaitingInput
+                    | InterruptReason::RuntimeError
+                    | InterruptReason::Stalled
+                    | InterruptReason::Unknown => {}
+                }
+                out.push(reason.i18n_key());
+            }
+            for level in [
+                AttentionLevel::None,
+                AttentionLevel::NeedsInput,
+                AttentionLevel::Completed,
+                AttentionLevel::RateLimited,
+                AttentionLevel::Error,
+            ] {
+                match level {
+                    AttentionLevel::None
+                    | AttentionLevel::NeedsInput
+                    | AttentionLevel::Completed
+                    | AttentionLevel::RateLimited
+                    | AttentionLevel::Error => {}
+                }
+                out.push(level.i18n_key());
+            }
+            for outcome in [
+                ResumeOutcome::Landed,
+                ResumeOutcome::Silent,
+                ResumeOutcome::Failed,
+                ResumeOutcome::Unverifiable,
+            ] {
+                match outcome {
+                    ResumeOutcome::Landed
+                    | ResumeOutcome::Silent
+                    | ResumeOutcome::Failed
+                    | ResumeOutcome::Unverifiable => {}
+                }
+                out.push(outcome.i18n_key());
+            }
+            out
+        };
+
+        for key in keys {
+            assert!(
+                TABLE.iter().any(|(k, _, _)| *k == key),
+                "{key} 不在 i18n 表里——用户会在日志里看到这个键名本身"
+            );
+        }
     }
 }

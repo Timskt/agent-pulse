@@ -128,10 +128,11 @@ const TABLE = {
   // ── 中断原因 ──
   //
   // 这几条要回答的不是「它怎么了」（那是上面的级别在说），而是
-  // 「所以这次我到底做了什么」。三个「按住手」的原因必须有措辞，
+  // 「所以这次我到底做了什么」。四个「按住手」的原因必须有措辞，
   // 否则界面上一片「已中断」，用户会以为守护神漏了一次。
   "reason.process_crashed": ["进程已退出", "Process gone"],
   "reason.rate_limited": ["等限流过去", "Waiting out the limit"],
+  "reason.upstream_rejected": ["上游挡回来了", "Upstream rejected"],
   "reason.awaiting_input": ["在问你话", "Asking you"],
   "reason.runtime_error": ["运行时报错", "Runtime error"],
   "reason.stalled": ["活没干完", "Work unfinished"],

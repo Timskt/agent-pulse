@@ -456,25 +456,36 @@ impl MonitorEngine {
                         // 走 `on_change`：原因是**状态**，会一直成立到情况变化，
                         // 每 10 秒重播一遍等于自己刷屏。指纹用原因键——原因变了
                         // （限流过去了却变成了报错）要能重新开口。
-                        let key = if tactic == ResumeTactic::Wait {
-                            "log.resume_wait"
-                        } else {
-                            "log.resume_hand_off"
+                        let reason_text = i18n.t(detection.interrupt_reason.i18n_key());
+                        // 限流保持窗口要把截止时刻说出来。只说「在等」的话，
+                        // 用户看到的是一段没有尽头的沉默——那跟守护神漏了一次
+                        // 分不出来，而这里恰恰是它做了一个正确的决定。
+                        let message = match (&detection.rate_limit_hold, tactic) {
+                            (Some(hold), ResumeTactic::Wait) => i18n.tf(
+                                "log.rate_limit_hold",
+                                &[
+                                    ("agent", &session.agent_name),
+                                    ("reason", reason_text),
+                                    ("marker", hold.marker.as_deref().unwrap_or("-")),
+                                    ("until", &hold.until),
+                                ],
+                            ),
+                            _ => {
+                                let key = if tactic == ResumeTactic::Wait {
+                                    "log.resume_wait"
+                                } else {
+                                    "log.resume_hand_off"
+                                };
+                                i18n.tf(
+                                    key,
+                                    &[("agent", &session.agent_name), ("reason", reason_text)],
+                                )
+                            }
                         };
                         self.push_event_on_change(
                             Self::tactic_topic(&session.id),
                             detection.interrupt_reason.key(),
-                            EngineEvent::new(
-                                LogLevel::Warn,
-                                Some(session.id.clone()),
-                                i18n.tf(
-                                    key,
-                                    &[
-                                        ("agent", &session.agent_name),
-                                        ("reason", i18n.t(detection.interrupt_reason.i18n_key())),
-                                    ],
-                                ),
-                            ),
+                            EngineEvent::new(LogLevel::Warn, Some(session.id.clone()), message),
                         )
                         .await;
                         continue;
@@ -559,6 +570,7 @@ impl MonitorEngine {
                 session.attention_detail = detection.attention_detail.clone();
                 session.detection_evidence = Some(detection.evidence.clone());
                 session.interrupt_reason = detection.interrupt_reason;
+                session.rate_limit_hold = detection.rate_limit_hold.clone();
                 session.resume_tactic = detection.interrupt_reason.tactic();
                 match detection.verdict {
                     Verdict::TaskCompleted => session.status = SessionStatus::Completed,
@@ -790,6 +802,9 @@ impl MonitorEngine {
                     session.resume_count = old.resume_count;
                     session.resume_streak = old.resume_streak;
                     session.resume_failures = old.resume_failures;
+                    // 限流保持窗口要跨轮活着，这正是它存在的全部理由：
+                    // 那行 `429` 会滚出记录尾部 40 行，窗口不能跟着它一起消失
+                    session.rate_limit_hold = old.rate_limit_hold.clone();
                     session.last_resume_at = old.last_resume_at.clone();
                     session.discovered_at = old.discovered_at.clone();
                     session.status = old.status.clone();

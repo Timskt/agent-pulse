@@ -164,6 +164,7 @@ export function asStuckSecs(raw: number): number | null {
 const KNOWN_REASON: Record<Exclude<InterruptReason, "none">, true> = {
   process_crashed: true,
   rate_limited: true,
+  upstream_rejected: true,
   awaiting_input: true,
   runtime_error: true,
   stalled: true,
