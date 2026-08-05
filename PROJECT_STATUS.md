@@ -40,16 +40,16 @@
 
 | 维度 | 现状 |
 |---|---|
-| 版本 | `1.6.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死） |
-| 后端 | Rust，17 个文件，持续同步统计 |
-| 前端 | TypeScript + React 19，持续同步统计 |
-| 单元测试 | Rust **128 个**（`cargo test`）+ 前端 **38 个**（`pnpm test`，vitest）；两者都在三个平台的 CI 里跑 |
-| Tauri 命令 | 25 个 `#[tauri::command]` |
+| 版本 | `1.7.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死） |
+| 后端 | Rust，18 个文件，约 14.9k 行 |
+| 前端 | TypeScript + React 19，44 个文件，约 7.3k 行 |
+| 单元测试 | Rust **191 个**（`cargo test`）+ 前端 **93 个**（`pnpm test`，vitest，7 个文件）；两者都在三个平台的 CI 里跑 |
+| Tauri 命令 | 38 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
 | 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
-| i18n 词条 | 后端 151 条（`(key, zh, en)`），前端 220 条（`[zh, en]`） |
+| i18n 词条 | 后端 198 条（`(key, zh, en)`），前端 347 条（`[zh, en]`） |
 | 持久化 | SQLite 6 张表 |
-| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
+| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
 
 **这个版本能做到的事**：在你不改变任何使用习惯的前提下，后台盯着 Claude Code / Codex / OpenCode
 的会话文件与进程，判断它是"还在干活"、"卡住了"、"在等你回话"、"限流了"还是"报错了"；
@@ -102,7 +102,8 @@ AgentPulse 走的是另一条：**附着在你已有的工作方式上**。代�
 | v1.3 P2 | 远程审批 | ❌ | 手机上点一下"续跑"——**未实现**，见 [13.2](#132-下一步候选v16) |
 | v1.4 | **可信化** | ✅ | tmux/screen 免权限投递通道、续跑演练（`ResumeProbe` 干跑探测）、macOS 辅助功能权限自检与"去开权限"引导、前端 vitest、局域网看板换绑修复 |
 | v1.5 | **闭环化** | ✅ | 投递后核验落地（`ResumeOutcome` + `resume_verified`）、一个计数器拆成三个、上限从判定层挪到动作闸门、静默失败会出声、日志区分事件与状态、版本号单一来源 |
-| v1.6 | **可解释判定** | ✅ 待发布 | `InterruptReason` 与 `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权、指纹缓存、每轮最多一问）、自定义适配器 UI、跨语言枚举/i18n 门禁、SQLite 形状迁移 |
+| v1.6 | **可解释判定** | ✅ | `InterruptReason` 与 `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权、指纹缓存、每轮最多一问）、自定义适配器 UI、跨语言枚举/i18n 门禁、SQLite 形状迁移 |
+| v1.7 | **记录与导出** | ✅ 待发布 | 单实例守护、续跑记录中心（独立分页 + 筛选）、统计趋势真实对比、会话档案抽屉（生命周期 / 中断次数 / 续跑时间线 / 成本时间线 / 路径一键复制）、柱状图时间刻度、CSV 导出（转义与公式注入分开处理）、会话生命周期收拢（修「关了还显示运行中」）、跨夏令时日期分组修复 |
 | v2.0 | 编排层 | ⏸ | 主动搁置，与非侵入定位冲突，动工前需确认 |
 | v2.1+ | 自治层 | ⏸ | 同上 |
 
@@ -1097,7 +1098,19 @@ ad-hoc 签名**每次构建都不一样**。后果：
 自签名/自己 `cargo tauri build` 出来的包、把 `.app` 覆盖更新、把它从"下载"拖到"应用程序"——
 都会触发同一件事。
 
-**怎么修**（三条都有效，按省事程度排）：
+**怎么根治**：让签名身份别再变。`scripts/macos-signing-identity.sh`（`pnpm
+macos:signing-identity`）造一张自签名的代码签名证书并在登录钥匙串里标为可信，之后
+`APPLE_SIGNING_IDENTITY="AgentPulse Self-Signed" pnpm tauri:build`，指定要求就从
+`cdhash H"…"` 变成 `identifier "com.agentpulse.app" and certificate leaf H"…"`
+——认名字加证书，证书不换这串就不变，**勾一次一直有效**。装上新版本后还要再重勾
+一次（让 TCC 把旧的哈希记录换成新的名字记录），那是最后一次。
+
+自签名不能公证，**对外分发仍需真的 Developer ID**：证书导成 base64 存进仓库
+secrets，CI 里给 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` /
+`APPLE_SIGNING_IDENTITY`，`tauri build` 会自己认。**签名身份故意不写进
+`tauri.conf.json`**——写死了，没有这张证书的人连构建都过不去。
+
+**已经装了 adhoc 包、暂时不想重新构建**（三条都有效，按省事程度排）：
 
 | 做法 | 命令 / 步骤 |
 |---|---|
@@ -1105,16 +1118,20 @@ ad-hoc 签名**每次构建都不一样**。后果：
 | 删掉再加回 | 选中 AgentPulse 按 `−`，再按 `+` 从"应用程序"里重新添加 |
 | 命令行重置 | `tccutil reset Accessibility com.agentpulse.app`（会清掉这一项的全部记录，然后重新授权） |
 
-**它在产品里的三个出口**（不能指望用户读文档）：
+**它在产品里的四个出口**（不能指望用户读文档）：
 
 - `accessibility_granted()` 用 `tell application "System Events" to return UI elements enabled`
   **只读探测**——不弹窗、不把人拽进设置面板，所以敢在引擎 `start()` 前和每次演练里各查一次。
 - `is_accessibility_error()` 认 `-1719` / `-25211` / `not allowed to send keystrokes` 等，
   把这个"默认静默"的错误换成一句能照着做的话。它**故意不带 cfg**：纯字符串判断，
   三个平台的 CI 都能测（`accessibility_errors_are_recognised`）。
-- `resume.needs_accessibility` / `probe.no_accessibility` 两条文案里都写了
-  "如果已经是开着的，取消再勾上"——因为**"勾着但失效"才是最常见的那种状态**，
-  只说"请去开启权限"等于让用户看着一个已经打勾的开关发愁。
+- `signature_is_stable()` 读 `codesign -d --requirements -`：出现 `anchor apple` 或
+  `certificate` 说明认的是名字加证书，只有 `cdhash` 说明是临时签名。同样**故意不带 cfg**。
+  查不出来就当稳定——这一项只用来加一句解释，拿不到证据时宁可少说，也不要凭猜测吓人。
+- `accessibility_hint()` 据此在 `resume.needs_accessibility` / `probe.no_accessibility`
+  和它们的 `_adhoc` 变体之间选一句。**分两句是因为要用户做的动作不一样**：没勾过的
+  去勾上，勾过的得取消再勾一次、而且得知道这事每次更新都会重演、根治要靠稳定签名。
+  一句笼统的"请去开启权限"会让已经勾过的人以为程序在骗他——用户的原话是"我明明勾选了"。
 
 **结构性解法是绕开它**：`channel_needs_accessibility()` 里 tmux、screen、iTerm2 三条通道
 返回 `false`——它们直接写伪终端，不碰 `System Events`，所以**根本不需要这个授权**。
@@ -1149,7 +1166,7 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 最后一行值得单独说：它不在任何一版的候选清单里，是从"为什么每次都要等用户来报同一类问题"
 这个问题倒推出来的。**清单能列出的都是想得到的功能；想不到的那一层，只能靠追问症状的成因找到。**
 
-### 13.2 v1.6 已交付与下一步候选
+### 13.2 v1.6 / v1.7 已交付与下一步候选
 
 按"先让已交付的东西可信"排序：
 
@@ -1172,8 +1189,32 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 **P1 — 继续拆 `ConfigPanel.tsx`。** 第一轮已把通用骨架、通知、成本、AI 分区拆出，主文件约 610 行；
 Webhook、远程和适配器仍可按同一边界继续拆，但不再是阻塞发布的欠账。
 
-**P2 — 组件层测试。** 现在的 38 个前端测试只覆盖纯函数和 store 归约；`SessionList`
+**P2 — 组件层测试。** 现在的 93 个前端测试只覆盖纯函数和 store 归约；`SessionList`
 的排序、标签显隐这类逻辑值得补 `@testing-library/react`。
+
+**P1 — 按供应商分组限流关键词（v1.8 候选，设计已定，未动工）。** 需求原话是「按不同供应商
+选不同策略」，但代码读下来，`RateLimited => Wait` 已经是全局默认（`detector/mod.rs`），
+最保守的那条路今天对所有供应商都生效。真正的暴露面在**识别**：`default_rate_limit_keywords()`
+只有 8 条，中转站把限流写成「上游负载已饱和」或只回一个 `upstream_busy` 时，一条都不命中，
+判定落到 `Unknown`，而 `Unknown => Nudge`——于是应用会按冷却一遍遍往里敲字，正好是会让号
+被封的那个行为。所以只做一张「供应商 → 策略」表是无效的：表要先知道这是限流才谈得上查，
+而出事的前提恰恰是没认出来。
+
+方向分三层，重心在第一层：(1) `rate_limit_keywords` 从全局清单改成按 profile 分组，
+且 `Unknown` 叠加「证据里出现过 HTTP 4xx/5xx 形状」时倒向 `Wait` 而不是 `Nudge`；
+(2) 解析限流消息里自带的等待时间（`retrying in 34s` / `resets at 3pm`）当冷却下限，
+比让用户猜每家等多久更准，也不用维护；(3) profile 里真正因供应商而异的只有三项——限流后
+冷却下限、同窗口撞第 N 次后彻底停手只叫人、是否信任消息里的 reset 时间。「敲字对限流没用」
+这类知识对所有供应商一样，不做成开关，做成开关等于允许用户把自己配到危险的一侧。
+未识别的供应商一律落最严格那档。
+
+**未决 — 供应商身份从哪来。** 代码里现在完全没有这个概念（grep `adapters/`、`detector/`、
+`monitor/` 无任何 `ANTHROPIC_BASE_URL` / `base_url`）。读运行中进程的 environ 能直接拿到
+（`sysinfo` 的 `Process::environ()` 确实存在），但同一个 block 里就是 `ANTHROPIC_AUTH_TOKEN`，
+等于让本应用具备读取用户密钥的能力，一旦加进去 9.1 那张安全表每一行都要重新论证；
+读 `~/.claude/settings.json` 同样碰凭证，且不代表运行中进程实际拿到的值。第三条路是
+不识别供应商，改成按项目/会话让用户自己挂 profile，零新增权限面，代价是要点一下。
+按非侵入定位倾向第三条，但这是产品决策，动工前需确认。
 
 **P2 — 自动更新重做。** 生成签名密钥对、配 `tauri-plugin-updater`、在 CI 的 `release` job 里
 产出 `latest.json`。上次失败的原因很具体（没有公钥就崩），别重复。顺带能解掉 12.6 的一半——
@@ -1204,7 +1245,7 @@ Webhook、远程和适配器仍可按同一边界继续拆，但不再是阻塞�
 | **Windows 用 UIAutomation 取代标题匹配** | 能直接枚举标签页，把"窗口级确定性"提升到"标签级确定性"，多标签宿主不再需要靠标题猜 | 工程量不小，但这是 Windows 侧唯一的确定性天花板突破口 |
 | **从历史里学阈值** | 你每次手动续跑（说明它漏判了）和每次撤销（说明它误判了）都是标注数据，可以用来给这台机器调 `idle_timeout_secs`；v1.5 的 `ResumeOutcome` 让这件事第一次有了**自动**标注来源（`Silent` = 投递侧的问题，`Landed` 后马上又停 = 判定侧的问题） | 要小心：不能让学习结果绕过 6.4 的两条铁律 |
 | **AI 兜底接进自动回路** | ✅ v1.6 | 唯一弱证据缺口自动提问，结构化 `DONE` / `CONTINUE`，见 12.4 |
-| **成本报表导出** | ⏸ v1.7 候选 | 按周/月汇总、导出 CSV；当前没有新增写入面 |
+| **成本报表导出** | ✅ v1.7 | 花费页三个维度（按天 / 按项目 / 按模型）都能导 CSV；写入面只有下载夹一处，没有新增授权项 |
 
 ### 13.4 被主动搁置的两层：v2.0 编排 / v2.1 自治
 

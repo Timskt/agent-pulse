@@ -4,7 +4,7 @@
 > 配置项逐条说明、路线图、开发红线在 [PROJECT_STATUS.md](../PROJECT_STATUS.md)；
 > 三平台手动验收清单在 [manual-test.md](./manual-test.md)。
 >
-> 最后一次与代码对齐：2026-08-02（`v1.6` 开发完成，待发布）。
+> 最后一次与代码对齐：2026-08-05（`v1.7` 开发完成，待发布）。
 
 ## 1. 一条不能越过的线
 
@@ -28,7 +28,7 @@ AgentPulse 是 **AI Agent 的守护神，不是它的容器**。整套架构都�
 │  React 19 + TypeScript + Tailwind 3 + Zustand                │
 │  总览 / 统计 / 花费 / 历史 / 设置        ← 界面文案 i18n 字典   │
 └───────────────────────────┬──────────────────────────────────┘
-                            │ Tauri IPC：25 个命令 + 3 个事件
+                            │ Tauri IPC：38 个命令 + 3 个事件
 ┌───────────────────────────▼──────────────────────────────────┐
 │                      Rust 核心                                │
 │                                                              │
@@ -37,6 +37,7 @@ AgentPulse 是 **AI Agent 的守护神，不是它的容器**。整套架构都�
 │  ③ 投递层  resumer/     复用器 → GUI 终端，「定位不到就不敲」    │
 │  ④ 洞察层  cost/ storage/  token 计价、限流预测、SQLite 时间线  │
 │  ⑤ 远程层  remote/      只读手机看板（默认关，令牌鉴权）        │
+│  ⑥ 导出层  export/      CSV 转义边界（内容 vs 数值分开处理）     │
 │                                                              │
 │  横切：monitor/ 调度  notify/ 提醒  webhook/ 外推  i18n/ 文案   │
 └──────────────────────────────────────────────────────────────┘
@@ -46,17 +47,18 @@ AgentPulse 是 **AI Agent 的守护神，不是它的容器**。整套架构都�
 
 | 路径 | 行数 | 职责 |
 |------|-----:|------|
-| `src-tauri/src/resumer/mod.rs` | 3189 | 投递层全部：通道选择、三平台脚本、演练、落地核验、聚焦 |
-| `src-tauri/src/monitor/mod.rs` | 1292 | 扫描循环、状态合并、**动作闸门**、事件环 |
-| `src-tauri/src/adapters/` | 1024 | 进程快照 + Claude Code / Codex / OpenCode / 自定义 |
-| `src-tauri/src/detector/mod.rs` | 883 | 信号融合、注意力分级、词边界匹配 |
-| `src-tauri/src/remote/mod.rs` | 870 | 手写 HTTP 服务 + 内嵌看板页 |
-| `src-tauri/src/storage/mod.rs` | 651 | SQLite 六张表：续跑/检测/日聚合/用量/游标/会话历史 |
-| `src-tauri/src/lib.rs` | 627 | Tauri 装配：命令、托盘、事件泵、窗口行为 |
-| `src-tauri/src/i18n/mod.rs` | 531 | 后端文案（通知、托盘、日志、报错） |
-| `src-tauri/src/cost/mod.rs` | 512 | 模型价目表、增量读用量、限流预测 |
+| `src-tauri/src/resumer/mod.rs` | 3382 | 投递层全部：通道选择、三平台脚本、演练、落地核验、聚焦 |
+| `src-tauri/src/storage/mod.rs` | 2305 | SQLite 六张表：续跑/检测/日聚合/用量/游标/会话历史 |
+| `src-tauri/src/monitor/mod.rs` | 1524 | 扫描循环、状态合并、**动作闸门**、事件环、生命周期收拢 |
+| `src-tauri/src/detector/mod.rs` | 1462 | 信号融合、注意力分级、词边界匹配 |
+| `src-tauri/src/adapters/` | 1230 | 进程快照 + Claude Code / Codex / OpenCode / 自定义 |
+| `src-tauri/src/lib.rs` | 876 | Tauri 装配：命令、托盘、事件泵、窗口行为 |
+| `src-tauri/src/remote/mod.rs` | 873 | 手写 HTTP 服务 + 内嵌看板页 |
+| `src-tauri/src/export/mod.rs` | 684 | CSV 渲染与转义边界（`Cell::Text` 中和公式 / `Cell::Value` 保持可求和） |
+| `src-tauri/src/i18n/mod.rs` | 644 | 后端文案（通知、托盘、日志、报错、CSV 表头） |
+| `src-tauri/src/cost/mod.rs` | 536 | 模型价目表、增量读用量、限流预测 |
+| `src/i18n/index.ts` | 739 | 前端文案（界面上的字） |
 | `src/components/ConfigPanel.tsx` | 610 | 设置页主编排（通知 / 成本 / AI 分区已拆到 `components/config/`） |
-| `src/i18n/index.ts` | 520 | 前端文案（界面上的字） |
 
 ## 4. ① 感知层：会话是怎么被认出来的
 
@@ -274,17 +276,23 @@ pane 刚被关掉、授权中途失效 —— 每一种都让脚本成功而字�
 
 ## 10. IPC 契约
 
-### 命令（前端 → Rust，共 25 个）
+### 命令（前端 → Rust，共 38 个）
 
 | 分组 | 命令 |
 |------|------|
 | 引擎 | `get_state` `get_status` `start_monitoring` `stop_monitoring` `scan_now` |
 | 配置 | `get_config` `update_config` `get_platform_info` `get_translations` |
 | 续跑 | `manual_resume` `probe_resume` `focus_terminal` `open_accessibility_settings` |
-| 统计 | `get_stats` `get_resume_history` `get_totals` `get_session_history` |
-| 花费 | `get_cost_daily` `get_cost_projects` `get_rate_forecast` |
+| 统计 | `get_stats` `get_resume_history` `get_resume_page` `get_stats_overview` `get_totals` `get_stats_trend` |
+| 花费 | `get_cost_daily` `get_cost_projects` `get_cost_models` `get_usage_summary` `get_rate_forecast` |
+| 历史 | `get_session_history` `get_session_history_page` `get_session_history_summary` `get_session_detail` |
+| 导出 | `export_resumes` `export_sessions` `export_cost` `export_stats` `reveal_export` |
 | 提醒 | `test_notify` `test_webhook` `ai_analyze` |
 | 看板 | `get_lan_ip` `generate_remote_token` |
+
+带 `_page` 后缀的四个是分页版，老的不分页命令保留给远程看板和托盘用。
+**导出跟的是当前筛选，不是当前页** —— 用户点导出时想的是「我筛出来的这些行」，
+只给可见的 20 行是一种没人会发现的静默数据丢失。
 
 ### 事件（Rust → 前端，共 3 个）
 
@@ -344,9 +352,9 @@ pane 刚被关掉、授权中途失效 —— 每一种都让脚本成功而字�
 额度、冷却、总开关全在闸门里；把任何一条塞回 `make_verdict`，催满的会话就会被
 钉在 `Suspicious`，于是既不敲也不叫人（见 §5）。
 
-## 12. 四个花了很大代价才弄明白的事实
+## 12. 六个花了很大代价才弄明白的事实
 
-这一节是这份文档最该被读的部分。四个问题都表现为「功能好像没生效」，而且都
+这一节是这份文档最该被读的部分。六个问题都表现为「功能好像没生效」，而且都
 **不在报错里**。
 
 ### 12.1 重新构建过的应用，辅助功能授权会静默失效
@@ -362,11 +370,27 @@ designated requirement，授权实际绑在二进制的 cdhash 上 —— **每�
 新 cdhash，系统设置里那个勾看着还在，实际已经不生效了。** 开发期每 `pnpm tauri
 build` 一次就要去设置里删掉再重新添加一次。
 
-现在的处理：动手之前用 `osascript -e 'tell application "System Events" to return
-UI elements enabled'` 查一次（只读、不弹窗、不会把用户拽进设置面板），没授权就
-**不跳窗口**，直接返回一句「去哪儿点」，并在演练面板上给「去开权限」按钮。
+现在的处理分三层：
 
-**要根治得做正式签名**（Developer ID + notarize），那时授权才跟着 bundle id 走。
+**① 动手之前先查。** `osascript -e 'tell application "System Events" to return UI
+elements enabled'`（只读、不弹窗、不会把用户拽进设置面板），没授权就**不跳窗口**，
+直接返回一句「去哪儿点」，并在演练面板上给「去开权限」按钮。
+
+**② 说清是哪一种缺。** 缺权限有两种成因，要用户做的动作不一样：没勾过的去勾上，
+勾过的得**取消再勾一次**。所以 `signature_is_stable()` 读一次
+`codesign -d --requirements -`：出现 `anchor apple` 或 `certificate` 说明认的是
+名字加证书，只有 `cdhash` 说明是临时签名。据此在 `resume.needs_accessibility` /
+`probe.no_accessibility` 和它们的 `_adhoc` 变体之间选一句。查不出来就当稳定
+——这一项只用来加一句解释，拿不到证据时宁可少说，也不要凭猜测吓人。
+
+**③ 根治靠固定签名。** `scripts/macos-signing-identity.sh` 造一张自签名的代码签名
+证书（`extendedKeyUsage=codeSigning` + 登录钥匙串信任 `trustRoot`），之后
+`APPLE_SIGNING_IDENTITY=…` 构建，指定要求就从 `cdhash H"…"` 变成
+`identifier "com.agentpulse.app" and certificate leaf H"…"`，证书不换这串就不变，
+勾一次一直有效。对外分发仍需真的 Developer ID（签名 + notarize）。
+
+**签名身份故意不写进 `tauri.conf.json`。** 写死了，没有这张证书的人连构建都过不去；
+放在环境变量里，本地用自签名、CI 用仓库 secrets 里的 Developer ID，两边都不用改配置。
 
 ### 12.2 tmux 是唯一一条不需要授权的路
 
@@ -412,6 +436,60 @@ UI elements enabled'` 查一次（只读、不弹窗、不会把用户拽进设�
 这条推论比这三个具体的坑更值钱：以后再加任何「替用户动手」的能力，都要连着
 它的核验信号一起加，否则等于又造一个只会报喜的通道。
 
+### 12.5 减 86400000 毫秒不等于「前一天」
+
+症状：历史页昨天那组的标题，一年里有两天会从「昨天」退回一个裸日期。
+
+`history.ts` 里判断某一天该叫今天、昨天还是写日期，要先算出「昨天是几号」。
+写成减一天的毫秒数在大部分日子里没问题，换季那两天两头都会错，而且**方向相反**：
+
+| 情形 | 例子 | 减 24 小时得到 | 后果 |
+|------|------|----------------|------|
+| 春天少一小时 | 洛杉矶 2026-03-09 00:30 | 03-07 | **整个 03-08 被跳过**，昨天那组永远匹配不上 |
+| 秋天多一小时 | 洛杉矶 2026-11-01 23:30 | 还是 11-01 | 算出来的「昨天」和今天同一天，昨天那组同样匹配不上 |
+
+`setDate(getDate() - 1)` 让运行时按**本地日历**退一格，两种情况都不发生。
+
+真正值钱的是第二层：**这个 bug 在开发机上不可能被发现。** 按整年逐小时扫过
+五个时区，`Asia/Shanghai` 的分歧数是 0 —— 中国不实行夏令时，本地怎么测都是绿的。
+既有的 11 个历史测试全部在错误实现下通过，因为没有一个落在换季那天。
+
+所以新增的三个测试用 `vi.stubEnv("TZ", "America/Los_Angeles")` **自己钉住时区**，
+外加一条守卫断言 `getTimezoneOffset() === 420` —— 万一哪天 TZ 覆盖失效，
+另外两条测试会变成真空通过，而守卫会先红。凡是碰日期算术的测试都该这么写：
+不钉时区的日期测试，只证明了写测试的人在哪个时区。
+
+### 12.6 CSV 的防注入和可机读是**互斥**的，不能一起要
+
+症状：导出的表格用 Excel 打开一切正常，`pandas.read_csv` 读出来数字全变字符串。
+
+以 `= + - @` 开头的字段会被电子表格当公式执行，标准缓解手段是前面加一个单引号。
+问题在于那个引号对电子表格是**标记**，对别的一切都是**数据**——`'-1` 在 pandas
+里就是字符串 `"'-1"`。所以一律加前缀会把两类东西同时弄坏：负数不能求和了，
+`@scope/pkg` 这种包名多了个引号。
+
+`export/mod.rs` 因此不提供「转义一个字段」这种函数，只提供两个变体：
+
+```rust
+pub enum Cell {
+    /// 内容不可控（项目名、工作目录、报错原文）→ 该防注入
+    Text(String),
+    /// 形状已知（数字、时间戳、yes/no、枚举）→ 只做 RFC 4180，保持可求和
+    Value(String),
+}
+```
+
+选哪个是**建表的人**在建表的时候决定的，不是转义函数猜的——因为只有调用点知道
+这一列的内容从哪来。同一份代码里 `project` 是 `Text`，`cost` 是 `Value`。
+
+另外三条 RFC 4180 的细节，缺一条就有一类用户打不开文件：行尾必须是 `\r\n`
+（Windows Excel 双击只认这个）；含 `, " \n \r` 的字段要包引号且内部引号翻倍；
+文件头必须写 UTF-8 BOM，否则简体中文 Windows 的 Excel 按 GBK 解，中文项目名全成乱码。
+
+**表头跟界面语言走，所以表头不是稳定的机器接口。** 这是明知的取舍：混着中英文
+的表头正是用户点名反感的东西，所以选了跟随 `config.language`；代价是脚本必须
+按列的位置读，不能按表头的名字读，这一条写在 `i18n/mod.rs` 的 `csv.*` 段落上方。
+
 ## 13. 测试与门禁
 
 本地和 CI 跑的是同五道门：
@@ -419,8 +497,8 @@ UI elements enabled'` 查一次（只读、不弹窗、不会把用户拽进设�
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 128 passed |
-| 前端单测 | `pnpm test`（vitest） | 32 passed |
+| Rust 单测 | `cargo test` | 191 passed |
+| 前端单测 | `pnpm test`（vitest） | 93 passed |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |
 
@@ -456,10 +534,13 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 - AI 判断（`ai_judge`）走的是 OpenAI 兼容端点，刻意保持中立、不绑某一家；目前**只由
   用户手点触发**，没有接进自动回路。
 - 环境自检目前长在 `collect_tools` 里，**没有覆盖会话目录可读性**，也还没有独立面板。
-- 判定证据面板（把每条信号的具体值、`TurnState`、忙时宽限有没有生效、命中哪个
-  关键词摊开给用户看）**还没做**。
-- 前端测试只到纯函数层（工具函数、显示映射、store 归约、版本一致性，共 38 个），
-  **组件渲染层没有任何测试**。
+- 导出的 CSV 有 18 个单元测试盯着转义边界，但**没有真的用 Excel / Numbers /
+  pandas 各打开过一次**。BOM 和 `\r\n` 这两条是照标准写的，不是实测出来的。
+- 前端测试只到纯函数层（工具函数、显示映射、store 归约、历史分组、趋势、
+  图表刻度、版本一致性，共 93 个），**组件渲染层没有任何测试**。
+- **供应商身份在代码里不存在。** 限流后不敲字是全局默认（`RateLimited => Wait`），
+  但认不出是限流的时候会落到 `Unknown => Nudge`。中转站把 429 换个说法就会掉进
+  这条路，而这正是会让账号被封的行为。按供应商分组关键词还没做。
 
 ## 15. 版本轨迹
 
@@ -471,6 +552,8 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 | v1.3 远程层 ✅ | 只读手机看板（令牌鉴权、默认 loopback） |
 | v1.4 可信化 ✅ | tmux/screen 通道、续跑演练、前端 vitest、三平台验收清单 |
 | v1.5 闭环 ✅ | **续跑落地核验**（`ResumeOutcome` + 指纹比对）、三个计数器分家、放弃动手时改为出声而非静默、看板换绑竞态修复、局域网地址自动推导、强令牌生成、判定层与动作闸门彻底分离 |
+| v1.6 可解释判定 ✅ | `InterruptReason` / `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权）、自定义适配器 UI、跨语言枚举与 i18n 门禁 |
+| v1.7 记录与导出 ✅ | 会话生命周期收拢（关掉的会话不再显示「运行中」）、续跑记录中心、统计趋势对比、会话档案抽屉、图表补时间刻度、**CSV 导出**（`Text` / `Value` 双变体转义）、跨夏令时的日期分组 |
 | v2.0 编排层 ⛔ | **与「非侵入」定位冲突，已搁置** —— 不经确认不动工 |
 | v2.1+ 自治层 ⛔ | 同上 |
 

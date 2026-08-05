@@ -121,7 +121,7 @@ pnpm tauri:build
 - [x] **v1.4** — tmux / screen 直投通道 + 续跑演练（dry-run）按钮 + 前端 vitest + 三平台验收清单
 - [x] **v1.5** — 续跑闭环（落地核验 + 四态记账）+ 三个计数器分家 + 判定层与动作闸门分离 + 看板换绑竞态修复 + 局域网地址自动推导
 - [x] **v1.6** — 判定证据面板 + 自定义适配器 UI + AI 第二意见仲裁 + 跨语言枚举/i18n 门禁
-- [ ] **v1.7** — 统计趋势与 CSV 导出（仅在需要时继续扩展，不改变非侵入定位）
+- [x] **v1.7** — 单实例守护 + 续跑记录中心 + 统计趋势对比 + 会话档案页 + 图表时间刻度 + CSV 导出 + 会话生命周期收拢（「关了还显示运行中」）
 
 阶段性取舍、每一条的来由和候选清单见 [PROJECT_STATUS.md § 13](./PROJECT_STATUS.md)。
 **v2.0 编排层 / v2.1+ 自治层与「非侵入」定位冲突，已明确搁置。**
@@ -142,8 +142,8 @@ git push origin main
 gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 
 # 3. 打标签并推标签（必须以 v 开头，且与 package.json 的版本一致——src/version.test.ts 会替你查）
-git tag v1.6.0
-git push origin v1.6.0
+git tag v1.7.0
+git push origin v1.7.0
 
 # 4. 盯打包
 gh run list --limit 3
@@ -161,9 +161,32 @@ gh run watch <run-id> --exit-status
 | `x86_64-pc-windows-msvc` | `.msi` / `.exe`（NSIS） |
 
 标签打错了：`git tag -d v1.5.0 && git push origin :refs/tags/v1.5.0`，重新打；已生成的
-Release 要手动删。macOS 产物**没有 Apple 开发者签名**，首次打开要右键 → 打开，且每次换
-版本都要重新授予「辅助功能」权限（原因见
-[PROJECT_STATUS.md § 12.6](./PROJECT_STATUS.md)）。完整说明见 § 11.4。
+Release 要手动删。macOS 产物**没有 Apple 开发者签名**，首次打开要右键 → 打开。
+
+### macOS：让「辅助功能」授权不再每次构建就失效
+
+macOS 把辅助功能授权挂在**代码签名**上，不是路径也不是 bundle id。没有证书时
+Tauri 只能临时签名（adhoc），授权实际绑在那一个二进制的哈希上——改一行代码重新
+构建，哈希就变了，系统设置里那个勾还在（记的是旧哈希）、实际已经不生效。
+这就是「我明明勾选了却还是敲不进去」的真正原因（详见
+[architecture.md § 12.1](./docs/architecture.md)）。
+
+本地开发用一张自签名证书就能解决，跑一次：
+
+```bash
+pnpm macos:signing-identity                       # 造证书，只需一次
+export APPLE_SIGNING_IDENTITY="AgentPulse Self-Signed"
+pnpm tauri:build
+```
+
+装好之后去「系统设置 › 隐私与安全性 › 辅助功能」**取消再勾一次**——这是最后一次，
+之后重新构建都不会再掉。自签名只解决「授权能不能留住」，不能公证，**对外分发仍需
+真的 Developer ID**：把证书导成 base64 存进仓库 secrets，CI 里设
+`APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` / `APPLE_SIGNING_IDENTITY`
+三个环境变量，`tauri build` 会自己认——**签名身份故意不写进 `tauri.conf.json`**，
+写死了没有这张证书的人就构建不了。
+
+完整说明见 § 11.4。
 
 ## License
 
