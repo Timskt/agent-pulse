@@ -537,6 +537,14 @@ impl MonitorEngine {
             }
         }
 
+        // ── 会话历史落库：**必须在上面那段合并之后** ──
+        //
+        // 位置有讲究。以前这一步在 `collect()` 里，那会儿本轮判定还没合并回
+        // `session.status`，写进历史表的永远是上一轮的结论。而且它只写「本轮
+        // 发现的」会话，于是用户关掉的会话那一行再也没人碰——连同
+        // `last_status = 'active'` 冻在库里，历史页因此一直显示「运行中」。
+        self.sync_session_history(&config, &sessions);
+
         // ── 感知层：该叫人的叫人，托盘角标同步 ──
         let pending = sessions.iter().filter(|s| s.attention.is_pending()).count();
         if let Some(notifier) = self.notifier.get() {
@@ -640,7 +648,43 @@ impl MonitorEngine {
         }
     }
 
-    /// 一轮扫描的重活：进程枚举、输出读取、成本解析、历史落库
+    /// 把本轮的会话状态写进历史表，并给已经消失的会话收尾
+    ///
+    /// 两件事必须挨在一起做，因为它们共用「本轮还活着的键」这一份事实：
+    /// 先把看得见的写进去（顺带把复活的会话 `ended_at` 清空），
+    /// 再把没写到的那些盖上收尾时间。
+    ///
+    /// **适配器全关的时候直接返回**，见 [`should_reconcile_history`]。
+    fn sync_session_history(&self, config: &AppConfig, sessions: &[AgentSession]) {
+        if !should_reconcile_history(config) {
+            return;
+        }
+        let mut live_keys = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let key = session.history_key();
+            let usage = session.usage.clone().unwrap_or_default();
+            self.storage.upsert_session_history(
+                &key,
+                &session.id,
+                &session.agent_name,
+                &session.working_dir,
+                session.session_file.as_deref().unwrap_or(""),
+                session.tty.as_deref().unwrap_or(""),
+                session.terminal_app.as_deref().unwrap_or(""),
+                session.status.key(),
+                session.resume_count,
+                usage.total_tokens,
+                usage.cost_usd,
+            );
+            live_keys.push(key);
+        }
+        let closed = self.storage.close_missing_sessions(&live_keys);
+        if closed > 0 {
+            tracing::debug!("[AgentPulse] {closed} 个会话已从视野消失，历史里收尾");
+        }
+    }
+
+    /// 一轮扫描的重活：进程枚举、输出读取、成本解析
     ///
     /// 全部塞进一个 `spawn_blocking`，异步侧只等一次结果——
     /// 分成多次 `spawn_blocking` 只会让每轮扫描多几次线程调度往返。
@@ -767,31 +811,12 @@ impl MonitorEngine {
                 }
             }
 
-            // 6. 会话历史时间线：以会话文件为主键，PID 换了也能接上同一条线
-            for session in &sessions {
-                let usage = session.usage.clone().unwrap_or_default();
-                let key = session.session_file.clone().unwrap_or_else(|| {
-                    format!(
-                        "{}-{}-{}",
-                        session.adapter_id, session.pid, session.discovered_at
-                    )
-                });
-                storage.upsert_session_history(
-                    &key,
-                    &session.id,
-                    &session.agent_name,
-                    &session.working_dir,
-                    session.session_file.as_deref().unwrap_or(""),
-                    session.tty.as_deref().unwrap_or(""),
-                    session.terminal_app.as_deref().unwrap_or(""),
-                    session.status.key(),
-                    session.resume_count,
-                    usage.total_tokens,
-                    usage.cost_usd,
-                );
-            }
-
-            // 7. 今日花费与限流预测（都是 SQL 聚合，一并在这里算完）
+            // 6. 今日花费与限流预测（都是 SQL 聚合，一并在这里算完）
+            //
+            // 会话历史的落库**不在这里**：这会儿 `session.status` 还是上一轮的
+            // 结论，本轮判定要等 `scan_once` 合并回去。在这儿写等于让历史表
+            // 永远慢一轮，一个刚中断的会话在历史里还标着「运行中」。
+            // 见 `scan_once` 里的 `sync_session_history`。
             let (cost_today, forecast) = if config.cost.enabled {
                 let today = Local::now().format("%Y-%m-%d").to_string();
                 let spent = storage.cost_for_date(&today);
@@ -911,19 +936,26 @@ impl MonitorEngine {
                 "log.mode_generic"
             });
 
+            // 先问「它卡了多久」再出手。`resume_verified` 里要盯着记录文件等上
+            // 几秒，等完再读这个数，读到的就是「卡的时长 + 我们核验用掉的时间」——
+            // 那是把自己的开销记到了会话的账上。
+            let stuck_secs = session.stuck_secs();
+
             // 投递 + 核验：会话记录有没有长出新内容，才是「敲进去了」的证据
             let (outcome, detail) = resumer.resume_verified(session, *use_goal_prompt).await;
             let landed = outcome.counts_as_nudge();
             let failures = self.commit_resume_outcome(&session.id, outcome).await;
 
-            self.storage.record_resume(
-                &session.id,
-                &session.agent_name,
-                &session.working_dir,
+            self.storage.record_resume(crate::storage::ResumeEvent {
+                session_id: &session.id,
+                agent_name: &session.agent_name,
+                working_dir: &session.working_dir,
                 prompt_type,
-                landed,
-                &detail,
-            );
+                success: landed,
+                outcome: outcome.storage_key(),
+                stuck_secs,
+                message: &detail,
+            });
 
             if landed {
                 self.push_event(EngineEvent::new(
@@ -1256,6 +1288,18 @@ fn has_nudges_left(session: &AgentSession, max: u32) -> bool {
     session.resume_streak < max
 }
 
+/// 本轮能不能给会话历史收尾
+///
+/// 收尾的推理是「表里有、本轮没发现，所以它没了」。这句话只有在**真的去看过**
+/// 的前提下才成立：适配器全关的时候一个都发现不了，照着收尾会把用户正在跑的
+/// 会话全标成已结束。
+///
+/// 抽成自由函数是为了能测——`MonitorEngine` 要 `ConfigManager::new()`，
+/// 那玩意儿读真实配置目录，单元测试里碰不得。
+fn should_reconcile_history(config: &AppConfig) -> bool {
+    !config.enabled_adapters.is_empty()
+}
+
 /// 这句话现在还值不值得说
 ///
 /// 抽成自由函数的理由跟 [`apply_resume_outcome`] 一样：裹在锁里的策略测不到。
@@ -1460,5 +1504,21 @@ mod tests {
         // 会话恢复后要忘掉这条话题，否则同一个情况第二次发生就说不出口了
         said.remove(&topic);
         assert!(should_say(&mut said, topic, "4"));
+    }
+
+    /// 适配器全关时不能收尾：那时候「没发现会话」说的是「没去看」
+    #[test]
+    fn history_is_not_reconciled_when_nothing_is_being_watched() {
+        let mut config = AppConfig::default();
+        assert!(
+            should_reconcile_history(&config),
+            "默认配置是开着适配器的，本轮该收尾"
+        );
+
+        config.enabled_adapters.clear();
+        assert!(
+            !should_reconcile_history(&config),
+            "一个适配器都没开的时候收尾，会把活着的会话标成已结束"
+        );
     }
 }

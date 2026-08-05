@@ -3,6 +3,7 @@ import { ConfigPanel } from "./components/ConfigPanel";
 import { CostPanel } from "./components/CostPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { LogPanel } from "./components/LogPanel";
+import { ResumeRecordsPanel } from "./components/ResumeRecordsPanel";
 import { SessionList } from "./components/SessionList";
 import { StatsPanel } from "./components/StatsPanel";
 import { StatusCards } from "./components/StatusCards";
@@ -140,8 +141,11 @@ export default function App() {
           <TabsContent value="cost" className="animate-fade-in">
             <CostPanel />
           </TabsContent>
-          <TabsContent value="history" className="animate-fade-in">
+          {/* 会话历史和续跑记录都是「过去发生了什么」，放同一页；
+              续跑记录在下，因为它是排查用的，会话历史才是先看的那个 */}
+          <TabsContent value="history" className="animate-fade-in space-y-4">
             <HistoryPanel />
+            <ResumeRecordsPanel />
           </TabsContent>
           <TabsContent value="config" className="animate-fade-in">
             <ConfigPanel />

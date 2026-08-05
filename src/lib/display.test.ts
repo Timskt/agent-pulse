@@ -2,11 +2,18 @@ import { describe, expect, it } from "vitest";
 // `?raw` 原样读 Rust 源码：这几条断言要跨语言比对，而枚举在两边都是编译期
 // 的东西，谁都看不见谁。详见下面「跨语言」那一组的说明。
 import detectorRs from "../../src-tauri/src/detector/mod.rs?raw";
+import resumerRs from "../../src-tauri/src/resumer/mod.rs?raw";
 import { ALL_KEYS } from "../i18n";
 import {
+  asOutcome,
+  asReason,
   ATTENTION_ICON,
   ATTENTION_TONE,
   LOG_TONE,
+  OUTCOME_GLYPH,
+  OUTCOME_TONE,
+  outcomeHintKey,
+  outcomeKey,
   reasonKey,
   STATUS_DOT,
   STATUS_TONE,
@@ -111,6 +118,22 @@ describe("display — 跨语言：中断原因", () => {
   it("none 不进 i18n 表——它是「没有中断」，没什么可显示的", () => {
     expect(ALL_KEYS).not.toContain("reason.none");
   });
+
+  it("asReason 认得 Rust 写进库里的每一个原因", () => {
+    // `detection_records.reason` 是后端按 `key()` 存的字符串。这里认不出来，
+    // 会话档案里那条中断记录就少一句「为什么停」——而那一列在库里躺了
+    // 一个版本没人读，正是因为没人守着这道缝
+    for (const reason of rustReasons.filter((r) => r !== "none")) {
+      expect(asReason(reason), `asReason 不认识 ${reason}`).toBe(reason);
+    }
+  });
+
+  it("asReason 把认不出来的收成 null", () => {
+    // v1.6 之前的行这一列是空串
+    expect(asReason("")).toBeNull();
+    expect(asReason("none")).toBeNull();
+    expect(asReason("something_new")).toBeNull();
+  });
 });
 
 /**
@@ -145,5 +168,67 @@ describe("display — 跨语言：续跑手段", () => {
 
   it("nudge 没有解释句——那是默认动作，没什么要交代的", () => {
     expect(Object.keys(TACTIC_NOTE)).not.toContain("nudge");
+  });
+});
+
+/**
+ * 跨语言：投递核验多一个结论，记录中心有没有话可说
+ *
+ * 这道缝比中断原因那道更容易漏，因为它跨了**三样东西**：Rust 的枚举、
+ * 库里那一列、界面上的徽标。Rust 加一个变体 `cargo build` 过，前端的
+ * `ResumeOutcome` 联合是手写的、`tsc` 也过，然后记录中心会静静地把这条
+ * 记录显示成「旧记录」——一个明明有结论的结果被说成「那时候还没记」。
+ *
+ * 所以事实来源取 `storage_key()` 的匹配臂：那才是真的写进库、发到前端的
+ * 字符串，不是变体名，也不是我们猜的 snake_case。
+ */
+describe("display — 跨语言：投递核验结论", () => {
+  const rustOutcomes = (() => {
+    // 从 `impl ResumeOutcome` 起步：这个文件里 `fn key`/`fn storage_key`
+    // 这种短名字很容易撞上别的 impl，抓错了就会拿一组无关字符串来比，
+    // 两边都对不上却每条都绿。
+    const body = resumerRs.match(
+      /impl ResumeOutcome \{[\s\S]*?fn storage_key\(&self\)[\s\S]*?\n {4}\}/,
+    );
+    expect(body, "resumer/mod.rs 里没找到 ResumeOutcome::storage_key()").not.toBeNull();
+    return [...(body?.[0] ?? "").matchAll(/ResumeOutcome::\w+ => "(\w+)"/g)].map(
+      (m) => m[1],
+    );
+  })();
+
+  it("确实读到了 Rust 那边的结论表", () => {
+    // 正则失配会返回空数组，那样后面每条断言都会「通过」
+    expect(rustOutcomes).toHaveLength(4);
+    expect(rustOutcomes).toEqual(
+      expect.arrayContaining(["landed", "silent", "failed", "unverifiable"]),
+    );
+  });
+
+  it("每个结论都有配色、字符、短标签和一句解释", () => {
+    for (const raw of rustOutcomes) {
+      const outcome = asOutcome(raw);
+      expect(outcome, `${raw} 没被 asOutcome 认出来，界面会当成旧记录`).not.toBeNull();
+      if (!outcome) continue;
+      expect(OUTCOME_TONE[outcome]).toBeTruthy();
+      expect(OUTCOME_GLYPH[outcome]).toBeTruthy();
+      expect(ALL_KEYS, `${raw} 缺短标签，徽标会显示键名`).toContain(
+        outcomeKey(outcome),
+      );
+      expect(ALL_KEYS, `${raw} 缺解释句，悬浮时会显示键名`).toContain(
+        outcomeHintKey(outcome),
+      );
+    }
+  });
+
+  it("前端认得的结论不多于 Rust 会发的——多出来的那个永远不会出现", () => {
+    expect(Object.keys(OUTCOME_TONE).sort()).toEqual([...rustOutcomes].sort());
+  });
+
+  it("空串和没见过的值都收敛成 null，而不是猜一个结论", () => {
+    // 旧记录那一列就是空串。这里断言的是「宁可少说一句」：拿 success 把它
+    // 补成 landed 等于替历史数据编造一个当时并不存在的核验结果。
+    expect(asOutcome("")).toBeNull();
+    expect(asOutcome("landed_maybe")).toBeNull();
+    expect(asOutcome("LANDED")).toBeNull();
   });
 });

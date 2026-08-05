@@ -71,6 +71,20 @@ impl ResumeOutcome {
         matches!(self, ResumeOutcome::Failed | ResumeOutcome::Silent)
     }
 
+    /// 存进库、发给前端的稳定键
+    ///
+    /// 跟 [`Self::i18n_key`] 分开是刻意的：文案键随时可以改措辞、改前缀，
+    /// 库里那一列改不了——已经写进去的行不会跟着变。所以落库走这个，
+    /// 显示走那个，两者不共用一个字符串。
+    pub fn storage_key(&self) -> &'static str {
+        match self {
+            ResumeOutcome::Failed => "failed",
+            ResumeOutcome::Landed => "landed",
+            ResumeOutcome::Silent => "silent",
+            ResumeOutcome::Unverifiable => "unverifiable",
+        }
+    }
+
     /// 日志里那句「结果如何」的文案键
     pub fn i18n_key(&self) -> &'static str {
         match self {
@@ -530,6 +544,82 @@ pub fn channel_needs_accessibility(channel_key: &str) -> bool {
     )
 }
 
+/// 从 `codesign -d --requirements -` 的输出判断签名身份稳不稳
+///
+/// **这是「我明明勾选了却还是敲不进去」的真正原因。** macOS 把辅助功能授权挂在
+/// 「指定要求」（designated requirement）上，既不是路径也不是 bundle id：
+///
+/// - 正式证书签过的：`identifier "…" and anchor apple generic and certificate leaf …`
+///   —— 认的是**名字加证书**，重新构建、升级、换路径都还是同一个身份，勾一次就一直有效。
+/// - 临时签名（adhoc）：`cdhash H"d449…"` —— 认的是**这一个二进制的哈希**。
+///   改一行代码重新构建，哈希就变了，对系统来说这是另一个应用。
+///
+/// 于是就有了那个最气人的现象：系统设置里那个勾还在（它记的是旧哈希），
+/// 但正在跑的这个二进制对不上，`UI elements enabled` 返回 false，
+/// 合成按键静默失效。用户以为自己授权了，其实授权给的是上一个构建。
+///
+/// **故意不加 cfg**：纯字符串判断，每个平台都能测。
+pub fn signature_is_stable(requirements: &str) -> bool {
+    // 这两个标记只出现在真证书签出来的要求里；adhoc 的要求里只有一个 cdhash
+    requirements.contains("anchor apple") || requirements.contains("certificate")
+}
+
+/// 当前进程所在的 `.app` 包路径；开发模式下（cargo 目录里）返回 `None`
+///
+/// 返回 `None` 是有意的：`tauri dev` 跑的是 target 目录里的裸二进制，
+/// 本来就没有稳定签名，这时候报警只是噪音。
+#[cfg(target_os = "macos")]
+fn app_bundle_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    // …/AgentPulse.app/Contents/MacOS/agent-pulse → …/AgentPulse.app
+    let bundle = exe.parent()?.parent()?.parent()?;
+    (bundle.extension()? == "app").then(|| bundle.to_string_lossy().into_owned())
+}
+
+/// 本应用的签名身份能不能活过一次更新
+///
+/// 查不出来就当它是稳定的：这一项只用来给错误信息加一句解释，
+/// 拿不到证据的时候宁可少说一句，也不要凭猜测吓人。
+#[cfg(target_os = "macos")]
+async fn signature_stable(i18n: &I18n) -> bool {
+    let Some(path) = app_bundle_path() else {
+        return true;
+    };
+    let Ok(out) =
+        run_with_timeout("codesign", &["-d", "--requirements", "-", &path], 10, i18n).await
+    else {
+        return true;
+    };
+    // codesign 把「指定要求」写到 stdout，其余签名信息写到 stderr，两边都要看
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    signature_is_stable(&text)
+}
+
+/// 缺权限时该说哪一句：是「还没勾」还是「勾了但签名换了所以失效」
+///
+/// 分两句话是因为要用户做的动作不一样：前者去勾上，后者**取消再勾一次**，
+/// 而且得知道这事儿每次更新都会重演、根治要靠稳定签名。
+/// 一句笼统的「去开权限」会让已经勾过的人以为程序在骗他。
+///
+/// 传两个 key 而不是写死一对：续跑失败和体检报告的语气不一样，
+/// 但「怎么判断」这件事只该有一份实现。
+#[cfg(target_os = "macos")]
+async fn accessibility_hint(
+    i18n: &I18n,
+    stable_key: &'static str,
+    adhoc_key: &'static str,
+) -> &'static str {
+    if signature_stable(i18n).await {
+        stable_key
+    } else {
+        adhoc_key
+    }
+}
+
 /// 走完全部定位流程但**一个字都不敲**，报告「续跑会把字敲到哪儿」
 ///
 /// 这是 12.1 那张「从没实机验证过」表格的解药：把「要冒险按一次才知道」
@@ -608,7 +698,17 @@ pub async fn probe_resume(session: &AgentSession, config: &AppConfig) -> ResumeP
 
     if blocked_by_permission {
         would_deliver = false;
-        detail = format!("{detail}\n\n{}", i18n.t("probe.no_accessibility"));
+        // 「没勾」和「勾了但签名换了所以失效」要说的话不一样，别让勾过的人以为程序在骗他
+        #[cfg(target_os = "macos")]
+        let hint = accessibility_hint(
+            &i18n,
+            "probe.no_accessibility",
+            "probe.no_accessibility_adhoc",
+        )
+        .await;
+        #[cfg(not(target_os = "macos"))]
+        let hint = "probe.no_accessibility";
+        detail = format!("{detail}\n\n{}", i18n.t(hint));
     }
 
     ResumeProbe {
@@ -891,7 +991,16 @@ pub async fn channel_health(lang: &str) -> Option<String> {
     if accessibility_granted(&i18n).await {
         return None;
     }
-    Some(i18n.t_owned("resume.needs_accessibility"))
+    Some(
+        i18n.t_owned(
+            accessibility_hint(
+                &i18n,
+                "resume.needs_accessibility",
+                "resume.needs_accessibility_adhoc",
+            )
+            .await,
+        ),
+    )
 }
 
 /// Windows / Linux 没有这层授权，事前没什么可体检的
@@ -1438,7 +1547,15 @@ impl Resumer {
         //
         // 所以在跳窗口之前就查一次：没权限就别跳了，直接告诉用户去哪儿点。
         if script.contains("System Events") && !accessibility_granted(&self.i18n).await {
-            return Err(self.i18n.t("resume.needs_accessibility").to_string());
+            return Err(self
+                .i18n
+                .t(accessibility_hint(
+                    &self.i18n,
+                    "resume.needs_accessibility",
+                    "resume.needs_accessibility_adhoc",
+                )
+                .await)
+                .to_string());
         }
 
         match run_osascript(&script, &self.i18n).await {
@@ -1467,9 +1584,15 @@ impl Resumer {
             // 权限查询有可能被系统缓存骗过（授权刚被撤销、查询还答 true），
             // 所以真敲下去再撞上 -1719 时，同样翻译成那句能照着做的话，
             // 而不是把 AppleScript 的英文原文糊到界面上
-            Err(stderr) if is_accessibility_error(&stderr) => {
-                Err(self.i18n.t("resume.needs_accessibility").to_string())
-            }
+            Err(stderr) if is_accessibility_error(&stderr) => Err(self
+                .i18n
+                .t(accessibility_hint(
+                    &self.i18n,
+                    "resume.needs_accessibility",
+                    "resume.needs_accessibility_adhoc",
+                )
+                .await)
+                .to_string()),
             Err(stderr) => Err(self.i18n.tf("resume.script_failed", &[("detail", &stderr)])),
         }
     }
@@ -2437,6 +2560,28 @@ mod tests {
             "execution error: Can't get window 1 of process \"Code\". (-1728)"
         ));
         assert!(!is_accessibility_error(""));
+    }
+
+    /// 这两段是从真机上抄下来的：一个是本应用（临时签名），
+    /// 一个是 Terminal.app（正式证书）。
+    ///
+    /// 差别就是「勾了为什么还是不管用」的答案：adhoc 的指定要求认的是
+    /// 一个具体哈希，改一行代码重新构建就换了身份，旧授权自然失效。
+    #[test]
+    fn adhoc_signature_is_not_stable() {
+        // 本应用现在的样子：只有 cdhash
+        assert!(!signature_is_stable(
+            r#"designated => cdhash H"d4493a69ce70aca1e479fdcf225a852a2e74e91f""#
+        ));
+        // 正式证书签过的：认名字 + 证书链
+        assert!(signature_is_stable(
+            r#"designated => identifier "com.apple.Terminal" and anchor apple"#
+        ));
+        assert!(signature_is_stable(
+            r#"designated => identifier "com.agentpulse.app" and anchor apple generic and certificate leaf[subject.OU] = "ABCDE12345""#
+        ));
+        // 查不出来的时候上层会当成稳定，这里只保证空串不会被误判成「有证书」
+        assert!(!signature_is_stable(""));
     }
 
     #[test]

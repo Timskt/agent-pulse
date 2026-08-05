@@ -3,6 +3,7 @@ pub mod ai_judge;
 pub mod config;
 pub mod cost;
 pub mod detector;
+pub mod export;
 pub mod i18n;
 pub mod monitor;
 pub mod notify;
@@ -143,6 +144,8 @@ async fn manual_resume(
 
     let use_goal = use_goal_prompt.unwrap_or(false);
     let resumer = resumer::Resumer::new(state.config_manager.get());
+    // 核验要等几秒，等完再问「卡了多久」就把这几秒也算进去了
+    let stuck_secs = session.stuck_secs();
     // 走带核验的入口：手动续跑最需要说实话——用户点完就盯着看结果，
     // 只报「脚本没报错」的话，敲进了隔壁标签页的那一次也会显示成功
     let (outcome, detail) = resumer.resume_verified(&session, use_goal).await;
@@ -151,14 +154,16 @@ async fn manual_resume(
 
     // 手动续跑也要进统计，否则「成功率」只反映自动续跑
     let prompt_type = if use_goal { "goal" } else { "generic" };
-    state.storage.record_resume(
-        &session.id,
-        &session.agent_name,
-        &session.working_dir,
+    state.storage.record_resume(storage::ResumeEvent {
+        session_id: &session.id,
+        agent_name: &session.agent_name,
+        working_dir: &session.working_dir,
         prompt_type,
-        ok,
-        &detail,
-    );
+        success: ok,
+        outcome: outcome.storage_key(),
+        stuck_secs,
+        message: &detail,
+    });
     // 冷却计时器也要跟着走：不写的话，下一轮自动续跑会以为这个会话从没被催过，
     // 立刻再敲一次，同一个会话吃两条提示词
     state.engine.note_manual_resume(&session.id, outcome).await;
@@ -308,12 +313,14 @@ async fn get_resume_page(
     offset: Option<u32>,
     query: Option<String>,
     outcome: Option<String>,
+    prompt_type: Option<String>,
 ) -> Result<storage::ResumeRecordPage, String> {
     Ok(state.storage.get_resume_page(
         limit.unwrap_or(20),
         offset.unwrap_or(0),
         query.as_deref().unwrap_or(""),
         outcome.as_deref().unwrap_or("all"),
+        prompt_type.as_deref().unwrap_or("all"),
     ))
 }
 
@@ -327,6 +334,15 @@ async fn get_stats_overview(state: State<'_, AppState>) -> Result<storage::Stats
 #[tauri::command]
 async fn get_totals(state: State<'_, AppState>) -> Result<(u32, u32, u32), String> {
     Ok(state.storage.get_totals())
+}
+
+/// 本期 vs 上期的趋势对比（`days = 1` 今日/昨日，`7` 近 7 天/前 7 天）
+#[tauri::command]
+async fn get_stats_trend(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<storage::StatsTrend, String> {
+    Ok(state.storage.stats_trend(days.unwrap_or(1)))
 }
 
 /// 每日花费趋势
@@ -396,19 +412,163 @@ async fn get_session_history(
         .session_history(limit.unwrap_or(50), query.unwrap_or_default().trim()))
 }
 
-/// 获取分页会话历史
+/// 获取分页会话历史（`status` 取 `all` / `live` / `ended`）
 #[tauri::command]
 async fn get_session_history_page(
     state: State<'_, AppState>,
     limit: Option<u32>,
     offset: Option<u32>,
     query: Option<String>,
+    status: Option<String>,
 ) -> Result<storage::SessionHistoryPage, String> {
     Ok(state.storage.get_session_history_page(
         limit.unwrap_or(20),
         offset.unwrap_or(0),
         query.as_deref().unwrap_or(""),
+        status.as_deref().unwrap_or("all"),
     ))
+}
+
+/// 会话历史的汇总数字（跟搜索条件走，不跟分页走）
+#[tauri::command]
+async fn get_session_history_summary(
+    state: State<'_, AppState>,
+    query: Option<String>,
+) -> Result<storage::SessionHistorySummary, String> {
+    Ok(state
+        .storage
+        .session_history_summary(query.as_deref().unwrap_or("")))
+}
+
+/// 一个会话的完整档案：生命周期 + 续跑时间线 + 中断记录
+#[tauri::command]
+async fn get_session_detail(
+    state: State<'_, AppState>,
+    session_key: String,
+) -> Result<Option<storage::SessionDetail>, String> {
+    Ok(state.storage.session_detail(&session_key))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CSV 导出
+//
+// 每个导出都**跟着界面上当前的筛选条件走**，而不是无条件导全库：用户点导出时
+// 心里想的是「把我现在看的这些拿出去」。但不跟分页走——只导可见的那 20 行
+// 是个陷阱，文件看起来正常，少的那些没人会发现。
+//
+// 上限 `EXPORT_MAX_ROWS` 是防手滑的护栏，不是产品限制：一次把几十万行读进
+// 内存再拼成一个 String，峰值内存能到几百 MB。真撞上限的话导出的是最近的那些
+// （查询本来就按时间倒序），而不是随机一批。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 单次导出的行数上限
+///
+/// 十万行按每行 200 字节算是 20 MB 文本，还在能一次性拼字符串的范围里。
+/// 按重度使用估算：一天 50 次续跑要连着跑五年半才撞到这个数。
+const EXPORT_MAX_ROWS: u32 = 100_000;
+
+/// 一次导出的结果：落盘路径 + 实际导了多少行
+#[derive(serde::Serialize)]
+struct ExportResult {
+    path: String,
+    rows: u32,
+}
+
+/// 导出续跑记录（跟随当前筛选条件）
+#[tauri::command]
+async fn export_resumes(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    outcome: Option<String>,
+    prompt_type: Option<String>,
+) -> Result<ExportResult, String> {
+    let page = state.storage.get_resume_page(
+        EXPORT_MAX_ROWS,
+        0,
+        query.as_deref().unwrap_or(""),
+        outcome.as_deref().unwrap_or("all"),
+        prompt_type.as_deref().unwrap_or("all"),
+    );
+    let i18n = i18n::I18n::from_code(&state.config_manager.get().language);
+    let csv = export::resumes_csv(&page.records, &i18n);
+    let rows = page.records.len() as u32;
+    let path = export::write_csv("resumes", &csv)?;
+    Ok(ExportResult { path, rows })
+}
+
+/// 导出会话档案（跟随当前筛选条件）
+#[tauri::command]
+async fn export_sessions(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    status: Option<String>,
+) -> Result<ExportResult, String> {
+    let page = state.storage.get_session_history_page(
+        EXPORT_MAX_ROWS,
+        0,
+        query.as_deref().unwrap_or(""),
+        status.as_deref().unwrap_or("all"),
+    );
+    let i18n = i18n::I18n::from_code(&state.config_manager.get().language);
+    let csv = export::sessions_csv(&page.entries, &i18n);
+    let rows = page.entries.len() as u32;
+    let path = export::write_csv("sessions", &csv)?;
+    Ok(ExportResult { path, rows })
+}
+
+/// 导出花费明细
+///
+/// `scope` 取 `daily` / `projects` / `models`——三种维度的列不一样，
+/// 硬塞进一个文件会得到一张三段拼起来的表，任何表格软件都读不成一个区域。
+#[tauri::command]
+async fn export_cost(
+    state: State<'_, AppState>,
+    scope: Option<String>,
+    days: Option<u32>,
+) -> Result<ExportResult, String> {
+    let days = days.unwrap_or(30);
+    let i18n = i18n::I18n::from_code(&state.config_manager.get().language);
+    let (slug, csv, rows) = match scope.as_deref().unwrap_or("daily") {
+        "projects" => {
+            let rows = state.storage.project_costs(days, EXPORT_MAX_ROWS);
+            let n = rows.len() as u32;
+            ("cost-projects", export::project_cost_csv(&rows, &i18n), n)
+        }
+        "models" => {
+            let rows = state.storage.model_costs(days, EXPORT_MAX_ROWS);
+            let n = rows.len() as u32;
+            ("cost-models", export::model_cost_csv(&rows, &i18n), n)
+        }
+        _ => {
+            let rows = state.storage.daily_costs(days);
+            let n = rows.len() as u32;
+            ("cost-daily", export::daily_cost_csv(&rows, &i18n), n)
+        }
+    };
+    let path = export::write_csv(slug, &csv)?;
+    Ok(ExportResult { path, rows })
+}
+
+/// 导出统计摘要
+#[tauri::command]
+async fn export_stats(
+    state: State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<ExportResult, String> {
+    let i18n = i18n::I18n::from_code(&state.config_manager.get().language);
+    let overview = state.storage.stats_overview();
+    let sessions = state.storage.session_history_summary("");
+    let usage = state.storage.usage_summary(days.unwrap_or(30));
+    let csv = export::stats_summary_csv(&overview, &sessions, &usage, &i18n);
+    let rows = csv.rows.len() as u32;
+    let path = export::write_csv("stats", &csv)?;
+    Ok(ExportResult { path, rows })
+}
+
+/// 在文件管理器里亮出刚导出的文件
+#[tauri::command]
+async fn reveal_export(path: String) -> Result<(), String> {
+    export::reveal(&path)
 }
 
 /// 测试外部推送通道（Slack / Discord / ntfy / Bark）
@@ -524,6 +684,19 @@ pub fn run() {
     let engine = Arc::new(MonitorEngine::new(config_manager.clone(), storage.clone()));
 
     tauri::Builder::default()
+        // 必须是链上的第一个插件（Tauri 的要求）。
+        //
+        // 拦的是一个不容易看出来的故障：升级时旧版本还在托盘里跑，新版本又启动，
+        // 两个进程都在守护同一批会话。`resume_streak` / `last_resume_at` 只活在
+        // 各自的内存里，谁也不知道对方刚敲过，于是同一个终端吃两条提示词，
+        // 「最多续跑 N 次」这道闸门实际上变成了 2N。用户看到的不是「有两个窗口」，
+        // 而是「自动续跑好像执行了两次」——顺着日志根本找不到原因。
+        //
+        // 第二个实例直接退出，但退出前把已经在跑的那个窗口拉到前台：
+        // 双击图标没反应的话，用户只会再双击几次。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            reveal_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -549,6 +722,7 @@ pub fn run() {
             get_resume_page,
             get_stats_overview,
             get_totals,
+            get_stats_trend,
             get_cost_daily,
             get_cost_projects,
             get_cost_models,
@@ -556,6 +730,13 @@ pub fn run() {
             get_rate_forecast,
             get_session_history,
             get_session_history_page,
+            get_session_history_summary,
+            get_session_detail,
+            export_resumes,
+            export_sessions,
+            export_cost,
+            export_stats,
+            reveal_export,
             test_webhook,
             ai_analyze,
             get_lan_ip,

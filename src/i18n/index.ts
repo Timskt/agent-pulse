@@ -176,6 +176,7 @@ const TABLE = {
     "No history yet — it fills in once monitoring starts",
   ],
 
+  "stats.peak": ["峰值 {count}", "peak {count}"],
   "stats.bar_tooltip": [
     "{date}：检测 {detections} 次 · 续跑 {resumes} 次 · 成功 {successful} 次",
     "{date}: {detections} detected · {resumes} resumed · {successful} succeeded",
@@ -186,6 +187,100 @@ const TABLE = {
   "stats.no_history": ["还没有续跑记录", "No resumes yet"],
   "stats.prompt_goal": ["目标续跑", "Goal"],
   "stats.prompt_generic": ["通用续跑", "Generic"],
+
+  // ── 续跑记录中心 ──
+  //
+  // 这四条是徽标上的**短标签**，跟后端 `resume.outcome_*` 那几句长话是两套：
+  // 那边要在日志里把事情说清楚（「按键发出去了，但盯了几秒会话一点没动……」），
+  // 这边只有一个徽标的宽度。同一个概念两种长度，不要互相复用。
+  "outcome.landed": ["已落地", "Landed"],
+  "outcome.silent": ["没反应", "No reaction"],
+  "outcome.failed": ["没送达", "Not delivered"],
+  "outcome.unverifiable": ["无法核验", "Unverifiable"],
+  // 徽标只有两三个字，说不清「所以我该干什么」，所以把下一步动作放在悬浮解释里
+  "outcome.landed_hint": [
+    "字敲进去了，而且看见会话动了起来",
+    "The text went in and the session was seen picking it up",
+  ],
+  "outcome.silent_hint": [
+    "字敲出去了，但盯了几秒会话没动——大概进了别的窗口，去看看焦点和输入法",
+    "Keystrokes went out but the session didn't budge — they likely hit another window; check focus and your input method",
+  ],
+  "outcome.failed_hint": [
+    "一个字都没敲出去，通道自己就报错了——多半是权限或者定位不到窗口",
+    "Nothing was typed at all — the channel itself errored out, usually permissions or a window it couldn't find",
+  ],
+  "outcome.unverifiable_hint": [
+    "已发送。这类会话没有可读的记录文件，核验不了，不代表出了问题",
+    "Sent. This kind of session keeps no readable transcript, so it can't be verified — that's not a fault",
+  ],
+  "outcome.legacy": ["旧记录", "Older record"],
+  "outcome.legacy_hint": [
+    "这条记录写在加入投递核验之前，当时只记了成功或失败",
+    "Written before delivery verification existed — only success or failure was recorded back then",
+  ],
+
+  "records.title": ["续跑记录", "Resume records"],
+  "records.desc": [
+    "每一次续跑敲进去了没有，以及没进去的原因",
+    "Whether each resume actually landed — and why it didn't",
+  ],
+  "records.search": [
+    "搜索项目 / Agent / 原因…",
+    "Search project, agent or reason…",
+  ],
+  "records.filter_outcome": ["投递结果", "Outcome"],
+  "records.filter_type": ["提示词", "Prompt"],
+  "records.all": ["全部", "All"],
+  "records.empty": ["还没有续跑记录", "No resumes yet"],
+  "records.empty_hint": [
+    "开始守护后，每一次自动或手动续跑都会记在这里",
+    "Once monitoring starts, every auto or manual resume is logged here",
+  ],
+  "records.no_match": ["没有匹配的记录", "Nothing matched"],
+  "records.no_match_hint": [
+    "换个关键词，或把筛选条件放回「全部」",
+    "Try another keyword, or set the filters back to All",
+  ],
+  "records.reason": ["原因", "Reason"],
+  "records.stuck": ["卡了 {dur}", "Stuck {dur}"],
+  "records.stuck_hint": [
+    "出手前它已经这么久没动了。这个数越大，说明发现得越晚",
+    "It had been idle this long before we stepped in — the bigger it is, the later we caught it",
+  ],
+
+  // ── 时长 ──
+  //
+  // 只给 key，不在代码里拼 `"3 分 20 秒"`：那种写法在英文里语序和单位都不一样。
+  "dur.secs": ["{n} 秒", "{n}s"],
+  "dur.mins": ["{n} 分钟", "{n} min"],
+  "dur.hours": ["{n} 小时", "{n} h"],
+
+  // ── 趋势对比 ──
+  "trend.title": ["跟上一期比", "Versus last period"],
+  "trend.desc": [
+    "同样长的两段时间放一起看，才知道是在变好还是变坏",
+    "Two equal spans side by side — the only way to tell better from worse",
+  ],
+  "trend.window_1": ["今日 / 昨日", "Today vs yesterday"],
+  "trend.window_7": ["近 7 天 / 前 7 天", "7 days vs previous 7"],
+  "trend.interruptions": ["中断次数", "Interruptions"],
+  "trend.resumes": ["续跑次数", "Resumes"],
+  "trend.landed_rate": ["敲进去的比例", "Landed rate"],
+  "trend.stuck_secs": ["平均卡多久", "Avg. stuck"],
+  "trend.baseline": ["上期 {value}", "Was {value}"],
+  "trend.flat": ["持平", "No change"],
+  "trend.no_baseline": ["没有可比的上期", "No period to compare"],
+  "trend.no_data": ["暂无", "—"],
+  // 空窗提示分两种，因为该做的事完全不同：一个是等，一个是没开着
+  "trend.too_new": [
+    "上一期这个应用还没在跑，没有可比的数据。守护满 {days} 天后这里会自动出现",
+    "The app wasn't running last period, so there's nothing to compare. This fills in after {days} day(s) of monitoring",
+  ],
+  "trend.stuck_unknown": [
+    "这一期没有能算出卡了多久的记录——没有可读会话记录的 agent 算不出这个数",
+    "No measurable stuck time this period — agents without a readable transcript can't report it",
+  ],
 
   // ── 花费 ──
   "cost.today": ["今日花费", "Spent today"],
@@ -223,6 +318,7 @@ const TABLE = {
   ],
   "cost.requests": ["{count} 次请求", "{count} requests"],
   "cost.tokens": ["{tokens} tokens", "{tokens} tokens"],
+  "cost.peak": ["峰值 ${cost}", "peak ${cost}"],
   "cost.bar_tooltip": [
     "{date}：${cost} · {tokens} tokens · {requests} 次请求",
     "{date}: ${cost} · {tokens} tokens · {requests} requests",
@@ -242,11 +338,11 @@ const TABLE = {
   "cost.models": ["模型排行", "Top models"],
   "cost.models_desc": ["近 {days} 天按模型聚合", "Grouped by model, last {days} days"],
 
-  // ── 会话历史时间线 ──
-  "history.title": ["会话历史", "Session history"],
+  // ── 会话历史 ──
+  "history.title": ["会话档案", "Session records"],
   "history.desc": [
-    "按项目或终端找回以前的会话",
-    "Find past sessions by project or terminal",
+    "每个会话一行，记着它活了多久、被续跑过几次、花了多少。点开看细节。",
+    "One row per session: how long it ran, how often it was resumed, what it cost. Click for details.",
   ],
   "history.search": ["搜索项目 / 终端…", "Search project or terminal…"],
   "history.empty": ["还没有历史会话", "No past sessions yet"],
@@ -256,6 +352,67 @@ const TABLE = {
   "history.previous": ["上一页", "Previous"],
   "history.next": ["下一页", "Next"],
   "history.page": ["第 {page} / {total} 页", "Page {page} of {total}"],
+
+  // 汇总条
+  "history.sum_total": ["会话总数", "Sessions"],
+  "history.sum_live": ["仍在运行", "Still running"],
+  "history.sum_resumes": ["续跑次数", "Resumes"],
+  "history.sum_cost": ["累计花费", "Total spend"],
+
+  // 状态筛选与状态标记
+  "history.filter_all": ["全部", "All"],
+  "history.filter_live": ["运行中", "Running"],
+  "history.filter_ended": ["已结束", "Ended"],
+  "history.live": ["运行中", "Running"],
+  "history.ended": ["已结束", "Ended"],
+  "history.last_seen_as": ["最后一眼：{status}", "Last seen: {status}"],
+  "history.ended_at": ["{time} 结束", "ended {time}"],
+  "history.lasted": ["持续 {duration}", "ran for {duration}"],
+  "history.today": ["今天", "Today"],
+  "history.yesterday": ["昨天", "Yesterday"],
+
+  // 档案抽屉
+  "history.detail_title": ["会话档案", "Session record"],
+  "history.detail_loading": ["正在读取档案…", "Loading record…"],
+  "history.detail_missing": [
+    "这个会话的档案已经不在库里了",
+    "This session is no longer in the database",
+  ],
+  "history.lifecycle": ["生命周期", "Lifecycle"],
+  "history.first_seen_at": ["首次发现", "First seen"],
+  "history.last_seen_at": ["最后发现", "Last seen"],
+  "history.duration": ["持续时长", "Duration"],
+  "history.final_status": ["最后状态", "Final status"],
+  "history.agent": ["Agent", "Agent"],
+  "history.terminal": ["终端", "Terminal"],
+  "history.detail_usage": ["用量", "Usage"],
+  "history.detail_tokens": ["Tokens", "Tokens"],
+  "history.interruptions": ["中断 {count} 次", "{count} interruption(s)"],
+  "history.no_interruptions": ["没有被判定过中断", "Never flagged as interrupted"],
+  "history.resume_timeline": ["续跑时间线", "Resume timeline"],
+  "history.no_resumes": ["没有续跑过", "Never resumed"],
+  "history.detection_timeline": ["中断记录", "Interruptions"],
+  "history.stuck_for": ["卡了 {duration}", "stuck {duration}"],
+  "history.copy_transcript": ["复制会话记录路径", "Copy transcript path"],
+  "history.copy_dir": ["复制工作目录", "Copy working directory"],
+  "history.no_transcript": [
+    "这个 agent 没有可读的会话记录文件",
+    "This agent has no readable transcript file",
+  ],
+
+  // ── 导出 ──
+  //
+  // 「导到哪儿去了」必须说出来：这个应用不弹系统保存对话框（那要多引一个插件
+  // 和一条权限），文件直接写到下载夹。只说「成功」而不说位置，用户找不到文件时
+  // 比失败更难受。所以成功那句话本身就是个可点的链接，点了在文件管理器里亮出来。
+  "export.csv": ["导出 CSV", "Export CSV"],
+  "export.running": ["正在导出…", "Exporting…"],
+  "export.done": ["已导出 {rows} 行，点这里查看", "{rows} rows exported — reveal"],
+  "export.failed": ["导出失败", "Export failed"],
+  "export.cost_daily": ["导出每日花费", "Export daily spend"],
+  "export.cost_projects": ["导出项目花费", "Export by project"],
+  "export.cost_models": ["导出模型花费", "Export by model"],
+  "export.stats": ["导出统计摘要", "Export summary"],
 
   // ── 设置：检测 ──
   "cfg.detection": ["检测", "Detection"],

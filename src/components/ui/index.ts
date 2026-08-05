@@ -29,5 +29,8 @@ export {
 export { Switch, ToggleRow } from "./Switch";
 export { Select, type SelectOption } from "./Select";
 export { Tabs, TabsContent, TabsList, TabsTrigger } from "./Tabs";
+export { Segmented, type SegmentedOption } from "./Segmented";
 export { Tooltip, TooltipProvider } from "./Tooltip";
+export { Drawer, DrawerRow, DrawerSection } from "./Drawer";
 export { BarChart, LegendDot, type BarDatum } from "./BarChart";
+export { ExportButton } from "./ExportButton";

@@ -248,6 +248,14 @@ const TABLE: &[(&str, &str, &str)] = &[
         "窗口已经切过去了，但系统不允许本应用模拟键盘，所以一个字都没敲进去。请到「系统设置 › 隐私与安全性 › 辅助功能」里勾上 AgentPulse（如果已经勾了，取消再勾一次——应用更新过后这条授权会失效）。或者在 tmux 里跑 Agent，那条路不需要任何权限。",
         "The window came forward, but the OS blocked this app from simulating the keyboard, so nothing was typed. Enable AgentPulse under System Settings › Privacy & Security › Accessibility (if it is already on, toggle it off and back on — the grant breaks whenever the app is updated). Alternatively, run your agents inside tmux: that path needs no permission at all.",
     ),
+    // 同一件事的另一种成因：勾是勾了，但应用是临时签名（adhoc），
+    // 每次重新构建二进制哈希都变，TCC 认的是哈希，于是旧授权对不上号。
+    // 这一句必须跟上面那句分开：让「已经勾过」的人看到「去勾上」只会觉得程序在骗他。
+    (
+        "resume.needs_accessibility_adhoc",
+        "窗口已经切过去了，但系统不允许本应用模拟键盘，所以一个字都没敲进去。你的勾没有白勾——问题是这个版本用的是临时签名，而 macOS 把授权记在代码签名上，所以每次重新构建都会被当成另一个应用，旧的勾自动失效。眼下的办法：到「系统设置 › 隐私与安全性 › 辅助功能」里把 AgentPulse 取消再勾一次（每次装新版本都得重来一遍）。要根治得用一份固定证书签名，或者在 tmux 里跑 Agent——那条路不碰模拟键盘，不需要任何权限。",
+        "The window came forward, but the OS blocked this app from simulating the keyboard, so nothing was typed. Your checkbox wasn't the problem: this build is ad-hoc signed, and macOS ties the grant to the code signature, so every rebuild looks like a different app and silently invalidates the old grant. For now, toggle AgentPulse off and back on under System Settings › Privacy & Security › Accessibility (and again after each new build). The real fix is signing with a stable certificate — or running your agents inside tmux, which never simulates the keyboard and needs no permission at all.",
+    ),
     // ── 续跑演练（dry-run）──
     //
     // 走完全部定位流程但一个字都不敲，把「要冒险按一次才知道」变成「随时可查」。
@@ -278,6 +286,11 @@ const TABLE: &[(&str, &str, &str)] = &[
         "probe.no_accessibility",
         "另外：本应用还没拿到「辅助功能」权限，所以合成按键会静默失效（表现就是窗口跳过来了、字没敲进去）。到「系统设置 › 隐私与安全性 › 辅助功能」里勾上 AgentPulse；已经勾了的话取消再勾一次。",
         "Also: this app hasn't been granted Accessibility permission, so synthetic keystrokes fail silently — the window comes forward and nothing gets typed. Enable AgentPulse under System Settings › Privacy & Security › Accessibility; if it's already on, toggle it off and back on.",
+    ),
+    (
+        "probe.no_accessibility_adhoc",
+        "另外：合成按键现在会静默失效（窗口跳过来了、字没敲进去）。不是你没勾——这个版本用的是临时签名，macOS 把授权记在代码签名上，重新构建一次就换了身份，旧的勾自动不生效。到「系统设置 › 隐私与安全性 › 辅助功能」里把 AgentPulse 取消再勾一次可以临时恢复；要一劳永逸，得用固定证书签名，或者把 Agent 跑在 tmux 里。",
+        "Also: synthetic keystrokes currently fail silently — the window comes forward and nothing gets typed. This isn't a missing checkbox: the build is ad-hoc signed, and macOS ties the grant to the code signature, so each rebuild is a new identity and the old grant stops applying. Toggling AgentPulse off and back on under System Settings › Privacy & Security › Accessibility restores it for now; signing with a stable certificate — or running the agent inside tmux — fixes it for good.",
     ),
     ("probe.channel_tmux", "tmux 面板", "the tmux pane"),
     ("probe.channel_screen", "screen 会话", "the screen session"),
@@ -450,6 +463,45 @@ const TABLE: &[(&str, &str, &str)] = &[
         "{agent}：{reason}，这次不催，等它自己恢复",
         "{agent}: {reason} — not nudging, waiting for it to recover",
     ),
+    // ── CSV 表头 ──
+    //
+    // 表头也是用户可见文字，所以跟通知一样跟着 `config.language` 走：界面是
+    // 中文、导出来的表头是英文，正是那种土不土洋不洋的搭配。
+    //
+    // 代价记一下：跟着语言变意味着表头**不是稳定的机器接口**。要拿它喂脚本
+    // 的话该按列的位置读，别按名字读——列的顺序是固定的，名字不是。
+    ("csv.time", "时间", "Time"),
+    ("csv.agent", "Agent", "Agent"),
+    ("csv.project", "项目目录", "Project directory"),
+    ("csv.session_id", "会话 ID", "Session ID"),
+    ("csv.prompt_type", "提示词类型", "Prompt type"),
+    ("csv.outcome", "核验结果", "Outcome"),
+    ("csv.stuck_secs", "卡了多久（秒）", "Stuck for (seconds)"),
+    ("csv.message", "说明", "Message"),
+    ("csv.terminal", "终端", "Terminal"),
+    ("csv.first_seen", "首次见到", "First seen"),
+    ("csv.last_seen", "最后一次见到", "Last seen"),
+    ("csv.last_status", "最后状态", "Last status"),
+    ("csv.ended_at", "结束时间", "Ended at"),
+    ("csv.live", "还在运行", "Still running"),
+    ("csv.resume_count", "续跑次数", "Resumes"),
+    ("csv.tokens", "Token 数", "Tokens"),
+    ("csv.cost", "花费（美元）", "Cost (USD)"),
+    ("csv.date", "日期", "Date"),
+    ("csv.model", "模型", "Model"),
+    ("csv.requests", "请求数", "Requests"),
+    ("csv.metric", "指标", "Metric"),
+    ("csv.value", "数值", "Value"),
+    ("csv.scans", "扫描次数", "Scans"),
+    ("csv.detections", "检测到中断", "Interruptions detected"),
+    ("csv.resumes", "续跑次数", "Resumes"),
+    ("csv.resumes_ok", "续跑成功", "Successful resumes"),
+    ("csv.resumes_failed", "续跑失败", "Failed resumes"),
+    ("csv.sessions_total", "会话总数", "Total sessions"),
+    ("csv.sessions_live", "还在运行", "Still running"),
+    ("csv.yes", "是", "Yes"),
+    ("csv.no", "否", "No"),
+    ("csv.unknown", "未知", "Unknown"),
 ];
 
 /// 国际化查表器

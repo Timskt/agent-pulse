@@ -1,28 +1,26 @@
 import { useEffect, useMemo } from "react";
 import { useI18n } from "../i18n";
-import { formatShortTime } from "../lib/utils";
+import { shortDate } from "../lib/utils";
 import {
   selectDailyStats,
-  selectResumeHistory,
-  selectResumeHistoryTotal,
   selectStatsOverview,
   selectTotals,
   useAppStore,
 } from "../stores/useAppStore";
+import { TrendPanel } from "./TrendPanel";
 import {
-  Badge,
   BarChart,
   Card,
   CardBody,
   CardHeader,
   EmptyState,
+  ExportButton,
   LegendDot,
   type BarDatum,
 } from "./ui";
 
-/** 与 store 里 `get_stats { days: 30 }` / `get_resume_history { limit: 50 }` 保持一致 */
+/** 与 store 里 `get_stats { days: 30 }` 保持一致 */
 const DAYS = 30;
-const HISTORY_LIMIT = 50;
 
 /**
  * 统计页
@@ -34,8 +32,6 @@ const HISTORY_LIMIT = 50;
 export function StatsPanel() {
   const { t } = useI18n();
   const dailyStats = useAppStore(selectDailyStats);
-  const resumeHistory = useAppStore(selectResumeHistory);
-  const resumeHistoryTotal = useAppStore(selectResumeHistoryTotal);
   const overview = useAppStore(selectStatsOverview);
   const totals = useAppStore(selectTotals);
   const fetchStats = useAppStore((s) => s.fetchStats);
@@ -53,6 +49,7 @@ export function StatsPanel() {
         key: day.date,
         value: day.total_detections + day.total_resumes,
         overlay: day.successful_resumes,
+        label: shortDate(day.date),
         tooltip: t("stats.bar_tooltip", {
           date: day.date,
           detections: day.total_detections,
@@ -63,6 +60,8 @@ export function StatsPanel() {
     [dailyStats, t]
   );
 
+  const peak = useMemo(() => bars.reduce((acc, b) => Math.max(acc, b.value), 0), [bars]);
+
   return (
     <div className="mx-auto max-w-3xl space-y-4">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -71,6 +70,10 @@ export function StatsPanel() {
         <StatCard label={t("stats.successful")} value={overview?.successful_resumes ?? successful} />
         <StatCard label={t("stats.success_rate")} value={`${successRate}%`} />
       </div>
+
+      {/* 趋势排在累计数之后、活动图之前：累计数是「一共」，趋势是「最近怎么样」，
+          后者才是用户打开这一页真正想知道的，所以放在视线第二站而不是最末 */}
+      <TrendPanel />
 
       <Card>
         <CardBody>
@@ -82,77 +85,22 @@ export function StatsPanel() {
               <div className="flex items-center gap-3">
                 <LegendDot>{t("stats.legend_total")}</LegendDot>
                 <LegendDot className="bg-emerald-500">{t("stats.legend_success")}</LegendDot>
+                <ExportButton
+                  command="export_stats"
+                  args={{ days: DAYS }}
+                  label={t("export.stats")}
+                />
               </div>
             }
           />
           {bars.length === 0 ? (
             <EmptyState title={t("stats.no_activity")} />
           ) : (
-            <BarChart
-              data={bars}
-              axis={
-                <>
-                  <span>{shortDate(dailyStats[0].date)}</span>
-                  <span>{shortDate(dailyStats[dailyStats.length - 1].date)}</span>
-                </>
-              }
-            />
+            <BarChart data={bars} peakLabel={t("stats.peak", { count: peak })} />
           )}
         </CardBody>
       </Card>
 
-      <Card>
-        <CardBody>
-          <CardHeader
-            className="mb-3"
-            title={t("stats.history")}
-            desc={t("stats.history_desc", { limit: HISTORY_LIMIT })}
-            aside={
-              <span className="text-[10px] tabular-nums text-neutral-400">
-                {t("stats.records", { count: resumeHistoryTotal || resumeHistory.length })}
-              </span>
-            }
-          />
-          {resumeHistory.length === 0 ? (
-            <EmptyState title={t("stats.no_history")} className="py-6" />
-          ) : (
-            <div className="max-h-72 divide-y divide-neutral-100 overflow-y-auto">
-              {resumeHistory.map((record) => (
-                <div key={record.id} className="flex items-center gap-3 py-2.5">
-                  <span
-                    className={
-                      record.success
-                        ? "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-[10px] text-emerald-600"
-                        : "flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-red-50 text-[10px] text-red-500"
-                    }
-                  >
-                    {record.success ? "✓" : "✗"}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-xs font-medium text-neutral-700">
-                        {record.agent_name}
-                      </span>
-                      <Badge tone={record.prompt_type === "goal" ? "violet" : "neutral"}>
-                        {record.prompt_type === "goal"
-                          ? t("stats.prompt_goal")
-                          : t("stats.prompt_generic")}
-                      </Badge>
-                    </div>
-                    {/* 成功的那条不用解释，失败的才需要看后端那句话 */}
-                    <p className="truncate text-[10px] text-neutral-400">
-                      {record.success ? record.working_dir : record.message || record.working_dir}
-                    </p>
-                  </div>
-                  <span className="shrink-0 text-[10px] tabular-nums text-neutral-300">
-                    {formatShortTime(record.created_at)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-        </CardBody>
-      </Card>
     </div>
   );
 }
@@ -166,7 +114,3 @@ function StatCard({ label, value }: { label: string; value: number | string }) {
   );
 }
 
-/** `2026-07-30` → `07-30`；坐标轴上年份是噪音 */
-function shortDate(date: string): string {
-  return date.length >= 10 ? date.slice(5) : date;
-}

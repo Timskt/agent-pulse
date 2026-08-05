@@ -51,13 +51,18 @@ describe("useAppStore — 初始状态", () => {
       loading: false,
       focusedSessionId: null,
       dailyStats: [],
-      resumeHistory: [],
+      resumeRecords: [],
+      resumeRecordsTotal: 0,
       totals: null,
       costDaily: [],
       costProjects: [],
       rateForecast: null,
       sessionHistory: [],
-      historyQuery: "",
+      sessionHistoryTotal: 0,
+      historyFilter: { query: "", status: "all", offset: 0 },
+      sessionHistorySummary: null,
+      detailKey: null,
+      sessionDetail: null,
     });
     vi.clearAllMocks();
   });

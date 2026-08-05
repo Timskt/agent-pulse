@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from "react";
 import { useI18n } from "../i18n";
-import { baseName, cn, formatTokens, formatUsd } from "../lib/utils";
+import { baseName, cn, formatTokens, formatUsd, shortDate } from "../lib/utils";
 import {
   selectCostDaily,
   selectCostModels,
@@ -17,6 +17,7 @@ import {
   CardBody,
   CardHeader,
   EmptyState,
+  ExportButton,
   Tooltip,
   type BarDatum,
 } from "./ui";
@@ -51,6 +52,7 @@ export function CostPanel() {
       costDaily.map((day) => ({
         key: day.date,
         value: day.cost_usd,
+        label: shortDate(day.date),
         tooltip: t("cost.bar_tooltip", {
           date: day.date,
           cost: formatUsd(day.cost_usd),
@@ -65,6 +67,7 @@ export function CostPanel() {
     () => costDaily.reduce((acc, day) => acc + day.cost_usd, 0),
     [costDaily]
   );
+  const peak = useMemo(() => costDaily.reduce((acc, d) => Math.max(acc, d.cost_usd), 0), [costDaily]);
   const cacheHitRate = usageSummary && usageSummary.total_tokens > 0
     ? Math.round((usageSummary.cache_read_tokens / usageSummary.total_tokens) * 100)
     : 0;
@@ -84,11 +87,19 @@ export function CostPanel() {
             title={t("cost.trend")}
             desc={t("cost.trend_desc", { days: TREND_DAYS })}
             aside={
-              <div className="text-right">
-                <p className="text-xl font-semibold tabular-nums text-neutral-900">
-                  ${formatUsd(status.cost_today)}
-                </p>
-                <p className="text-[10px] text-neutral-400">{t("cost.today")}</p>
+              <div className="flex items-start gap-3">
+                <ExportButton
+                  className="mt-1"
+                  command="export_cost"
+                  args={{ scope: "daily", days: TREND_DAYS }}
+                  label={t("export.cost_daily")}
+                />
+                <div className="text-right">
+                  <p className="text-xl font-semibold tabular-nums text-neutral-900">
+                    ${formatUsd(status.cost_today)}
+                  </p>
+                  <p className="text-[10px] text-neutral-400">{t("cost.today")}</p>
+                </div>
               </div>
             }
           />
@@ -99,12 +110,7 @@ export function CostPanel() {
               <BarChart
                 data={bars}
                 barClassName="bg-blue-500/70 group-hover:bg-blue-500"
-                axis={
-                  <>
-                    <span>{shortDate(costDaily[0].date)}</span>
-                    <span>{shortDate(costDaily[costDaily.length - 1].date)}</span>
-                  </>
-                }
+                peakLabel={t("cost.peak", { cost: formatUsd(peak) })}
               />
               <p className="mt-2 text-[10px] tabular-nums text-neutral-400">
                 {t("cost.range_total", { days: TREND_DAYS, cost: formatUsd(rangeTotal) })}
@@ -128,13 +134,33 @@ export function CostPanel() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <Card>
           <CardBody>
-            <CardHeader className="mb-3" title={t("cost.projects")} desc={t("cost.projects_desc", { days: PROJECT_DAYS })} />
+            <CardHeader
+              className="mb-3"
+              title={t("cost.projects")}
+              desc={t("cost.projects_desc", { days: PROJECT_DAYS })}
+              aside={
+                <ExportButton
+                  command="export_cost"
+                  args={{ scope: "projects", days: PROJECT_DAYS }}
+                />
+              }
+            />
             <RankList rows={costProjects.map((project) => ({ key: project.project, label: baseName(project.project), detail: `${t("cost.tokens", { tokens: formatTokens(project.total_tokens) })} · ${t("cost.requests", { count: project.requests })}`, value: project.cost_usd, tooltip: project.project }))} />
           </CardBody>
         </Card>
         <Card>
           <CardBody>
-            <CardHeader className="mb-3" title={t("cost.models")} desc={t("cost.models_desc", { days: PROJECT_DAYS })} />
+            <CardHeader
+              className="mb-3"
+              title={t("cost.models")}
+              desc={t("cost.models_desc", { days: PROJECT_DAYS })}
+              aside={
+                <ExportButton
+                  command="export_cost"
+                  args={{ scope: "models", days: PROJECT_DAYS }}
+                />
+              }
+            />
             <RankList rows={costModels.map((model) => ({ key: model.model, label: model.model, detail: `${t("cost.tokens", { tokens: formatTokens(model.total_tokens) })} · ${t("cost.requests", { count: model.requests })}`, value: model.cost_usd }))} />
           </CardBody>
         </Card>
@@ -194,7 +220,3 @@ function RankList({ rows }: { rows: readonly { key: string; label: string; detai
   return <div className="space-y-3">{rows.map((row) => <div key={row.key}><div className="flex items-baseline justify-between gap-3"><Tooltip content={row.tooltip ?? row.label}><span className="truncate font-mono text-[11px] text-neutral-700">{row.label}</span></Tooltip><span className="shrink-0 text-[11px] font-medium tabular-nums text-neutral-800">${formatUsd(row.value)}</span></div><div className="mt-1 h-1 overflow-hidden rounded-full bg-neutral-100"><div className="h-full rounded-full bg-neutral-800/70" style={{ width: `${max === 0 ? 0 : (row.value / max) * 100}%` }} /></div><p className="mt-1 text-[10px] tabular-nums text-neutral-400">{row.detail}</p></div>)}</div>;
 }
 
-/** `2026-07-30` → `07-30` */
-function shortDate(date: string): string {
-  return date.length >= 10 ? date.slice(5) : date;
-}

@@ -257,6 +257,22 @@ export interface DailyStats {
   failed_resumes: number;
 }
 
+/**
+ * 投递核验的四种结论（Rust `ResumeOutcome::storage_key`）
+ *
+ * 刻意只列这四个、不把空串收进来：这个联合是**显示用**的，
+ * `display.ts` 里几张 `Record<ResumeOutcome, …>` 要靠它保证四态都有配色和措辞。
+ * 把 `""` 塞进来的话，那几张表就得给「没有结论」也编一个颜色。
+ * 旧记录的空串走 `asOutcome()` 收敛成 `null`。
+ */
+export type ResumeOutcome = "landed" | "silent" | "failed" | "unverifiable";
+
+/** 记录中心的筛选值：四态之外多一个「全部」 */
+export type OutcomeFilter = ResumeOutcome | "all";
+
+/** 提示词类型的筛选值 */
+export type PromptTypeFilter = "all" | "goal" | "generic";
+
 export interface ResumeRecord {
   id: number;
   session_id: string;
@@ -265,6 +281,17 @@ export interface ResumeRecord {
   /** `generic` | `goal` */
   prompt_type: string;
   success: boolean;
+  /**
+   * 核验结论。**v1.6 之前的行是空串**——那时候只存了 `success` 这一个布尔，
+   * 回答不了「敲出去了但没反应」和「压根没敲出去」的区别。
+   */
+  outcome: ResumeOutcome | "";
+  /**
+   * 出手时它已经卡了多久（秒）。**`-1` 是「不知道」，不是「零秒」**：
+   * v1.7 之前的行没这个数，Codex / OpenCode 这类没有可读记录的会话也算不出来。
+   * 显示前一律走 `asStuckSecs()` 收成 `null`。
+   */
+  stuck_secs: number;
   message: string;
   created_at: string;
 }
@@ -309,11 +336,65 @@ export interface SessionHistoryEntry {
   tty: string;
   terminal_app: string;
   first_seen: string;
+  /**
+   * 最后一次被扫到的时刻。会话还活着的时候，这个数每轮都在动。
+   */
   last_seen: string;
+  /**
+   * 最后一眼看到它在干什么（`SessionStatus`）。**这是历史，不会回头改。**
+   */
   last_status: string;
+  /**
+   * 从扫描结果里消失的时刻；**空串表示它还在。**
+   *
+   * 跟 `last_status` 分开两列，是因为那两句话问的不是一件事：
+   * `last_status` 答「最后一眼它在干什么」，`ended_at` 答「它还在不在」。
+   * 合成一列的后果用户见过——关掉的会话在历史页一直写着「运行中」，
+   * 因为那个词是现在时，可写下它的那一刻已经过去了。
+   */
+  ended_at: string;
   resume_count: number;
   total_tokens: number;
   cost_usd: number;
+}
+
+/** 会话还在不在（`ended_at` 为空即为在） */
+export function isLive(entry: SessionHistoryEntry): boolean {
+  return entry.ended_at === "";
+}
+
+/** 历史页的状态筛选 */
+export type HistoryStatusFilter = "all" | "live" | "ended";
+
+/** 会话历史的汇总数字；跟着搜索条件走，不跟着分页走 */
+export interface SessionHistorySummary {
+  total: number;
+  live: number;
+  resumes: number;
+  cost_usd: number;
+  total_tokens: number;
+}
+
+/** 一次「判定为中断」的记录 */
+export interface DetectionRecord {
+  id: number;
+  session_id: string;
+  agent_name: string;
+  verdict: string;
+  signals: string;
+  has_active_goal: boolean;
+  /** 中断原因键（`InterruptReason`）；v1.6 之前的行是空串 */
+  reason: InterruptReason | "";
+  created_at: string;
+}
+
+/** 一个会话的完整档案：它自己 + 它身上发生过的事 */
+export interface SessionDetail {
+  entry: SessionHistoryEntry;
+  /** 续跑记录，时间正序 */
+  resumes: ResumeRecord[];
+  /** 中断判定记录，时间正序 */
+  detections: DetectionRecord[];
 }
 
 export interface ResumeRecordPage {
@@ -333,6 +414,31 @@ export interface StatsOverview {
   successful_resumes: number;
   failed_resumes: number;
   active_sessions: number;
+}
+
+/**
+ * 一个指标的本期与上期
+ *
+ * 两边都可能是 `null`，而且 `null` 跟 `0` 是两件不同的事：
+ * 「上期没数据」和「上期是 0」在界面上必须说不同的话。
+ */
+export interface TrendMetric {
+  current: number | null;
+  previous: number | null;
+}
+
+/** 趋势对比可选的窗口长度（天）；后端 `stats_trend` 认 1–90，界面只给这两档 */
+export type TrendWindow = 1 | 7;
+
+export interface StatsTrend {
+  window_days: number;
+  /** 确认中断的次数 */
+  interruptions: TrendMetric;
+  resumes: TrendMetric;
+  /** 敲进去的比例，0–100 */
+  landed_rate: TrendMetric;
+  /** 平均卡了多久才被催醒（秒） */
+  stuck_secs: TrendMetric;
 }
 
 export interface AiVerdict {

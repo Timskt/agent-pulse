@@ -9,18 +9,68 @@ import type {
   DailyCost,
   DailyStats,
   EngineEvent,
+  HistoryStatusFilter,
   MonitorState,
   ProjectCost,
   RateLimitForecast,
+  ResumeOutcome,
   ResumeProbe,
   ResumeRecord,
   ResumeRecordPage,
+  SessionDetail,
   SessionHistoryEntry,
   SessionHistoryPage,
+  SessionHistorySummary,
   StatsOverview,
+  StatsTrend,
+  TrendWindow,
 } from "../types";
 
 export type TabId = "dashboard" | "stats" | "cost" | "history" | "config";
+
+/**
+ * 续跑记录中心的筛选条件
+ *
+ * `outcome` 和 `prompt_type` 用 `"all"` 而不是 `null` 表示不筛，因为这个值
+ * 直接就是发给后端的那个字符串——多一层「null 就传 all」的翻译，翻错了
+ * 只会静默地少给几条记录。
+ */
+export interface ResumeFilter {
+  query: string;
+  outcome: ResumeOutcome | "all";
+  promptType: "goal" | "generic" | "all";
+  offset: number;
+}
+
+/** 续跑记录每页条数；组件的翻页步长要跟这个对齐 */
+export const RESUME_PAGE_SIZE = 20;
+
+const defaultResumeFilter: ResumeFilter = {
+  query: "",
+  outcome: "all",
+  promptType: "all",
+  offset: 0,
+};
+
+/**
+ * 历史页的筛选条件
+ *
+ * 跟 `ResumeFilter` 同构，连 `"all"` 而不是 `null` 的取舍也一样：这个值直接
+ * 就是发给后端的那个字符串。
+ */
+export interface HistoryFilter {
+  query: string;
+  status: HistoryStatusFilter;
+  offset: number;
+}
+
+export const HISTORY_PAGE_SIZE = 20;
+
+const defaultHistoryFilter: HistoryFilter = {
+  query: "",
+  status: "all",
+  offset: 0,
+};
 
 /** 命令结果：文案由后端按当前语言给，前端只管显示 */
 export interface CommandResult {
@@ -39,11 +89,22 @@ interface AppStore {
   focusedSessionId: string | null;
 
   dailyStats: DailyStats[];
-  resumeHistory: ResumeRecord[];
-  resumeHistoryTotal: number;
+  /** 续跑记录中心当前那一页 */
+  resumeRecords: ResumeRecord[];
+  /** 满足当前筛选条件的总条数，用来算页数 */
+  resumeRecordsTotal: number;
   statsOverview: StatsOverview | null;
   /** (检测数, 续跑数, 成功数) */
   totals: [number, number, number] | null;
+  /** 本期 vs 上期；还没取到是 `null` */
+  statsTrend: StatsTrend | null;
+  /**
+   * 趋势卡当前看的窗口
+   *
+   * 存在 store 里而不是组件里：统计页是 Radix `Tabs` 的一个面板，切走再切回来
+   * 会重新挂载，局部 state 会把用户选的「近 7 天」悄悄弹回「今日」。
+   */
+  trendWindow: TrendWindow;
 
   costDaily: DailyCost[];
   costProjects: ProjectCost[];
@@ -53,15 +114,41 @@ interface AppStore {
 
   sessionHistory: SessionHistoryEntry[];
   sessionHistoryTotal: number;
-  historyQuery: string;
+  /** 历史页的筛选条件；跟 `resumeFilter` 一个路子，翻页要沿用 */
+  historyFilter: HistoryFilter;
+  /**
+   * 会话历史的汇总数字。**跟着搜索条件走，不跟着分页走**——
+   * 顶部那条「共 N 个会话」问的是筛出来一共多少，不是这一页几行。
+   */
+  sessionHistorySummary: SessionHistorySummary | null;
+  /**
+   * 抽屉开在哪个会话上；`null` 表示抽屉关着。
+   *
+   * **抽屉的开合看这个，不看 `sessionDetail`。** 档案是异步取的，正在取的那
+   * 一拍 `sessionDetail` 也是 `null`，拿它当开关会让抽屉刚点开就自己关掉。
+   */
+  detailKey: string | null;
+  /** 抽屉里那个会话的档案；`null` 且 `detailKey` 非空表示还在取 */
+  sessionDetail: SessionDetail | null;
+
+  /** 续跑记录中心的筛选条件；翻页要沿用，所以存在 store 里而不是组件里 */
+  resumeFilter: ResumeFilter;
 
   setActiveTab: (tab: TabId) => void;
   setFocusedSession: (sessionId: string | null) => void;
   fetchState: () => Promise<void>;
   fetchConfig: () => Promise<void>;
   fetchStats: () => Promise<void>;
+  /** 换趋势窗口并重取；不传就用当前窗口 */
+  fetchStatsTrend: (window?: TrendWindow) => Promise<void>;
   fetchCost: () => Promise<void>;
-  fetchSessionHistory: (query?: string, offset?: number) => Promise<void>;
+  /** 按筛选条件重取会话历史；只传变化的那部分，其余沿用当前条件 */
+  fetchSessionHistory: (patch?: Partial<HistoryFilter>) => Promise<void>;
+  /** 打开某个会话的档案抽屉 */
+  openSessionDetail: (sessionKey: string) => Promise<void>;
+  closeSessionDetail: () => void;
+  /** 按筛选条件重取续跑记录；只传变化的那部分，其余沿用当前条件 */
+  fetchResumeRecords: (patch?: Partial<ResumeFilter>) => Promise<void>;
   startMonitoring: () => Promise<void>;
   stopMonitoring: () => Promise<void>;
   scanNow: () => Promise<void>;
@@ -125,10 +212,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
   loading: false,
   focusedSessionId: null,
   dailyStats: [],
-  resumeHistory: [],
-  resumeHistoryTotal: 0,
+  resumeRecords: [],
+  resumeRecordsTotal: 0,
+  resumeFilter: defaultResumeFilter,
   statsOverview: null,
   totals: null,
+  statsTrend: null,
+  trendWindow: 1,
   costDaily: [],
   costProjects: [],
   costModels: [],
@@ -136,7 +226,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   rateForecast: null,
   sessionHistory: [],
   sessionHistoryTotal: 0,
-  historyQuery: "",
+  historyFilter: defaultHistoryFilter,
+  sessionHistorySummary: null,
+  detailKey: null,
+  sessionDetail: null,
 
   setActiveTab: (tab) => set({ activeTab: tab }),
   setFocusedSession: (sessionId) => set({ focusedSessionId: sessionId }),
@@ -159,15 +252,71 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   fetchStats: async () => {
     try {
-      const [dailyStats, resumeHistory, totals, statsOverview] = await Promise.all([
+      const [dailyStats, totals, statsOverview, statsTrend] = await Promise.all([
         invoke<DailyStats[]>("get_stats", { days: 30 }),
-        invoke<ResumeRecordPage>("get_resume_page", { limit: 20, offset: 0, outcome: "all" }),
         invoke<[number, number, number]>("get_totals"),
         invoke<StatsOverview>("get_stats_overview"),
+        invoke<StatsTrend>("get_stats_trend", { days: get().trendWindow }),
       ]);
-      set({ dailyStats, resumeHistory: resumeHistory.records, resumeHistoryTotal: resumeHistory.total, totals, statsOverview });
+      set({ dailyStats, totals, statsOverview, statsTrend });
     } catch (e) {
       console.error("get_stats", e);
+    }
+  },
+
+  /**
+   * 换窗口时**先落 `trendWindow`**，段控件立刻跟手
+   *
+   * 等请求回来再切的话，点下去要愣一下才动，用户会以为没点着又点一次。
+   * 反过来，数据回来时要确认窗口还是当时那个——快速点两下，先发的那个请求
+   * 可能后回来，把「近 7 天」的卡片填成今日的数。
+   */
+  fetchStatsTrend: async (window) => {
+    const target = window ?? get().trendWindow;
+    set({ trendWindow: target });
+    try {
+      const statsTrend = await invoke<StatsTrend>("get_stats_trend", { days: target });
+      if (get().trendWindow === target) set({ statsTrend });
+    } catch (e) {
+      console.error("get_stats_trend", e);
+    }
+  },
+
+  /**
+   * 拉一页续跑记录
+   *
+   * 传进来的是**增量**：`{ outcome: "silent" }` 只改结果筛选，其他条件留着。
+   * 改条件（而不是翻页）时 `offset` 自动归零——第 3 页筛出来只有 5 条的话，
+   * 用户会看到一个空列表，然后以为「筛完什么都没有」。
+   */
+  fetchResumeRecords: async (patch) => {
+    const prev = get().resumeFilter;
+    const changesFilter =
+      patch !== undefined &&
+      (["query", "outcome", "promptType"] as const).some(
+        (k) => patch[k] !== undefined && patch[k] !== prev[k],
+      );
+    const filter: ResumeFilter = {
+      ...prev,
+      ...patch,
+      ...(changesFilter && patch?.offset === undefined ? { offset: 0 } : {}),
+    };
+    set({ resumeFilter: filter });
+    try {
+      const page = await invoke<ResumeRecordPage>("get_resume_page", {
+        limit: RESUME_PAGE_SIZE,
+        offset: filter.offset,
+        query: filter.query,
+        outcome: filter.outcome,
+        promptType: filter.promptType,
+      });
+      // 请求是防抖后发出的，回来时筛选条件可能又变了；只有仍然对得上才落库，
+      // 否则快速切筛选会出现「列表显示的是上一个条件的结果」
+      if (get().resumeFilter === filter) {
+        set({ resumeRecords: page.records, resumeRecordsTotal: page.total });
+      }
+    } catch (e) {
+      console.error("get_resume_page", e);
     }
   },
 
@@ -186,15 +335,68 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  fetchSessionHistory: async (query, offset = 0) => {
-    const next = query ?? get().historyQuery;
+  /**
+   * 改条件（而不是翻页）时 `offset` 归零，理由同 `fetchResumeRecords`。
+   *
+   * 汇总跟列表一趟发出去，但只跟 `query` 有关——状态筛选不传给它，因为
+   * 那条汇总本身就要同时说出「活着 N 个」和「一共 M 个」，跟着状态筛选
+   * 走的话选中「已结束」后它会自称「活着 0 个」，把自己要回答的问题抹掉。
+   */
+  fetchSessionHistory: async (patch) => {
+    const prev = get().historyFilter;
+    const changesFilter =
+      patch !== undefined &&
+      (["query", "status"] as const).some(
+        (k) => patch[k] !== undefined && patch[k] !== prev[k],
+      );
+    const filter: HistoryFilter = {
+      ...prev,
+      ...patch,
+      ...(changesFilter && patch?.offset === undefined ? { offset: 0 } : {}),
+    };
+    set({ historyFilter: filter });
     try {
-      const page = await invoke<SessionHistoryPage>("get_session_history_page", { limit: 20, offset, query: next });
-      set({ sessionHistory: page.entries, sessionHistoryTotal: page.total, historyQuery: next });
+      const [page, summary] = await Promise.all([
+        invoke<SessionHistoryPage>("get_session_history_page", {
+          limit: HISTORY_PAGE_SIZE,
+          offset: filter.offset,
+          query: filter.query,
+          status: filter.status,
+        }),
+        invoke<SessionHistorySummary>("get_session_history_summary", {
+          query: filter.query,
+        }),
+      ]);
+      // 防抖发出的请求回来时条件可能又变了；只有仍然对得上才落库
+      if (get().historyFilter === filter) {
+        set({
+          sessionHistory: page.entries,
+          sessionHistoryTotal: page.total,
+          sessionHistorySummary: summary,
+        });
+      }
     } catch (e) {
       console.error("get_session_history_page", e);
     }
   },
+
+  openSessionDetail: async (sessionKey) => {
+    // 先把上一个会话的档案清掉：不清的话点第二行会先闪一下第一行的内容
+    set({ detailKey: sessionKey, sessionDetail: null });
+    try {
+      const detail = await invoke<SessionDetail | null>("get_session_detail", {
+        sessionKey,
+      });
+      // 取的过程中用户可能已经关掉抽屉、或者点开了另一个会话
+      if (get().detailKey === sessionKey) {
+        set({ sessionDetail: detail });
+      }
+    } catch (e) {
+      console.error("get_session_detail", e);
+    }
+  },
+
+  closeSessionDetail: () => set({ detailKey: null, sessionDetail: null }),
 
   startMonitoring: async () => {
     set({ loading: true });
@@ -362,10 +564,13 @@ export const selectActiveTab = (s: AppStore) => s.activeTab;
 export const selectLoading = (s: AppStore) => s.loading;
 export const selectFocusedSessionId = (s: AppStore) => s.focusedSessionId;
 export const selectDailyStats = (s: AppStore) => s.dailyStats;
-export const selectResumeHistory = (s: AppStore) => s.resumeHistory;
-export const selectResumeHistoryTotal = (s: AppStore) => s.resumeHistoryTotal;
+export const selectResumeRecords = (s: AppStore) => s.resumeRecords;
+export const selectResumeRecordsTotal = (s: AppStore) => s.resumeRecordsTotal;
+export const selectResumeFilter = (s: AppStore) => s.resumeFilter;
 export const selectStatsOverview = (s: AppStore) => s.statsOverview;
 export const selectTotals = (s: AppStore) => s.totals;
+export const selectStatsTrend = (s: AppStore) => s.statsTrend;
+export const selectTrendWindow = (s: AppStore) => s.trendWindow;
 export const selectCostDaily = (s: AppStore) => s.costDaily;
 export const selectCostProjects = (s: AppStore) => s.costProjects;
 export const selectCostModels = (s: AppStore) => s.costModels;
@@ -373,4 +578,8 @@ export const selectUsageSummary = (s: AppStore) => s.usageSummary;
 export const selectRateForecast = (s: AppStore) => s.rateForecast;
 export const selectSessionHistory = (s: AppStore) => s.sessionHistory;
 export const selectSessionHistoryTotal = (s: AppStore) => s.sessionHistoryTotal;
-export const selectHistoryQuery = (s: AppStore) => s.historyQuery;
+export const selectHistoryFilter = (s: AppStore) => s.historyFilter;
+export const selectSessionHistorySummary = (s: AppStore) =>
+  s.sessionHistorySummary;
+export const selectDetailKey = (s: AppStore) => s.detailKey;
+export const selectSessionDetail = (s: AppStore) => s.sessionDetail;

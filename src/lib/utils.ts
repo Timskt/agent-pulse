@@ -25,13 +25,49 @@ export function formatUsd(usd: number): string {
   return usd.toFixed(2);
 }
 
+/**
+ * 库里的时间戳 → `Date`，解析不出来就是 `null`
+ *
+ * 后端写的是本地时间 `2026-07-30 14:03:22`（`Local::now()`），**不带时区**。
+ * 那个空格得换成 `T` 才能被当成本地时间解析；直接塞给 `new Date()`，
+ * Safari 系的引擎会返回 `Invalid Date`。
+ */
+function parseStamp(raw: string): Date | null {
+  if (!raw) return null;
+  const d = new Date(raw.includes("T") ? raw : raw.replace(" ", "T"));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 /** `2026-07-30 14:03:22` / ISO → `7/30 14:03` */
 export function formatShortTime(raw: string): string {
-  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T");
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) return raw;
+  const d = parseStamp(raw);
+  if (!d) return raw;
   const pad = (n: number) => n.toString().padStart(2, "0");
   return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** `2026-07-30 14:03:22` → `2026-07-30`；分组用的日期键 */
+export function dayOf(raw: string): string {
+  return raw.slice(0, 10);
+}
+
+/**
+ * 两个时间戳之间的秒数；任一头解析不出来就是 `null`
+ *
+ * 返回 `null` 而不是 0：「算不出持续多久」和「持续了 0 秒」在界面上
+ * 是两句不同的话，用 0 兼职表示前者会让一条刚开始的会话显示成「持续 0 秒」，
+ * 看着像出了故障。
+ */
+export function secondsBetween(from: string, to: string): number | null {
+  const a = parseStamp(from);
+  const b = parseStamp(to);
+  if (!a || !b) return null;
+  return Math.max(0, Math.round((b.getTime() - a.getTime()) / 1000));
+}
+
+/** `2026-07-30` → `07-30`；坐标轴上年份是噪音 */
+export function shortDate(date: string): string {
+  return date.length >= 10 ? date.slice(5) : date;
 }
 
 /** `/Users/sky/code/git/agent-pulse` → `agent-pulse` */

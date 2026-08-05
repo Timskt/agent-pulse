@@ -69,3 +69,33 @@ body {
 .animate-pulse-soft {
   animation: pulse-soft 2s ease-in-out infinite;
 }
+
+/* 抽屉：遮罩只淡入，不能带位移——`fade-in` 那个 translateY 会让整块
+   蒙版可见地往上蹿一下 */
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.animate-overlay-in {
+  animation: overlay-in 0.15s ease-out;
+}
+
+@keyframes slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.animate-slide-in {
+  animation: slide-in-right 0.2s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* 说了不要动画的就别动。抽屉是整屏尺度的位移，前庭敏感的人对这个最难受 */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in,
+  .animate-overlay-in,
+  .animate-slide-in,
+  .animate-pulse-soft {
+    animation: none;
+  }
+}
