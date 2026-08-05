@@ -397,10 +397,23 @@ mod tests {
         );
     }
 
-    /// 刚动过的会话是 0 秒——那是一个真实的答案，跟「不知道」不同
+    /// 刚动过的会话给得出一个数（≈0），而不是「不知道」
+    ///
+    /// 这条要守的是 `Some` 和 `None` 的区别：0 秒是一个真实的答案，
+    /// 跟「没这个数」不是一回事（见上面 `no_transcript_means_no_answer`）。
+    ///
+    /// 所以断言留了 1 秒余量，**不能写成 `== Some(0)`**：`ago(0)` 把「现在」
+    /// 格式化成秒级字符串，`stuck_secs()` 又重新取一次 `Local::now()`，
+    /// 两次调用之间只要跨过一个整秒，差值就是 1。写死 0 的版本在本机能过
+    /// 几十次，然后在 CI 上随机红一次——Windows runner 上就是这么红的，
+    /// `left: Some(1), right: Some(0)`。
     #[test]
-    fn a_just_touched_session_is_zero_not_unknown() {
-        assert_eq!(session(&ago(0), Some("/tmp/x.jsonl")).stuck_secs(), Some(0));
+    fn a_just_touched_session_is_a_number_not_unknown() {
+        let got = session(&ago(0), Some("/tmp/x.jsonl")).stuck_secs();
+        assert!(
+            matches!(got, Some(0..=1)),
+            "刚动过的会话该给出 ≈0 秒这个真实答案，实际 {got:?}"
+        );
     }
 
     #[test]
