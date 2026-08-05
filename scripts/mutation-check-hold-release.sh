@@ -34,13 +34,13 @@ run_mutant() {
 
   cp "$BACKUP" "$TARGET"
   if ! perl -0pi -e "s/\Q$ORIG\E/$replacement/" "$TARGET"; then
-    echo "  ✗ $name：perl 出错" >&2
+    echo "  ✗ ${name}：perl 出错" >&2
     surprises=$((surprises + 1))
     return
   fi
   if ! grep -qF "$replacement" "$TARGET"; then
     # 这一条最要紧：没改到任何东西的「检查」会报假绿
-    echo "  ✗ $name：替换没生效，这条检查是假的" >&2
+    echo "  ✗ ${name}：替换没生效，这条检查是假的" >&2
     surprises=$((surprises + 1))
     return
   fi
@@ -49,22 +49,31 @@ run_mutant() {
   out="$(cd src-tauri && cargo test --quiet --lib detector:: 2>&1)"
   local failed=""
   if grep -q "test result: FAILED" <<<"$out"; then
-    failed="$(grep -oE '^ *[a-z_]+ ' <<<"$(sed -n '/failures:/,/^$/p' <<<"$out")" | tr -d ' ' | tr '\n' ' ')"
+    # cargo 的失败清单长这样（缩进 + 全路径，没有行尾空格）：
+    #     detector::tests::a_recovered_session_lets_the_hold_go
+    # 只按 `^ *[a-z_]+ ` 去抓是抓不到的——第一版就是这么把五条检查全报成
+    # 「没人红」的，而实测那两条测试确实红了。假绿和假红一样要命。
+    failed="$(grep -oE '^[[:space:]]+[a-z_]+::[a-z_:]+$' <<<"$out" | tr -d ' ' | sort -u | tr '\n' ' ')"
+    if [[ -z "$failed" ]]; then
+      echo "  ✗ ${name}：测试失败了但一个名字都没解析出来，这个脚本的判定坏了" >&2
+      surprises=$((surprises + 1))
+      return
+    fi
   fi
 
   if [[ -z "$expect" ]]; then
     if [[ -z "$failed" ]]; then
-      echo "  ○ $name：[等价] 如预期没人红"
+      echo "  ○ ${name}：[等价] 如预期没人红"
       expected=$((expected + 1))
     else
-      echo "  ✗ $name：[等价] 但有人红了 → $failed" >&2
+      echo "  ✗ ${name}：[等价] 但有人红了 → $failed" >&2
       surprises=$((surprises + 1))
     fi
   elif grep -q "$expect" <<<"$failed"; then
-    echo "  ● $name：如预期红了（$expect）"
+    echo "  ● ${name}：如预期红了（${expect}）"
     expected=$((expected + 1))
   else
-    echo "  ✗ $name：期望 $expect 变红，实际红的是「${failed:-没人红}」" >&2
+    echo "  ✗ ${name}：期望 $expect 变红，实际红的是「${failed:-没人红}」" >&2
     surprises=$((surprises + 1))
   fi
 }
