@@ -1,4 +1,5 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { useI18n } from "../../i18n";
 import { cn } from "../../lib/utils";
 
 /**
@@ -27,6 +28,10 @@ export function Drawer({
   children: React.ReactNode;
   footer?: React.ReactNode;
 }) {
+  // 关闭按钮的读屏名字在这里取，不做成 prop：做成 prop 就有调用方忘了传，
+  // 而忘了传的后果是读屏只念「按钮」，肉眼完全看不出来
+  const { t } = useI18n();
+
   return (
     <DialogPrimitive.Root open={open} onOpenChange={(next) => !next && onClose()}>
       <DialogPrimitive.Portal>
@@ -49,6 +54,7 @@ export function Drawer({
               )}
             </div>
             <DialogPrimitive.Close
+              aria-label={t("common.close")}
               className={cn(
                 "shrink-0 rounded-md p-1 text-neutral-400 outline-none transition-colors",
                 "hover:bg-neutral-100 hover:text-neutral-600 focus-visible:ring-2 focus-visible:ring-neutral-300"

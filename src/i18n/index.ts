@@ -697,6 +697,10 @@ const TABLE = {
   "common.error": ["出错了：{detail}", "Something went wrong: {detail}"],
   "common.copy": ["复制", "Copy"],
   "common.copied": ["已复制", "Copied"],
+  // 只给读屏软件听的名字。图标按钮里那个叉是 aria-hidden 的装饰，
+  // 不补这一条读屏就只念一声「按钮」，用户不知道按下去会发生什么。
+  // 屏幕上看不见也算用户可见文案，所以照样进这张表、照样跟着语言切
+  "common.close": ["关闭", "Close"],
 } satisfies Record<string, Entry>;
 
 export type I18nKey = keyof typeof TABLE;

@@ -82,8 +82,29 @@ export function ExportButton({
     }
   }
 
+  // 读屏要听的那句话。绿字/红字是**动作之后才出现**的，读屏不会主动去念，
+  // 于是用鼠标的人知道导好了、用读屏的人只听到一声「按钮」然后什么都没有。
+  //
+  // 活区必须一直在 DOM 里（`sr-only` 是绝对定位，不是 display:none，
+  // 既不占 flex 的位置也还在无障碍树上）。等有话说了才把这个 span 插进来，
+  // 部分读屏软件根本不会念——那等于没做。
+  //
+  // 失败时连原因一起念：视觉版把原因藏在 `title` 里，而读屏用户没法悬停。
+  const live = busy
+    ? t("export.running")
+    : error
+      ? t("common.error", { detail: error })
+      : done
+        ? done.truncated
+          ? t("export.truncated", { rows: done.rows })
+          : t("export.done", { rows: done.rows })
+        : "";
+
   return (
     <div className={cn("flex items-center gap-2", className)}>
+      <span className="sr-only" role="status" aria-live="polite">
+        {live}
+      </span>
       {done && (
         // 截断和成功都得能点开文件——文件确实写出来了，只是不全。
         // 但颜色要分开：绿色在这个界面里到处都是「没问题」的意思，
