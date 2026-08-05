@@ -29,6 +29,19 @@ import type {
 export type TabId = "dashboard" | "stats" | "cost" | "history" | "config";
 
 /**
+ * 推送来的事件在前端最多攒多少条
+ *
+ * 这里不是显示上限：`LogPanel` 把这批和 `get_state` 快照里的合并、去重之后
+ * 自己裁到 200 行。这个数的唯一作用是**别让它无界增长**——挂机一整天下来
+ * 推送来的事件成千上万，全留着就是白占内存，而屏幕上只看得到最近 200 行。
+ *
+ * 它和后端的 `EVENT_RING_CAP`（500）数值一样，但**不是**同一个约束，别为了
+ * 「保持一致」把两者绑成一个数：后端那个决定快照里能回看多少，这个只是本地
+ * 缓冲的天花板。后端调大调小都不用动这里。
+ */
+const LOCAL_EVENT_CAP = 500;
+
+/**
  * 续跑记录中心的筛选条件
  *
  * `outcome` 和 `prompt_type` 用 `"all"` 而不是 `null` 表示不筛，因为这个值
@@ -494,7 +507,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       "engine-events",
       (event) => {
         set((state) => ({
-          localEvents: [...state.localEvents, ...event.payload].slice(-500),
+          localEvents: [...state.localEvents, ...event.payload].slice(
+            -LOCAL_EVENT_CAP,
+          ),
         }));
       },
     );
