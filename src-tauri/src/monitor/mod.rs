@@ -38,6 +38,29 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 /// 跟「正常工作」在屏幕上长得一模一样，晚说一小时就是白等一小时。
 const RESUME_FAILURE_ALERT_AT: u32 = 2;
 
+/// 活动日志最多留多少条
+///
+/// 日志面板是给人看的，不是审计追踪——真要追历史有 SQLite 里的
+/// `resume_records` / `detection_records`。
+pub const EVENT_RING_CAP: usize = 500;
+
+/// 这一轮该把事件环末尾的多少条推给前端
+///
+/// 单独抽成函数是因为 bug 就出在这段算术上：原来的泵拿 `events.len()` 当游标，
+/// 而这个长度攒到 [`EVENT_RING_CAP`] 就不再变了，于是「长度没变 = 没有新事件」
+/// 在那之后**永远成立**，活动日志静默停更。用只增的累计数当游标才认得出新事件。
+///
+/// 返回值封顶在 `ring_len`：环里已经被裁掉的那些，前端这辈子都拿不到了，
+/// 硬要按差值切会直接越界 panic。这种情况下丢的是最老的几条，
+/// 而日志面板本来就只显示最近的——比崩掉好。
+pub fn fresh_tail(pushed: u64, sent: u64, ring_len: usize) -> usize {
+    // `pushed < sent` 正常跑不出来（计数只增）。但真出现时用饱和减
+    // 得到 0（这一轮不推），而不是让 `u64` 减法在 debug 下 panic、
+    // 在 release 下绕成一个天文数字然后按它去切片。
+    let behind = pushed.saturating_sub(sent);
+    behind.min(ring_len as u64) as usize
+}
+
 /// 日志级别
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -92,6 +115,37 @@ pub struct MonitorState {
     pub sessions: Vec<AgentSession>,
     pub events: Vec<EngineEvent>,
     pub status: EngineStatus,
+    /// 一共往 `events` 里推过多少条（**只增**，不随事件环裁剪回落）
+    ///
+    /// 推送泵靠它认「哪些是新的」。用 `events.len()` 不行：那个长度到 500 就
+    /// 不动了，于是「长度没变 = 没有新事件」这个判断在攒够 500 条之后**永远成立**，
+    /// 活动日志从此静默停更——后端还在记，界面上再也不出现新的一行。
+    ///
+    /// 不发给前端（`skip`）：前端拿 `events` 数组本身就够了，多一个它用不上的
+    /// 计数只会让人以为该拿它做点什么。
+    #[serde(skip)]
+    pub events_pushed: u64,
+}
+
+impl MonitorState {
+    /// 往活动日志里追加一条，并把环裁回上限
+    ///
+    /// 逻辑放在状态自己身上而不是引擎上，是为了能测：`MonitorEngine` 要
+    /// `ConfigManager` 和 `Storage` 才建得起来，而 `ConfigManager::new()` 会往
+    /// 用户真正那份 `config.json` 里写东西——为了测两行计数去碰用户的配置文件，
+    /// 代价和收益完全不成比例。
+    ///
+    /// 两个计数的分工是这段代码的全部要点：`events_pushed` 跟着**推过多少**走，
+    /// `events.len()` 跟着**留着多少**走。它们一旦被写成同一个数，推送泵就再也
+    /// 认不出新事件（见 [`fresh_tail`]）。
+    pub fn push_event(&mut self, event: EngineEvent) {
+        self.events.push(event);
+        if self.events.len() > EVENT_RING_CAP {
+            let drain_count = self.events.len() - EVENT_RING_CAP;
+            self.events.drain(0..drain_count);
+        }
+        self.events_pushed = self.events_pushed.saturating_add(1);
+    }
 }
 
 /// 一轮扫描在阻塞线程里攒出来的全部结果
@@ -172,14 +226,8 @@ impl MonitorEngine {
     /// 公开出来是给 `remote` 模块用的：看板启动/停止也该出现在同一条日志流里，
     /// 用户不用去别处找「看板到底起来了没有」。
     pub async fn push_event(&self, event: EngineEvent) {
-        let mut state = self.state.lock().await;
         tracing::info!("[AgentPulse] {}", event.message);
-        state.events.push(event);
-        // 只留最近 500 条：日志面板是给人看的，不是审计追踪
-        if state.events.len() > 500 {
-            let drain_count = state.events.len() - 500;
-            state.events.drain(0..drain_count);
-        }
+        self.state.lock().await.push_event(event);
     }
 
     /// 只在「情况变了」的那一轮说话
@@ -1332,6 +1380,111 @@ fn apply_resume_outcome(session: &mut AgentSession, outcome: ResumeOutcome, now:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 攒够 500 条之后还认得出新事件
+    ///
+    /// 这条是那个 bug 的正脸。原来的推送泵拿 `events.len()` 当游标，而事件环封顶在
+    /// [`EVENT_RING_CAP`]——长度到 500 就不再变了，于是「长度没变 = 没有新事件」
+    /// 在那之后**永远成立**：后端继续记日志，界面上再也不出现新的一行，
+    /// 不报错、不留痕，看起来就像「最近没发生什么事」。
+    #[test]
+    fn a_saturated_ring_still_reports_new_events() {
+        let cap = EVENT_RING_CAP;
+        // 环已经满了、游标停在 500：跑了一阵子之后的稳定状态
+        // 又来一条 → 推过的总数 501，环长度仍然是 500
+        assert_eq!(
+            fresh_tail(cap as u64 + 1, cap as u64, cap),
+            1,
+            "环满之后新事件必须还能推出去"
+        );
+    }
+
+    /// 长度不变但计数在涨——上面那条的一般形式
+    #[test]
+    fn a_pinned_length_does_not_hide_a_burst() {
+        let cap = EVENT_RING_CAP;
+        // 一个轮询周期里来了 7 条，环被裁掉 7 条，长度还是 500
+        assert_eq!(fresh_tail(cap as u64 + 7, cap as u64, cap), 7);
+    }
+
+    /// 没有新事件时不推空包
+    #[test]
+    fn nothing_new_means_nothing_emitted() {
+        assert_eq!(fresh_tail(0, 0, 0), 0);
+        assert_eq!(fresh_tail(42, 42, 42), 0);
+    }
+
+    /// 前端落后太多时按环里剩下的推，不越界
+    ///
+    /// 泵每 800 毫秒醒一次，正常追得上。但主线程卡住、机器休眠再唤醒之后，
+    /// 累计数可以比环里留着的多出好几千。拿差值当切片起点会直接 panic；
+    /// 封顶到环长度只丢掉最老的那些——日志面板本来就只看最近的。
+    #[test]
+    fn falling_far_behind_clamps_instead_of_panicking() {
+        assert_eq!(fresh_tail(10_000, 0, EVENT_RING_CAP), EVENT_RING_CAP);
+        // 环还没满时同样不能超过环长
+        assert_eq!(fresh_tail(10_000, 0, 3), 3);
+    }
+
+    /// 计数万一回退，这一轮就别推
+    ///
+    /// 正常跑不出来（`events_pushed` 只增）。但 `u64` 减法遇到负数在 debug 下
+    /// 会 panic、在 release 下会绕成天文数字然后被拿去切片，两种都比
+    /// 「这一轮不推」糟糕得多。
+    #[test]
+    fn a_backwards_counter_emits_nothing() {
+        assert_eq!(fresh_tail(3, 9, EVENT_RING_CAP), 0);
+    }
+
+    /// 冷启动第一轮：环里有几条就推几条
+    #[test]
+    fn a_cold_start_emits_what_is_already_there() {
+        assert_eq!(fresh_tail(4, 0, 4), 4);
+    }
+
+    /// 事件环裁剪之后，计数不能跟着回落
+    ///
+    /// 这条守的是 [`MonitorState::push_event`] 里两个计数的分工：一个跟「推过多少」
+    /// 走，一个跟「留着多少」走。它们一旦被写成同一个数，上面那个静默停更立刻复活。
+    #[test]
+    fn the_counter_keeps_climbing_after_the_ring_trims() {
+        let mut state = MonitorState::default();
+        let overflow = 25;
+        for i in 0..(EVENT_RING_CAP + overflow) {
+            state.push_event(EngineEvent::new(LogLevel::Info, None, format!("第 {i} 条")));
+        }
+        assert_eq!(state.events.len(), EVENT_RING_CAP, "环该封顶");
+        assert_eq!(
+            state.events_pushed,
+            (EVENT_RING_CAP + overflow) as u64,
+            "计数该记全部推过的条数，不受裁剪影响"
+        );
+        // 最新的还在，最老的被裁掉了
+        let last = format!("第 {} 条", EVENT_RING_CAP + overflow - 1);
+        assert_eq!(state.events.last().unwrap().message, last);
+        assert!(!state.events.iter().any(|e| e.message == "第 0 条"));
+    }
+
+    /// 满环 + 新事件，串起来跑一遍
+    ///
+    /// 前两条分别测了「计数对不对」和「算术对不对」，这条把它们接上：
+    /// 环满之后再推一条，泵该恰好取到那一条，而且取到的就是最新那条。
+    #[test]
+    fn a_full_ring_then_one_more_emits_exactly_that_one() {
+        let mut state = MonitorState::default();
+        for i in 0..EVENT_RING_CAP {
+            state.push_event(EngineEvent::new(LogLevel::Info, None, format!("旧 {i}")));
+        }
+        // 泵已经追平
+        let sent = state.events_pushed;
+        state.push_event(EngineEvent::new(LogLevel::Warn, None, "新来的"));
+
+        let fresh = fresh_tail(state.events_pushed, sent, state.events.len());
+        assert_eq!(fresh, 1);
+        let emitted = &state.events[state.events.len() - fresh..];
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].message, "新来的");
+    }
 
     fn session_with(dir: &str, tty: Option<&str>) -> AgentSession {
         AgentSession {

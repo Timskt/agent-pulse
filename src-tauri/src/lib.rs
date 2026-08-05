@@ -170,7 +170,7 @@ async fn manual_resume(
 
     state
         .engine
-        .push_event_public(EngineEvent::new(
+        .push_event(EngineEvent::new(
             if ok {
                 LogLevel::Success
             } else {
@@ -208,7 +208,7 @@ async fn focus_terminal(state: State<'_, AppState>, session_id: String) -> Resul
     let detail = resumer::focus_session(&session, &lang).await?;
     state
         .engine
-        .push_event_public(EngineEvent::new(
+        .push_event(EngineEvent::new(
             LogLevel::Info,
             Some(session_id),
             i18n.tf("log.focused", &[("detail", &detail)]),
@@ -244,7 +244,7 @@ async fn probe_resume(
     // 日志里只留一行摘要，多行的 detail 留给面板——否则一次演练就把日志刷满
     state
         .engine
-        .push_event_public(EngineEvent::new(
+        .push_event(EngineEvent::new(
             if probe.would_deliver {
                 LogLevel::Info
             } else {
@@ -665,19 +665,6 @@ async fn get_translations(
     Ok(state.i18n().all())
 }
 
-// 引擎的事件推送入口：命令层也要能往同一条日志里写
-impl MonitorEngine {
-    pub async fn push_event_public(&self, event: EngineEvent) {
-        let mut state = self.state.lock().await;
-        tracing::info!("[AgentPulse] {}", event.message);
-        state.events.push(event);
-        if state.events.len() > 500 {
-            let drain_count = state.events.len() - 500;
-            state.events.drain(0..drain_count);
-        }
-    }
-}
-
 /// 构建托盘菜单
 ///
 /// 单独抽出来是因为语言切换时要整体重建：菜单项文字一旦创建就不能改，
@@ -861,23 +848,23 @@ pub fn run() {
             let engine_for_events = engine.clone();
             let app_for_events = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let mut last_len = 0usize;
+                // 游标是**累计推过的条数**，不是数组长度。长度到 500 就封顶了，
+                // 拿它当游标的话「长度没变 = 没有新事件」在攒够 500 条之后永远成立，
+                // 活动日志从此静默停更。见 `monitor::fresh_tail`。
+                let mut sent = 0u64;
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
                     let new_events = {
                         let state = engine_for_events.state.lock().await;
-                        let total = state.events.len();
-                        if total == last_len {
+                        let pushed = state.events_pushed;
+                        let fresh = monitor::fresh_tail(pushed, sent, state.events.len());
+                        if fresh == 0 {
                             continue;
                         }
-                        // 事件环被裁剪后 total 会小于 last_len，取 min 防止切片越界
-                        let start = last_len.min(total);
-                        last_len = total;
-                        state.events[start..].to_vec()
+                        sent = pushed;
+                        state.events[state.events.len() - fresh..].to_vec()
                     };
-                    if !new_events.is_empty() {
-                        let _ = app_for_events.emit("engine-events", new_events);
-                    }
+                    let _ = app_for_events.emit("engine-events", new_events);
                 }
             });
 
