@@ -143,6 +143,10 @@ export function Chip({
   return (
     <button
       type="button"
+      // 这是个**开关**，不是普通按钮。开没开只用颜色表示的话，读屏念出来
+      // 就只有标签本身——听不出「这条已经勾上了」；`aria-pressed` 让它
+      // 变成读屏认得的切换按钮，一个字的视觉变化都不用。
+      aria-pressed={active}
       onClick={onClick}
       className={cn(
         "rounded-full border px-2.5 py-1 text-[10px] font-medium transition-colors",

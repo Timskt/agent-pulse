@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useI18n } from "../i18n";
 import {
   ATTENTION_ICON,
@@ -134,6 +134,9 @@ function SessionRow({
   const [probe, setProbe] = useState<ResumeProbe | null>(null);
   const [probing, setProbing] = useState(false);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
+  // 每张卡片一个：列表里同时展开好几张的话，写死的 id 会重复，
+  // aria-controls 就会指向别人那块
+  const evidenceId = useId();
 
   const stalled =
     session.status === "interrupted" || session.status === "suspended";
@@ -298,6 +301,14 @@ function SessionRow({
               size="xs"
               variant="ghost"
               disabled={busy || probing}
+              // 按钮的字已经会在「查看判据 / 收起」之间换，所以状态本身不算丢。
+              // 补这两条是为了把按钮和它展开的那块**关联**起来：读屏才能说出
+              // 「已展开」并直接跳到那块内容，而不是让人自己在页面里找。
+              //
+              // `aria-controls` 只在真的展开时才给：收起时那块根本没渲染，
+              // 指过去就是一个悬空的 id，而 ARIA 要求它必须指到存在的元素
+              aria-expanded={evidenceOpen}
+              aria-controls={evidenceOpen ? evidenceId : undefined}
               onClick={() => setEvidenceOpen((open) => !open)}
             >
               {evidenceOpen ? t("evidence.hide") : t("evidence.button")}
@@ -349,14 +360,14 @@ function SessionRow({
 
       {probe && <ProbePanel probe={probe} onClose={() => setProbe(null)} />}
       {evidenceOpen && session.detection_evidence && (
-        <EvidencePanel evidence={session.detection_evidence} />
+        <EvidencePanel id={evidenceId} evidence={session.detection_evidence} />
       )}
     </div>
   );
 }
 
 /** 判定证据：展示事实，不在前端重算结论 */
-function EvidencePanel({ evidence }: { evidence: DetectionEvidence }) {
+function EvidencePanel({ id, evidence }: { id?: string; evidence: DetectionEvidence }) {
   const { t } = useI18n();
   const turn = t(`evidence.turn.${evidence.turn_state}` as Parameters<typeof t>[0]);
   const signalKinds = Array.from(
@@ -371,7 +382,7 @@ function EvidencePanel({ evidence }: { evidence: DetectionEvidence }) {
     .map((key) => t(key as Parameters<typeof t>[0]))
     .join("、");
   return (
-    <div className="border-t border-neutral-100 bg-sky-50/50 px-4 py-3">
+    <div id={id} className="border-t border-neutral-100 bg-sky-50/50 px-4 py-3">
       <p className="text-[11px] font-semibold text-neutral-700">{t("evidence.title")}</p>
       <div className="mt-1.5 grid grid-cols-1 gap-1 text-[10px] text-neutral-600 sm:grid-cols-2">
         <span>{t("evidence.signals")}: {signalKinds || t("evidence.none")}</span>
