@@ -538,7 +538,7 @@ if total == last_len { continue; }   // 满环之后恒真
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 191 passed |
+| Rust 单测 | `cargo test` | 204 passed |
 | 前端单测 | `pnpm test`（vitest） | 93 passed |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |
@@ -554,6 +554,29 @@ CI（`.github/workflows/ci.yml`）的两个关键决定：
 
 `build-tauri` 和 `Create Release` 由 `refs/tags/v*` 触发，四目标矩阵：
 macOS arm64 / macOS x64 / Linux x64 / Windows x64。
+
+### 变异检查：新测试的验收标准，不在 CI 里
+
+「加了 8 个测试」本身不说明任何事——一个从来不会红的测试和没有测试是一回事。
+所以这个项目对新测试的验收标准是**改坏实现，确认它会红**。
+
+`scripts/mutation-check-event-pump.sh` 把这件事固化了一次（事件推送泵那 8 个）：
+逐个把实现改坏、跑测试、记下谁红了、恢复。跑一次就能回答「这些测试里有没有摆设」。
+
+**故意不进 CI。** 它要反复编译整个 crate，比五道门加起来还慢，而它验的是
+*测试本身写得好不好*——那是写测试那次就该验完的事，不是每次 push 都要重跑的。
+留成手动脚本，改动那块逻辑时跑一次。
+
+两条从这个脚本里学到的：
+
+- **有些变异体应该活下来，要明确标出来。** `EVENT_RING_CAP` 从 500 改成 499
+  不会有任何测试红，这是对的：那个数是调参不是正确性约束，测试全都拿常量本身
+  断言而不抄字面量。为了「杀死」它去写 `assert_eq!(cap, 500)` 等于把调参钉死。
+  脚本里这类标成 `[等价]` 并反过来判——不区分的话，「有变异体活着」这个信号
+  迟早被当成噪音。
+- **改坏源码的脚本必须用 `trap` 恢复。** 第一版把恢复写在循环末尾，脚本中途
+  崩了一次，仓库里就留下一个故意改坏的实现。`trap ... EXIT INT TERM` 对崩溃、
+  Ctrl-C、被 kill 一样有效。
 
 ### cfg 纪律（红过两次）
 

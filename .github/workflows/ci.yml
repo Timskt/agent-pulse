@@ -49,8 +49,9 @@ jobs:
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
 
-      # --all-targets 才会把 #[cfg(test)] 里的代码也编进来：115 个单元测试是
-      # 跨平台脚本唯一的自动化保障，不能只编不看。
+      # --all-targets 才会把 #[cfg(test)] 里的代码也编进来：单元测试是跨平台
+      # 脚本唯一的自动化保障，不能只编不看。
+      # （这里刻意不写测试条数——写了就得跟着改，改漏了这行注释就在说谎。）
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings

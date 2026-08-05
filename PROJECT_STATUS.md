@@ -523,7 +523,7 @@ IDE 按**进程名前缀**匹配而不是精确等于（`ide_paths_match_by_proc
 （测试：`exhausted_streak_stops_typing_but_not_watching`、`failed_deliveries_never_exhaust_the_budget`、
 `cooldown_*`、`verdict_ignores_every_resume_counter`）
 
-`resumer` 模块共 **46 个单元测试**，是全仓库测试最密的模块——因为它是唯一会"对外界产生副作用"的模块。
+`resumer` 是全仓库测试最密的模块（`cargo test resumer::` 数得到当下的条数）——因为它是唯一会"对外界产生副作用"的模块。
 
 ### 7.8 开环 → 闭环：敲完之后要回头看一眼
 
@@ -882,7 +882,7 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 - **三个平台都跑 lint 和测试**。续跑层几乎全是 `#[cfg(target_os = …)]`，只在 ubuntu 上跑 clippy
   等于 Windows 和 macOS 分支从来没被编译过——上一版就是这么让一个 Windows 专属编译错误
   躺到打标签才暴露的。
-- **`--all-targets`**。不加它，`#[cfg(test)]` 里的代码不会被编译；128 个单元测试是跨平台脚本
+- **`--all-targets`**。不加它，`#[cfg(test)]` 里的代码不会被编译；单元测试是跨平台脚本
   唯一的自动化保障，"能编译"和"测试也能编译"是两件事。
 
 还有一处后补的：**`pnpm test` 单独一步，排在 `pnpm build` 前面**。此前 `check-frontend` 只跑
@@ -1320,11 +1320,11 @@ pnpm install                     # 装前端依赖
 pnpm tauri:dev                   # 开发（含 Rust 热重载）
 pnpm tauri:build                 # 打包，产物在 src-tauri/target/release/bundle/
 pnpm build                       # 仅前端：tsc && vite build（CI 用的就是这条）
-pnpm test                        # 前端 38 个 vitest（含四处版本号一致性）
+pnpm test                        # 前端 vitest（含四处版本号一致性）
 
 cd src-tauri
 cargo clippy --all-targets -- -D warnings   # CI 的 lint，本地务必先跑
-cargo test                                  # 128 个单元测试
+cargo test                                  # 后端单元测试
 cargo test -- --list                        # 列出全部测试名
 
 ./scripts/gen-icons.sh           # 从 SVG 母版重出整套图标（需要 Chrome/Chromium）
