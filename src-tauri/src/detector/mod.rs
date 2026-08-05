@@ -657,8 +657,13 @@ impl Detector {
         };
         let (attention, attention_detail) = self.grade_attention(evidence);
         let classified = self.classify_reason(evidence);
-        let (interrupt_reason, rate_limit_hold) =
-            self.apply_rate_limit_hold(session, classified, error_output, now.naive_local());
+        let (interrupt_reason, rate_limit_hold) = self.apply_rate_limit_hold(
+            session,
+            classified,
+            &verdict,
+            error_output,
+            now.naive_local(),
+        );
         let signal_kinds = signals.iter().map(|signal| signal.kind.clone()).collect();
 
         DetectionResult {
@@ -704,10 +709,24 @@ impl Detector {
     ///
     /// 保持只压住「敲不敲字」，**不碰注意力分级**：窗口里该叫人还是要叫人。
     /// 应用打算按住不动的时候，正是最该让用户知道的时候。
+    ///
+    /// **看见它自己动了就放手**（`verdict` 是 `Running` 或 `TaskCompleted`）。
+    /// 截止时刻是个估算——`retrying in 10m` 是上游说的、冷却下限是我们配的，
+    /// 都可能比真实窗口长。而「记录又开始长了」「完成标记出现了」是**事实**：
+    /// 限流已经过去了，再按着只会让界面继续说「撞上限流，不敲字」，
+    /// 而状态徽标那边写着「运行中」——用户看到的是自相矛盾的两句话。
+    /// 事实优先于估算，和 [`Self::classify_reason`] 里「进程存活位优先于日志行」
+    /// 是同一条原则。
+    ///
+    /// 放手不会削弱这个窗口存在的意义：证据滚走那个场景里，会话是**停着**的
+    /// （判定为 `ConfirmInterrupt` 或 `Suspicious`），两者都不在放手的名单里。
+    /// 而 `Running` / `TaskCompleted` 的会话本来就不会被敲字——动作层那段
+    /// 整个长在 `Verdict::ConfirmInterrupt` 分支里面。
     fn apply_rate_limit_hold(
         &self,
         session: &AgentSession,
         classified: InterruptReason,
+        verdict: &Verdict,
         error_output: Option<&str>,
         now: NaiveDateTime,
     ) -> (InterruptReason, Option<RateLimitHold>) {
@@ -733,6 +752,11 @@ impl Detector {
                     marker,
                 }),
             );
+        }
+
+        // 它自己动起来了——限流窗口已经过去，估算出来的截止时刻作废
+        if matches!(verdict, Verdict::Running | Verdict::TaskCompleted) {
+            return (classified, None);
         }
 
         // 窗口还在：照当初那个原因说话，把手段按回 `Wait`
@@ -1179,6 +1203,7 @@ mod tests {
         let (reason, hold) = d.apply_rate_limit_hold(
             &session,
             InterruptReason::RateLimited,
+            &Verdict::ConfirmInterrupt,
             Some("429 rate limit reached, retrying in 30s"),
             Local::now().naive_local(),
         );
@@ -1193,6 +1218,7 @@ mod tests {
         let (reason, hold) = d.apply_rate_limit_hold(
             &session,
             InterruptReason::Stalled,
+            &Verdict::ConfirmInterrupt,
             None,
             Local::now().naive_local(),
         );
@@ -1216,6 +1242,7 @@ mod tests {
         let (_, hold) = d.apply_rate_limit_hold(
             &session,
             InterruptReason::UpstreamRejected,
+            &Verdict::ConfirmInterrupt,
             Some("upstream_busy"),
             Local::now().naive_local(),
         );
@@ -1224,6 +1251,7 @@ mod tests {
         let (reason, _) = d.apply_rate_limit_hold(
             &session,
             InterruptReason::Stalled,
+            &Verdict::ConfirmInterrupt,
             None,
             Local::now().naive_local(),
         );
@@ -1247,6 +1275,7 @@ mod tests {
         let (reason, hold) = d.apply_rate_limit_hold(
             &session,
             InterruptReason::Stalled,
+            &Verdict::ConfirmInterrupt,
             None,
             Local::now().naive_local(),
         );
@@ -1271,6 +1300,7 @@ mod tests {
         let (_, hold) = d.apply_rate_limit_hold(
             &session,
             InterruptReason::RateLimited,
+            &Verdict::ConfirmInterrupt,
             Some("429 too many requests"),
             Local::now().naive_local(),
         );
@@ -1285,6 +1315,7 @@ mod tests {
         let (_, hold) = detector().apply_rate_limit_hold(
             &session(),
             InterruptReason::RateLimited,
+            &Verdict::ConfirmInterrupt,
             Some("429 rate limit reached"),
             Local::now().naive_local(),
         );
@@ -1295,12 +1326,94 @@ mod tests {
         );
     }
 
+    /// **它自己动起来了就放手。**
+    ///
+    /// 截止时刻是估算：`retrying in 10m` 是上游说的、冷却下限是我们配的，
+    /// 都可能比真实窗口长得多。而「记录又开始长了」是事实。不放手的话，
+    /// 一个已经恢复干活的会话会在剩下的窗口里一直挂着「撞上限流，不敲字」，
+    /// 而它旁边的状态徽标写着「运行中」——两句话自相矛盾，用户只能猜哪句是真的。
+    #[test]
+    fn a_recovered_session_lets_the_hold_go() {
+        let mut session = session();
+        session.rate_limit_hold = Some(RateLimitHold {
+            // 故意留一个很长的窗口：放手必须是因为看见它动了，
+            // 不是因为窗口刚好到点
+            until: until(600),
+            reason: InterruptReason::RateLimited,
+            marker: Some("429".to_string()),
+        });
+
+        let (reason, hold) = detector().apply_rate_limit_hold(
+            &session,
+            InterruptReason::None,
+            &Verdict::Running,
+            None,
+            Local::now().naive_local(),
+        );
+        assert_eq!(
+            reason,
+            InterruptReason::None,
+            "它在跑，就不该再对用户说「撞上限流」"
+        );
+        assert!(hold.is_none(), "窗口作废了，别再带着它");
+    }
+
+    /// 干完了同理：一个「已完成」的会话不该同时挂着「在等限流过去」
+    #[test]
+    fn a_finished_session_lets_the_hold_go() {
+        let mut session = session();
+        session.rate_limit_hold = Some(RateLimitHold {
+            until: until(600),
+            reason: InterruptReason::RateLimited,
+            marker: None,
+        });
+
+        let (_, hold) = detector().apply_rate_limit_hold(
+            &session,
+            InterruptReason::None,
+            &Verdict::TaskCompleted,
+            None,
+            Local::now().naive_local(),
+        );
+        assert!(hold.is_none(), "活都干完了，还按着就只是在制造矛盾的界面");
+    }
+
+    /// 但「说不清」不算动起来了——那正是该保守的时候
+    ///
+    /// `Suspicious` 的意思是证据不足，而这个功能的整个前提就是
+    /// 「认不出来的时候宁可多等」。拿它当恢复信号会把放手条件放到最宽，
+    /// 正好在最不确定的时候松开手。
+    #[test]
+    fn an_unsure_verdict_keeps_holding() {
+        let mut session = session();
+        session.rate_limit_hold = Some(RateLimitHold {
+            until: until(600),
+            reason: InterruptReason::RateLimited,
+            marker: None,
+        });
+
+        let (reason, hold) = detector().apply_rate_limit_hold(
+            &session,
+            InterruptReason::Stalled,
+            &Verdict::Suspicious,
+            None,
+            Local::now().naive_local(),
+        );
+        assert_eq!(
+            reason.tactic(),
+            ResumeTactic::Wait,
+            "证据不足的时候松手，等于在最不确定的时刻开始敲字"
+        );
+        assert!(hold.is_some(), "没看见它动，窗口就还得带着");
+    }
+
     /// 不该起窗口的原因不许起：`Stalled` 起了窗口就等于把该敲的那一类也按住了
     #[test]
     fn an_ordinary_stall_arms_no_hold() {
         let (reason, hold) = detector().apply_rate_limit_hold(
             &session(),
             InterruptReason::Stalled,
+            &Verdict::ConfirmInterrupt,
             None,
             Local::now().naive_local(),
         );
