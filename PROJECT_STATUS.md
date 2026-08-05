@@ -895,8 +895,8 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 `pnpm build`，于是前端的 38 个测试在 CI 里根本没人跑——本地绿、远端从不验证，等于没有。
 拆成两步还有个好处：测试挂了能一眼看出是测试挂了，而不是被埋进一次构建失败里。
 
-最近一次绿灯：run `30700566408`（Frontend / Rust macOS / Rust Ubuntu / Rust Windows 四个全绿；
-`build-tauri` 与 `Create Release` 因为不是标签推送而 Skipped，符合预期）。
+最近一次绿灯：run `31039877510`（`b5d7269`，Frontend / Rust macOS / Rust Ubuntu / Rust Windows
+四个全绿；`build-tauri` 与 `Create Release` 因为不是标签推送而 Skipped，符合预期）。
 
 ### 11.2 一个值得记住的教训：cfg 必须跟调用点严格对齐
 
