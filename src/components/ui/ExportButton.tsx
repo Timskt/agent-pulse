@@ -4,10 +4,12 @@ import { useI18n } from "../../i18n";
 import { cn } from "../../lib/utils";
 import { Button } from "./Button";
 
-/** 后端 `ExportResult`：落盘路径 + 实际导了多少行 */
+/** 后端 `ExportResult`：落盘路径 + 实际导了多少行 + 有没有被上限截断 */
 interface ExportResult {
   path: string;
   rows: number;
+  /** 后端撞到十万行上限，库里还有更多没导出来 */
+  truncated: boolean;
 }
 
 /**
@@ -50,11 +52,17 @@ export function ExportButton({
 
   // 成功提示自己退场。不自动退的话它会一直挂在标题旁边，
   // 下次再点导出时用户分不清那句话说的是这次还是上次
+  //
+  // 被截断的那句留久一些：它不是「干完了」，是「你得改筛选再导一次」。
+  // 让这种提示跟成功提示一样 8 秒消失，等于赌用户正好在看这个角落
   useEffect(() => {
     if (!done) return;
-    const timer = window.setTimeout(() => {
-      if (alive.current) setDone(null);
-    }, 8000);
+    const timer = window.setTimeout(
+      () => {
+        if (alive.current) setDone(null);
+      },
+      done.truncated ? 20000 : 8000,
+    );
     return () => window.clearTimeout(timer);
   }, [done]);
 
@@ -77,13 +85,23 @@ export function ExportButton({
   return (
     <div className={cn("flex items-center gap-2", className)}>
       {done && (
+        // 截断和成功都得能点开文件——文件确实写出来了，只是不全。
+        // 但颜色要分开：绿色在这个界面里到处都是「没问题」的意思，
+        // 拿它说「少了几十万行」会被当成成功一扫而过
         <button
           type="button"
           onClick={() => void invoke("reveal_export", { path: done.path })}
-          className="max-w-[13rem] truncate text-[10px] text-emerald-600 underline decoration-emerald-200 underline-offset-2 hover:decoration-emerald-500"
+          className={cn(
+            "max-w-[13rem] truncate text-[10px] underline underline-offset-2",
+            done.truncated
+              ? "text-amber-600 decoration-amber-300 hover:decoration-amber-500"
+              : "text-emerald-600 decoration-emerald-200 hover:decoration-emerald-500",
+          )}
           title={done.path}
         >
-          {t("export.done", { rows: done.rows })}
+          {done.truncated
+            ? t("export.truncated", { rows: done.rows })
+            : t("export.done", { rows: done.rows })}
         </button>
       )}
       {error && (

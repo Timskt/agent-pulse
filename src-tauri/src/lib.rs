@@ -467,11 +467,27 @@ async fn get_session_detail(
 /// 按重度使用估算：一天 50 次续跑要连着跑五年半才撞到这个数。
 const EXPORT_MAX_ROWS: u32 = 100_000;
 
-/// 一次导出的结果：落盘路径 + 实际导了多少行
+/// 这次导出是不是被上限切了一刀
+///
+/// 两个条件都要满足才算截断。只看 `rows == EXPORT_MAX_ROWS` 会在库里刚好
+/// 有十万行时误报一次「还有更多」——那次其实一行没少。
+fn hit_cap(rows: u32, total: u32) -> bool {
+    rows >= EXPORT_MAX_ROWS && total > rows
+}
+
+/// 一次导出的结果：落盘路径 + 实际导了多少行 + 有没有被上限截断
+///
+/// `truncated` 不能省。上限本身是合理的（几十万行拼一个 String 会吃掉几百 MB
+/// 内存），但**撞上限而不说**就成了这个仓库反复在修的那类毛病：文件能打开、
+/// 行看着完整、界面还报了个成功，少掉的那些要等用户拿它算完账才发现。
+///
+/// 判据是「拿到的行数 == 上限，而库里的总数比它多」。总数本来就跟着同一个
+/// 筛选条件算，不用额外查一次。
 #[derive(serde::Serialize)]
 struct ExportResult {
     path: String,
     rows: u32,
+    truncated: bool,
 }
 
 /// 导出续跑记录（跟随当前筛选条件）
@@ -493,7 +509,11 @@ async fn export_resumes(
     let csv = export::resumes_csv(&page.records, &i18n);
     let rows = page.records.len() as u32;
     let path = export::write_csv("resumes", &csv)?;
-    Ok(ExportResult { path, rows })
+    Ok(ExportResult {
+        path,
+        rows,
+        truncated: hit_cap(rows, page.total),
+    })
 }
 
 /// 导出会话档案（跟随当前筛选条件）
@@ -513,7 +533,11 @@ async fn export_sessions(
     let csv = export::sessions_csv(&page.entries, &i18n);
     let rows = page.entries.len() as u32;
     let path = export::write_csv("sessions", &csv)?;
-    Ok(ExportResult { path, rows })
+    Ok(ExportResult {
+        path,
+        rows,
+        truncated: hit_cap(rows, page.total),
+    })
 }
 
 /// 导出花费明细
@@ -528,6 +552,8 @@ async fn export_cost(
 ) -> Result<ExportResult, String> {
     let days = days.unwrap_or(30);
     let i18n = i18n::I18n::from_code(&state.config_manager.get().language);
+    // 这三个维度都是**聚合**结果：按天最多几百行、按项目是目录数、按模型是个位数。
+    // 谁都不可能撞到十万，所以这里不判截断——传上限只是给查询一个收口。
     let (slug, csv, rows) = match scope.as_deref().unwrap_or("daily") {
         "projects" => {
             let rows = state.storage.project_costs(days, EXPORT_MAX_ROWS);
@@ -546,7 +572,11 @@ async fn export_cost(
         }
     };
     let path = export::write_csv(slug, &csv)?;
-    Ok(ExportResult { path, rows })
+    Ok(ExportResult {
+        path,
+        rows,
+        truncated: false,
+    })
 }
 
 /// 导出统计摘要
@@ -562,7 +592,12 @@ async fn export_stats(
     let csv = export::stats_summary_csv(&overview, &sessions, &usage, &i18n);
     let rows = csv.rows.len() as u32;
     let path = export::write_csv("stats", &csv)?;
-    Ok(ExportResult { path, rows })
+    // 摘要是竖排的固定十行，没有上限可撞
+    Ok(ExportResult {
+        path,
+        rows,
+        truncated: false,
+    })
 }
 
 /// 在文件管理器里亮出刚导出的文件
@@ -873,4 +908,40 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running AgentPulse");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上限的边界：正好等于上限时**不算**截断
+    ///
+    /// 这条边界值得单独钉住，因为两种写法在绝大多数输入下表现一样，
+    /// 只在「库里恰好十万行」这一个点上分叉——而那次一行都没少，
+    /// 却会被错误的写法报成「还有更多没导出」。用户为此改筛选、重导一遍，
+    /// 拿到的是同样的文件。
+    #[test]
+    fn the_cap_boundary_is_not_truncation() {
+        // 一行没少：拿到的就是库里全部
+        assert!(!hit_cap(EXPORT_MAX_ROWS, EXPORT_MAX_ROWS));
+        // 少了一行：这才是截断
+        assert!(hit_cap(EXPORT_MAX_ROWS, EXPORT_MAX_ROWS + 1));
+    }
+
+    /// 没撞上限的普通导出不该报截断
+    #[test]
+    fn a_normal_export_is_never_truncated() {
+        assert!(!hit_cap(0, 0));
+        assert!(!hit_cap(20, 20));
+    }
+
+    /// `total` 比实际行数少也不能报截断
+    ///
+    /// 行数和总数是分两次算出来的（一次取行、一次 `COUNT`），中间有别的线程
+    /// 在写库时两者可以对不上。这种情况下宁可少报一次，也不要凭一个抖动的
+    /// 数字去告诉用户「你的数据不全」。
+    #[test]
+    fn a_stale_total_does_not_trigger_the_warning() {
+        assert!(!hit_cap(EXPORT_MAX_ROWS, EXPORT_MAX_ROWS - 5));
+    }
 }

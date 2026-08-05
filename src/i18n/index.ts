@@ -409,6 +409,12 @@ const TABLE = {
   "export.running": ["正在导出…", "Exporting…"],
   "export.done": ["已导出 {rows} 行，点这里查看", "{rows} rows exported — reveal"],
   "export.failed": ["导出失败", "Export failed"],
+  // 撞上限时必须换一套措辞，不能只把行数写小。用户看到「已导出 100000 行」
+  // 会以为那就是全部——一份自己不说自己不全的导出，比导出失败更坏
+  "export.truncated": [
+    "只导出了最近 {rows} 行（还有更多，先筛一下再导）",
+    "Only the latest {rows} rows (more exist — narrow the filter)",
+  ],
   "export.cost_daily": ["导出每日花费", "Export daily spend"],
   "export.cost_projects": ["导出项目花费", "Export by project"],
   "export.cost_models": ["导出模型花费", "Export by model"],
