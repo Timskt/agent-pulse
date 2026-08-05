@@ -395,6 +395,20 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_resume_created ON resume_records(created_at);
             CREATE INDEX IF NOT EXISTS idx_detection_created ON detection_records(created_at);
 
+            -- v1.7：会话档案抽屉按 `session_id` 取这两张表，而上面那两个索引
+            -- 只盖了 `created_at`——于是每开一次抽屉都是两次全表扫描。
+            --
+            -- 复合到 `(session_id, created_at)` 而不是只索引 `session_id`：
+            -- 两个查询都紧跟着 `ORDER BY created_at`，把排序键放进索引，
+            -- SQLite 直接顺着索引读，连排序那一步都省了。
+            --
+            -- 现在的量级下这不是能感知的卡顿（2 万行约 1 毫秒）。加它是因为
+            -- 全表扫描的代价**随行数线性涨**，而这两张表只增不减：等用户攒够
+            -- 数据、真的觉得抽屉变慢的时候，那台机器上已经没人愿意等一次
+            -- 迁移了。索引在 2 万行时占 733 KB，比它替下来的扫描便宜。
+            CREATE INDEX IF NOT EXISTS idx_resume_session ON resume_records(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_detection_session ON detection_records(session_id, created_at);
+
             -- v1.2 洞察层：逐请求用量。主键即去重键，天然幂等，
             -- 因此重复解析同一段 jsonl 不会把账单算两遍。
             CREATE TABLE IF NOT EXISTS usage_records (
@@ -1513,6 +1527,24 @@ mod tests {
         storage.get_resume_page(50, 0, "", outcome, prompt_type)
     }
 
+    /// 问 SQLite 打算怎么执行这条 SQL
+    ///
+    /// 索引这种东西没法用「结果对不对」来测：加不加索引，返回的行**完全一样**，
+    /// 只是慢。所以只能直接问查询计划——`SCAN` 是全表扫，`SEARCH ... USING INDEX`
+    /// 才是走了索引。
+    fn plan(storage: &Storage, sql: &str) -> String {
+        let conn = storage.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("解释查询计划失败");
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("读查询计划失败")
+            .filter_map(|r| r.ok())
+            .collect();
+        rows.join(" | ")
+    }
+
     #[test]
     fn outcome_survives_a_round_trip() {
         let storage = Storage::in_memory();
@@ -2301,5 +2333,60 @@ mod tests {
         // 那是两份真实记录，合并逻辑必须绕开它们
         storage.merge_fragmented_history();
         assert_eq!(storage.session_history(50, "").len(), 2);
+    }
+
+    /// 抽屉那两个查询必须走索引，而且必须是**这条**索引
+    ///
+    /// 这两个断言防的是同一件事的两个方向：索引被人删掉（退回全表扫描），
+    /// 或者查询的 `WHERE` / `ORDER BY` 被改成索引盖不住的形状。两种情况
+    /// 都不会让任何别的测试变红——行数、内容、顺序全都一样，只是慢，
+    /// 而且要等用户攒够数据才慢。
+    #[test]
+    fn the_session_drawer_queries_use_their_index() {
+        let storage = Storage::in_memory();
+
+        let resume_plan = plan(
+            &storage,
+            &format!(
+                "SELECT {RESUME_COLUMNS} FROM resume_records WHERE session_id = 'x' \
+                 ORDER BY created_at ASC, id ASC"
+            ),
+        );
+        assert!(
+            resume_plan.contains("USING INDEX idx_resume_session"),
+            "续跑记录没走 session 索引，实际计划：{resume_plan}"
+        );
+
+        let detection_plan = plan(
+            &storage,
+            "SELECT id, session_id, agent_name, verdict, signals, has_active_goal, reason, created_at \
+             FROM detection_records WHERE session_id = 'x' ORDER BY created_at ASC, id ASC",
+        );
+        assert!(
+            detection_plan.contains("USING INDEX idx_detection_session"),
+            "检测记录没走 session 索引，实际计划：{detection_plan}"
+        );
+    }
+
+    /// 复合索引的第二列换来的是「不用再排一次」
+    ///
+    /// 只索引 `session_id` 也能让上面那条测试通过，但查询计划里会多一个
+    /// `USE TEMP B-TREE FOR ORDER BY`——SQLite 得把取出来的行再排一遍。
+    /// 把 `created_at` 放进索引第二列之后这一步消失了，所以单独钉住它，
+    /// 否则以后有人把索引简化成单列，白掉的那部分没人会发现。
+    #[test]
+    fn the_drawer_queries_do_not_sort_afterwards() {
+        let storage = Storage::in_memory();
+        let resume_plan = plan(
+            &storage,
+            &format!(
+                "SELECT {RESUME_COLUMNS} FROM resume_records WHERE session_id = 'x' \
+                 ORDER BY created_at ASC, id ASC"
+            ),
+        );
+        assert!(
+            !resume_plan.contains("TEMP B-TREE"),
+            "还在事后排序，说明排序键没进索引：{resume_plan}"
+        );
     }
 }
