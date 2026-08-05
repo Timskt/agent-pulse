@@ -59,7 +59,12 @@ const REJECTION_PHRASES: &[&str] = &[
     "upstream busy",
     "server_busy",
     "capacity",
-    "throttl",
+    // 写全词而不是 `throttl` 这样的词干：`contains_keyword` 对 ASCII 关键词
+    // 要求词边界，而词干后面永远紧跟着字母（`throttled` 的 `e`），于是词干
+    // **一个都匹配不上**。第一版写的就是词干，是变异检查逼出的那条
+    // 「每条短语单独认」的测试把它照出来的。
+    "throttled",
+    "throttling",
     "上游负载",
     "上游繁忙",
     "并发超限",
@@ -257,6 +262,62 @@ mod tests {
         );
     }
 
+    /// 表里每一条都得**单独**被认出来
+    ///
+    /// 上面那条只证明了「这句话能认出来」，而那句话同时含 `上游负载` 和
+    /// `负载已饱和` 两条——删掉任意一条它照样绿。变异检查把这个指出来了：
+    /// 把 `上游负载` 换成一个永不命中的字符串，全部测试仍然通过。
+    ///
+    /// 所以这里给每条配一句**只有它能命中**的话。这不是在钉一个调参旋钮
+    /// （那种该像 `EVENT_RING_CAP` 一样只做符号断言），而是在钉产品要求本身：
+    /// 表里少一条，就是少认一种真实存在的限流说法，而认不出来的代价是号被封。
+    #[test]
+    fn every_listed_phrase_is_recognized_on_its_own() {
+        // 每一项都只含目标短语，不含表里任何其它短语
+        let cases = [
+            ("x-ratelimit", "x-ratelimit-limit: 40000"),
+            ("ratelimit-remaining", "ratelimit-remaining: 0"),
+            ("retry-after", "retry-after: 30"),
+            ("upstream_busy", r#"{"code":"upstream_busy"}"#),
+            ("upstream busy", "the upstream busy signal was returned"),
+            ("server_busy", r#"{"error":"server_busy"}"#),
+            ("capacity", "at capacity right now"),
+            ("throttled", "request was throttled by the gateway"),
+            ("throttling", "throttling is active for this key"),
+            ("上游负载", "上游负载过高，请稍后再试"),
+            ("上游繁忙", "上游繁忙，切换线路"),
+            ("并发超限", "并发超限，请降低请求速率"),
+            ("请求过于频繁", "请求过于频繁"),
+            ("触发限流", "已触发限流策略"),
+            ("负载已饱和", "当前线路负载已饱和"),
+        ];
+
+        // 先确认这张清单没有漏掉表里的条目——漏了的话那一条就没人守，
+        // 而这条测试会假绿
+        assert_eq!(
+            cases.len(),
+            REJECTION_PHRASES.len(),
+            "表里有 {} 条短语，测试只覆盖了 {} 条",
+            REJECTION_PHRASES.len(),
+            cases.len()
+        );
+        for phrase in REJECTION_PHRASES {
+            assert!(
+                cases.iter().any(|(p, _)| p == phrase),
+                "{phrase} 没有对应的用例"
+            );
+        }
+
+        for (phrase, message) in cases {
+            let got = upstream_rejection(message);
+            assert_eq!(
+                got.as_ref().map(|s| s.marker.as_str()),
+                Some(phrase),
+                "「{message}」该由 {phrase} 认出来"
+            );
+        }
+    }
+
     #[test]
     fn a_bare_upstream_busy_is_a_rejection() {
         assert!(upstream_rejection(r#"{"error":"upstream_busy"}"#).is_some());
@@ -334,12 +395,18 @@ mod tests {
     }
 
     /// 隔着一个单词的数字跟这个引导词没关系
+    ///
+    /// 句子里**必须真的有一个数字**，否则这条测不出任何东西：没有数字时
+    /// 无论跨不跨字母都返回 `None`，把字母那道闸门整个删掉它照样绿。
+    /// 第一版就是这么写的（`"retry after the third attempt"`），变异检查
+    /// 直接指出来了。
     #[test]
     fn a_number_behind_another_word_is_not_the_wait() {
         assert_eq!(
-            parse_wait_hint("retry after the third attempt"),
+            parse_wait_hint("retry after the quota window, 900 seconds total"),
             None,
-            "引导词后面紧跟的是单词而不是数字，不该翻过它去抓远处的数"
+            "「900 秒」描述的是配额窗口，不是要等的时间；\
+             引导词后面紧跟的是单词就该收手，不能翻过它去抓远处的数"
         );
     }
 
