@@ -41,15 +41,15 @@
 | 维度 | 现状 |
 |---|---|
 | 版本 | `1.7.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死） |
-| 后端 | Rust，18 个文件，约 14.9k 行 |
-| 前端 | TypeScript + React 19，44 个文件，约 7.3k 行 |
-| 单元测试 | Rust **191 个**（`cargo test`）+ 前端 **93 个**（`pnpm test`，vitest，7 个文件）；两者都在三个平台的 CI 里跑 |
+| 后端 | Rust，19 个文件，约 16.3k 行 |
+| 前端 | TypeScript + React 19，44 个文件，约 7.4k 行 |
+| 单元测试 | Rust **243 个**（`cargo test`）+ 前端 **93 个**（`pnpm test`，vitest，7 个文件）；两者都在三个平台的 CI 里跑 |
 | Tauri 命令 | 38 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
 | 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
-| i18n 词条 | 后端 198 条（`(key, zh, en)`），前端 347 条（`[zh, en]`） |
+| i18n 词条 | 后端 200 条（`(key, zh, en)`），前端 349 条（`[zh, en]`） |
 | 持久化 | SQLite 6 张表 |
-| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
+| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v1.8 限流保持 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
 
 **这个版本能做到的事**：在你不改变任何使用习惯的前提下，后台盯着 Claude Code / Codex / OpenCode
 的会话文件与进程，判断它是"还在干活"、"卡住了"、"在等你回话"、"限流了"还是"报错了"；
@@ -99,7 +99,7 @@ AgentPulse 走的是另一条：**附着在你已有的工作方式上**。代�
 | v1.1 | **感知层** | ✅ | `TurnState` 回合状态、`error_output` 结构性证据通道、`AttentionLevel` 注意力分级、系统通知 + 声音 + 托盘角标 + 节流、三平台续跑（Windows / Linux 补齐）、剪贴板投递绕开输入法 |
 | v1.2 | **洞察层** | ✅ | 21 个模型的价目表、用量归集与去重游标、按天/按项目成本、限流窗口预测、统计面板、会话历史 |
 | v1.3 | **远程层** | ✅ | 只读手机看板（令牌 + CSP nonce + 默认只听 127.0.0.1）、Webhook（Slack / Discord / ntfy / Bark / 自定义） |
-| v1.3 P2 | 远程审批 | ❌ | 手机上点一下"续跑"——**未实现**，见 [13.2](#132-v16--v17-已交付与下一步候选) |
+| v1.3 P2 | 远程审批 | ❌ | 手机上点一下"续跑"——**未实现**，见 [13.2](#132-v16--v17--v18-已交付与下一步候选) |
 | v1.4 | **可信化** | ✅ | tmux/screen 免权限投递通道、续跑演练（`ResumeProbe` 干跑探测）、macOS 辅助功能权限自检与"去开权限"引导、前端 vitest、局域网看板换绑修复 |
 | v1.5 | **闭环化** | ✅ | 投递后核验落地（`ResumeOutcome` + `resume_verified`）、一个计数器拆成三个、上限从判定层挪到动作闸门、静默失败会出声、日志区分事件与状态、版本号单一来源 |
 | v1.6 | **可解释判定** | ✅ | `InterruptReason` 与 `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权、指纹缓存、每轮最多一问）、自定义适配器 UI、跨语言枚举/i18n 门禁、SQLite 形状迁移 |
@@ -261,7 +261,7 @@ AppState {
   前端因此不需要轮询 `invoke`，也不会因为一轮扫描很慢而卡住 UI。
 - **自启动**：`tauri_plugin_autostart`（macOS 用 `LaunchAgent`）。
 - **注意**：`045e571` 移除了 updater 插件——它在没有配置签名公钥的情况下会让应用启动即崩。
-  自动更新要重做（见 [13.2](#132-v16--v17-已交付与下一步候选)）。
+  自动更新要重做（见 [13.2](#132-v16--v17--v18-已交付与下一步候选)）。
 
 ### SQLite 表（`storage/mod.rs`）
 
@@ -812,12 +812,18 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 
 | 侧 | 词条数 | 形态 | 覆盖 |
 |---|---:|---|---|
-| 后端 | 89 | `(key, zh, en)` | 托盘菜单、系统通知、活动日志、续跑结果文本、远程页面 |
-| 前端 | 202 | `[zh, en]` | 所有界面文案 |
+| 后端 | 200 | `(key, zh, en)` | 托盘菜单、系统通知、活动日志、续跑结果文本、远程页面 |
+| 前端 | 349 | `[zh, en]` | 所有界面文案 |
 
-两边都由 `config.language` 驱动。后端 i18n 有 5 个测试，其中两个是防腐的：
-`no_duplicate_keys`（重复 key 会静默覆盖）和 `placeholders_are_all_documented`
-（文案里的 `{}` 占位符必须都有出处）。
+两边都由 `config.language` 驱动。后端 i18n 有 6 个测试，其中三个是防腐的：
+`no_duplicate_keys`（重复 key 会静默覆盖）、`placeholders_are_all_documented`
+（文案里的 `{}` 占位符必须都有出处），以及 v1.8 补上的 `every_enum_key_resolves_to_real_wording`。
+
+最后那个补的是一个真实的洞：`t()` 查不到 key 时会**把 key 本身返回**，而
+`InterruptReason` / `Tactic` / `AttentionLevel` / `ResumeOutcome` 四族的 `i18n_key()`
+都会直接进活动日志和通知（`lib.rs`、`monitor/mod.rs`、`resumer/mod.rs`、`remote/mod.rs`）。
+漏一条词条不会让任何测试变红，只会让用户在日志里看到 `reason.upstream_rejected` 这种键名。
+现在这个测试遍历四族的每个变体，逐个确认它在两种语言下都查得到真话。
 
 **没有任何用户可见文案是硬编码的**，包括续跑失败的原因、托盘菜单项、远程页面的字段名。
 对应的一条产品约束：中英夹杂的"不土不洋"搭配要避免——中文界面下不是不能出现英文（模型名、
@@ -861,7 +867,7 @@ Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history`
 | `RemoteConfig` | `enabled: false`，`port: 17650`，`bind_all: false`，`token: ""` |
 | `WebhookConfig` | 默认关；provider + url + topic + template |
 | `AiJudgeConfig` | 默认关；供应商中立（见 12.4） |
-| `CustomAdapterConfig` | 自定义适配器的配置载体（UI 未做，见 13.2） |
+| `CustomAdapterConfig` | 自定义适配器的配置载体；设置页可增删改（v1.6 已交付） |
 | `ModelPriceOverride` | 用户覆盖价目表 |
 
 ---
@@ -1154,7 +1160,7 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 | P0 续跑演练（dry-run）按钮 | ✅ v1.4 | `Resumer::probe` + `ResumeProbe`，见 7.13 |
 | P0 三平台实机验证清单 | ✅ 清单已写 / ⚠️ **还没走完** | `docs/manual-test.md`，见 12.1 |
 | P1 拆 `ConfigPanel.tsx` | ✅ v1.6（第一轮） | 通用骨架、通知、成本、AI 分区已拆，主文件降到约 610 行 |
-| P1 前端 vitest | ✅ v1.4 | 38 个，见 14.2 |
+| P1 前端 vitest | ✅ v1.4 | 落地时 38 个，现已 93 个，见 14.2 |
 | P2 重写 `docs/architecture.md` / README / `icons/icon.png` | ✅ | 见 12.2 |
 | P2 自动更新重做 | ❌ 仍未做 | 见 13.2 |
 | P1 自定义适配器 UI | ✅ v1.6 | 设置页可增删改名称、进程匹配和会话文件模式 |
@@ -1166,7 +1172,7 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 最后一行值得单独说：它不在任何一版的候选清单里，是从"为什么每次都要等用户来报同一类问题"
 这个问题倒推出来的。**清单能列出的都是想得到的功能；想不到的那一层，只能靠追问症状的成因找到。**
 
-### 13.2 v1.6 / v1.7 已交付与下一步候选
+### 13.2 v1.6 / v1.7 / v1.8 已交付与下一步候选
 
 按"先让已交付的东西可信"排序：
 
@@ -1192,21 +1198,38 @@ Webhook、远程和适配器仍可按同一边界继续拆，但不再是阻塞�
 **P2 — 组件层测试。** 现在的 93 个前端测试只覆盖纯函数和 store 归约；`SessionList`
 的排序、标签显隐这类逻辑值得补 `@testing-library/react`。
 
-**P1 — 按供应商分组限流关键词（v1.8 候选，设计已定，未动工）。** 需求原话是「按不同供应商
-选不同策略」，但代码读下来，`RateLimited => Wait` 已经是全局默认（`detector/mod.rs`），
-最保守的那条路今天对所有供应商都生效。真正的暴露面在**识别**：`default_rate_limit_keywords()`
-只有 8 条，中转站把限流写成「上游负载已饱和」或只回一个 `upstream_busy` 时，一条都不命中，
-判定落到 `Unknown`，而 `Unknown => Nudge`——于是应用会按冷却一遍遍往里敲字，正好是会让号
-被封的那个行为。所以只做一张「供应商 → 策略」表是无效的：表要先知道这是限流才谈得上查，
-而出事的前提恰恰是没认出来。
+**已交付（v1.8）— 限流识别与保持窗口。** 需求原话是「按不同供应商选不同策略」，但代码读
+下来，`RateLimited => Wait` 已经是全局默认（`detector/mod.rs`），最保守的那条路今天对所有
+供应商都生效。真正的暴露面有两处，都不在「策略表」上：
 
-方向分三层，重心在第一层：(1) `rate_limit_keywords` 从全局清单改成按 profile 分组，
-且 `Unknown` 叠加「证据里出现过 HTTP 4xx/5xx 形状」时倒向 `Wait` 而不是 `Nudge`；
-(2) 解析限流消息里自带的等待时间（`retrying in 34s` / `resets at 3pm`）当冷却下限，
-比让用户猜每家等多久更准，也不用维护；(3) profile 里真正因供应商而异的只有三项——限流后
-冷却下限、同窗口撞第 N 次后彻底停手只叫人、是否信任消息里的 reset 时间。「敲字对限流没用」
-这类知识对所有供应商一样，不做成开关，做成开关等于允许用户把自己配到危险的一侧。
-未识别的供应商一律落最严格那档。
+**一、认不出来。** `default_rate_limit_keywords()` 只有 8 条，中转站把限流写成
+「上游负载已饱和」或只回一个 `upstream_busy` 时，一条都不命中，原因落到 `RuntimeError`，
+而它配的手段是 `Nudge`——于是应用按冷却一遍遍往里敲字，正好是会让号被封的那个行为。
+所以只做一张「供应商 → 策略」表是无效的：表要先知道这是限流才谈得上查，而出事的前提
+恰恰是没认出来。
+
+**二、认出来了也只按住几十秒。** 这一条是动工时读代码才发现的，比第一条更要紧：适配器
+只读记录尾部 40 行（`read_tail_lines(path, 40)`），而 agent 撞上限流后还会继续写重试日志。
+等那行 `429` 被顶出这 40 行，判定就再也看不见它，原因掉回 `Stalled` → `Nudge`——**应用
+正好在限流窗口还没过去的时候开始敲字**。不是没有 `Wait`，是 `Wait` 只维持到那行字滚走为止。
+
+| 落点 | 位置 |
+|---|---|
+| 兜底形状识别（关键词全落空后看 HTTP 形状与中转站说法） | `detector::rate_limit::upstream_rejection` |
+| 从消息里抠等待时间（`retrying in 34s` / `请在 30 秒后重试`） | `detector::rate_limit::parse_wait_hint` |
+| 新原因 `UpstreamRejected`（与 `RateLimited` 分开，措辞不同） | `detector::InterruptReason` |
+| 保持窗口（认出那轮记截止时刻，之后不看证据只看时刻） | `detector::RateLimitHold`、`Detector::apply_rate_limit_hold` |
+| 跨轮存活 | `AgentSession::rate_limit_hold`，由 `scan_once` 逐轮合并 |
+| 活动日志说出截止时刻 | `log.rate_limit_hold` |
+
+三个刻意的取舍：`500` 不算限流形状（太常见，拿它当限流会让真故障没人叫）；存坏的时间戳
+**故意不保守**（当成「一直按住」会让某个会话永久静默，比多敲一次糟得多）；用户配的关键词
+永远排在兜底前面。
+
+**未做（下一个增量）— 按供应商 profile。** 真正因供应商而异的只有三项：限流后冷却下限、
+同窗口撞第 N 次后彻底停手只叫人、是否信任消息里的 reset 时间。「敲字对限流没用」这类知识
+对所有供应商一样，不做成开关——做成开关等于允许用户把自己配到危险的一侧。未识别的供应商
+一律落最严格那档。
 
 **已定 — 供应商身份由用户自己挂，不嗅探。** 代码里现在完全没有这个概念（grep `adapters/`、
 `detector/`、`monitor/` 无任何 `ANTHROPIC_BASE_URL` / `base_url`）。读运行中进程的 environ
@@ -1332,26 +1355,32 @@ cargo test -- --list                        # 列出全部测试名
 git tag v1.5.0 && git push origin v1.5.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
-### 14.2 测试分布（Rust 128 + 前端 38）
+### 14.2 测试分布（Rust 243 + 前端 93）
 
 | 模块 | 个数 | 守的是什么 |
 |---|---:|---|
-| `resumer` | 46 | 生成脚本的语法、剪贴板通道、拒绝盲敲、终端识别边界、落地核验、演练 |
-| `detector` | 16 | 两条铁律、散文不是证据、词边界、**判定不看任何续跑计数器** |
-| `monitor` | 14 | 冷却与线性退避、额度闸门、`ResumeOutcome` 归约、事件去重、标签 |
+| `resumer` | 47 | 生成脚本的语法、剪贴板通道、拒绝盲敲、终端识别边界、落地核验、演练 |
+| `detector` | 46 | 两条铁律、散文不是证据、词边界、**判定不看任何续跑计数器**、保持窗口的时刻比较 |
+| `storage` | 35 | 六张表的读写、去重游标、续跑记录、历史聚合 |
+| `monitor` | 23 | 冷却与线性退避、额度闸门、`ResumeOutcome` 归约、事件去重、标签、保持窗口跨轮存活 |
+| `adapters` | 20 | 回合分类、记账行跳过、错误行提取、尾部读取的多字节边界（其中 10 个在 `claude_code`） |
+| `detector::rate_limit` | 19 | 兜底形状识别、等待时间解析（中英）、每条关键词单独可命中 |
+| `export` | 18 | CSV 转义、上限截断、三个维度的列齐全 |
 | `remote` | 11 | 两种令牌来源、定长比较、弱令牌告警、换绑前先停旧监听、页面渲染 |
-| `adapters::claude_code` | 10 | 回合分类、记账行跳过、错误行提取、尾部读取的多字节边界 |
 | `cost` | 7 | 最长前缀匹配、引入期价格、聚合 |
 | `webhook` | 6 | 五家载荷格式 |
-| `i18n` | 5 | 无重复 key、占位符有出处 |
+| `i18n` | 6 | 无重复 key、占位符有出处、**四族枚举 key 都查得到真话** |
 
 前端（vitest，`pnpm test`）：
 
 | 文件 | 个数 | 守的是什么 |
 |---|---:|---|
-| `src/lib/utils.test.ts` | 16 | token / 金额 / 时间格式化、`baseName` 的三平台路径、`cn` 的同族覆盖 |
-| `src/lib/display.test.ts` | 7 | 状态与注意力级别的映射齐全、每个值都是合法 Tailwind 类、i18n key 对得上 |
+| `src/lib/utils.test.ts` | 25 | token / 金额 / 时间格式化、`baseName` 的三平台路径、`cn` 的同族覆盖 |
+| `src/lib/display.test.ts` | 19 | 状态与注意力级别的映射齐全、每个值都是合法 Tailwind 类、i18n key 对得上 |
+| `src/lib/trend.test.ts` | 19 | 「不知道」与 0 不是一回事、时长三档文案、环比：上期为 0 仍可比 / 没上期不拿 0 当基准 / 持平是 0 不是 null、涨跌该红还是该绿 |
+| `src/lib/history.test.ts` | 14 | 按本地时区（不是 UTC）分天、今天/昨天措辞、跨月跨年、**夏令时增减那一小时的当天「昨天」仍然对** |
 | `src/stores/useAppStore.test.ts` | 7 | 命令归约：成功/失败的 `ok` 取值、错误文案原样传递、演练结论不被吞 |
+| `src/components/ui/BarChart.test.ts` | 7 | 最后一根柱子一定有刻度、刻度数不超上限、30 天按 5 格步长从右往左、无数据无刻度 |
 | `src/version.test.ts` | 2 | 四处版本号一致、是三段数字而不是占位符（见 11.6） |
 
 值得单独一提的几个测试名（它们本身就是文档）：
@@ -1370,6 +1399,13 @@ git tag v1.5.0 && git push origin v1.5.0    # 触发 4 目标打包 + 建 Releas
 - `accessibility_errors_are_recognised` —— 静默的权限错误要换成人话（12.6）
 - `pty_channels_need_no_accessibility` —— tmux / screen / iTerm2 不需要授权
 - `tail_survives_multibyte_at_the_window_edge` —— 尾部读取不能把 UTF-8 字符切一半
+- `a_scrolled_away_rate_limit_still_holds_the_line` —— v1.8 的存在理由：证据被顶出 40 行之后仍然不敲字
+- `the_stall_we_built_this_for_still_gets_nudged` —— 保持窗口不能顺手把普通卡住也一起按住
+- `an_unrecognized_relay_limit_is_not_nudged` —— 中转站换个说法也不能掉回"敲字"那条路
+- `a_dead_process_outranks_a_rejection_shape` —— 进程都没了就不是在等限流
+- `a_500_is_not_a_rejection_shape` —— 拿最常见的错误码当限流，会让真故障没人叫
+- `every_listed_phrase_is_recognized_on_its_own` —— 逐条钉住，防的是"某条词根本命中不了却没人发现"
+- `every_enum_key_resolves_to_real_wording` —— 漏一条词条不该让用户在日志里看见键名
 
 ### 14.3 技术栈
 
