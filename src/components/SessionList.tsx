@@ -141,7 +141,7 @@ export function SessionList() {
         <div className="divide-y divide-neutral-100">
           {visible.map((session) => (
             <SessionRow
-              key={session.id}
+              key={`${session.id}:${session.runtime_generation}`}
               session={session}
               focused={session.id === focusedSessionId}
               aiEnabled={config?.ai_judge.enabled ?? false}
@@ -394,7 +394,11 @@ function SessionRow({
             size="xs"
             variant="outline"
             disabled={busy}
-            onClick={() => act(() => manualResume(session.id, true))}
+            onClick={() =>
+              act(() =>
+                manualResume(session.id, session.runtime_generation, true),
+              )
+            }
           >
             {t("session.resume_goal")}
           </Button>
@@ -402,7 +406,11 @@ function SessionRow({
             size="xs"
             variant={stalled ? "primary" : "outline"}
             disabled={busy}
-            onClick={() => act(() => manualResume(session.id, false))}
+            onClick={() =>
+              act(() =>
+                manualResume(session.id, session.runtime_generation, false),
+              )
+            }
           >
             {t("session.resume")}
           </Button>

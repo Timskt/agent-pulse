@@ -196,78 +196,104 @@ AwaitingUser 回合收尾了，确实停在等人
 「上游拒绝」，而不是一个没有解释的沉默。日志里必须说出截止时刻——「不催」如果只说
 「在等」，跟守护神漏了一次分不出来。
 
-## 6. ③ 投递层：那串字符到底怎么落进终端的
+## 6. ③ 投递层：自动静默不是“把窗口藏起来”
 
-整层的设计原则只有一句：**定位不到就不敲。**「没续跑」用户还能自己补一句，
-「敲进别人的代码」是不可撤销的。
+v1.10 的原则是：**自动动作只有在精确寻址、后台执行、可验证三项同时成立时才获准投递。**
+脚本没有报错、窗口可以被激活、键盘事件被系统接受，都不是安全自动续跑的充分条件。
 
-### 通道优先级
+### 6.1 平台无关的能力许可
 
-按确定性从高到低排，认得出哪条就用哪条：
+`resume_core.rs` 把 transport 能力拆成三条正交轴：
 
-| 通道 | 寻址方式 | 需要前台窗口 | 需要系统授权 | 过输入法 |
-|------|----------|:---:|:---:|:---:|
-| **tmux** | `send-keys -t %3 -l --`（pane id） | 否 | 否 | 否 |
-| iTerm2 | `write text` 直接写 pty | 是 | 否 | 否 |
-| Terminal / VS Code / Cursor / Warp | AppleScript + TTY 匹配 | 是 | **辅助功能** | 是 |
-| Windows 控制台 / Terminal | 隐藏 PowerShell 定位器 + `SetForegroundWindow` + Unicode `SendInput` | 是 | 否 | **否** |
-| Linux X11 / Wayland | `xdotool` / `ydotool` | 是 | 否 | 是 |
-| screen | `-X stuff`（只到 session 当前选中的 window） | 否 | 否 | 否 |
+```text
+TargetCertainty = Exact | Window | Unknown
+Visibility      = Background | StealsFocus
+Verification    = Transcript | Protocol | None
+DeliveryPolicy  = BackgroundOnly | AllowForeground
+```
 
-**tmux 是唯一一条不需要任何系统授权、也不需要窗口在前台的路。** 按 pane id
-寻址，参数走 argv 数组所以没有 shell 插值，还绕开了输入法。如果续跑总是不稳，
-最有效的一步是把 agent 跑在 tmux 里。
+自动入口默认 `BackgroundOnly`，许可条件固定为：
 
-`screen -X stuff` 只能投给该 session **当前选中**的 window，属于窗口级不确定，
-所以和其它盲敲路径同一个门槛：必须显式打开 `auto_follow_latest`。
+```text
+target == Exact && visibility == Background && verification != None
+```
 
-### 非 ASCII 必须走剪贴板
+没有安全能力时返回 `deferred/no-safe-transport`。`Deferred` 不是失败，也不是成功：不增加成功数、
+不消耗连击额度、不刷错误通知，更不能自动降级成前台注入。只有用户明确点击手动续跑时，调用方才
+能显式传入 `AllowForeground`；即使如此，`Unknown` 目标仍然拒绝。
 
-合成按键要过输入法。中文提示词用 `keystroke` 敲出来，拼音输入法会把它变成
-一串「啊啊啊啊」（用户实测报过）。所以：非 ASCII 提示词先写进剪贴板，再合成
-**一个 ASCII 粘贴组合键**（⌘V / `^v` / Ctrl+Shift+V）。iTerm2 走 `write text`
-直写 pty，不经过按键合成，因此豁免。
+### 6.2 当前真实通道边界
 
-自由文本**永不拼进 shell 字符串**：Linux 走 stdin 喂剪贴板，Windows 用单引号
-PS 字面量，tmux/screen 用 argv 数组。
+| 通道 / 宿主 | 自动模式 | 手动模式 | 原因 |
+|---|---|---|---|
+| tmux exact pane | 后台允许 | 允许 | pane id 精确寻址，不需要焦点 |
+| screen 当前 window | 延后 | 可在显式盲跟随下使用 | 只能定位当前 window，不是 exact pane |
+| iTerm2 exact TTY | 后台允许 | 允许 | `write text` 直写目标 session；自动脚本不 `activate`、不 `select` |
+| Terminal.app / macOS IDE | 延后 | 可前台定位后输入 | 需要选中窗口/标签或模拟键盘 |
+| Windows classic cmd/conhost | 延后 | 可前台定位后用 Unicode `SendInput` 输入 | 外部 console 的输入缓冲是共享资源，不能按 PID 精确寻址 |
+| Windows Terminal / ConPTY / IDE | 延后 | 可前台定位后用 Unicode `SendInput` 输入 | 外部既有会话没有精确后台输入端点 |
+| Linux X11 / Wayland 普通终端 | 延后 | 可显式走 xdotool/ydotool | 依赖激活窗口和键盘注入 |
+| 无 transcript/协议确认 | 延后 | 可投递但只能是 `Unverifiable` | transport ACK 不能证明 Agent 收到 |
 
-### 演练（`probe_resume`）
+因此“跨平台支持”不等于“所有终端都可自动静默”。自动安全延后是正确结果，不是功能失败。
 
-同一套定位流程走完，**一个字都不敲**，返回 `ResumeProbe`：确定性等级、通道、
-具体目标（pane id / tty / 窗口标题）、一段解释、`would_deliver`、以及
-`needs_permission_fix`（macOS 缺辅助功能授权时前端据此给「去开权限」按钮 ——
-用布尔而不是让前端匹配工具名，否则换成英文界面立刻失灵）。
+### 6.3 Windows 外部 console：自动延后，手动才前台输入
 
-结论同时写一条活动日志。用户报「续跑没反应」时截的往往就是那面板，有这一行
-就不用再问「你演练过吗、结果是什么」。
+Windows 旧实现通过剪贴板发送 `Ctrl+V`，在 cmd/conhost + Codex CLI 中可能触发 Codex 的
+“粘贴图片”快捷键。后续尝试过 `AttachConsole` / `WriteConsoleInputW`，但这组 API 面向的是 console
+级共享输入缓冲：知道目标 PID 属于某个 console，并不等于获得了“只投递给这个 PID/CLI”的精确输入
+端点。对于不由 AgentPulse 创建和持有的外部 console，不能把它宣称为安全后台 transport。
 
-### 落地核验（`resume_verified`）——投递不是终点
+因此 v1.10 的 Windows 边界是：
 
-`Resumer::resume` 返回 `Ok` 的真实含义只是「AppleScript / PowerShell / xdotool
-没报错」，不是「那句话进了那个会话」。焦点被抢、粘进隔壁标签、IME 拦住组合键、
-pane 刚被关掉、授权中途失效 —— 每一种都让脚本成功而字没进去。**只发动作不看世界
-有没有变，系统就永远不知道自己坏了**，只能等用户来报。
+```text
+自动 BackgroundOnly
+→ 外部 cmd/conhost、Windows Terminal/ConPTY、IDE terminal 均无精确后台端点
+→ deferred/no-safe-transport，不激活窗口、不输入
 
-核验用的信号本来就在磁盘上：agent 真动起来就会往自己的会话记录里写东西。
-投递前记一次 `transcript_fingerprint`（会话文件的 `(长度, mtime)`），之后每
-`VERIFY_POLL_MS = 300` 毫秒复查一次，最多等 `VERIFY_WINDOW_SECS = 6` 秒 ——
-一看到长出新内容就立刻收工，不必等满：
+用户明确点击手动续跑 AllowForeground
+→ 重新核验进程代际与唯一窗口目标
+→ 前台定位目标窗口
+→ Unicode SendInput 发送完整 prompt
+→ 独立发送 Enter
+```
 
-| `ResumeOutcome` | 含义 | 计入 |
+手动路径不访问或覆盖剪贴板，不发送 `Ctrl+V` / `SendKeys`，也不通过可见 PowerShell 窗口执行。
+窗口无法唯一定位、目标已退出或代际变化时必须拒绝，不能盲敲当前窗口。完整 Unicode 文本、独立
+Enter、无 PowerShell 弹窗、无图片粘贴错误以及 transcript 精确 prompt **仍需 Windows 真机复测**；
+代码与静态检查不能替代该结论，清单见 `docs/manual-test.md`。
+
+### 6.4 不可逆输入与只读核验的资源边界
+
+窗口、剪贴板和键盘属于桌面级共享资源，真实输入继续受全局 `delivery_lock` 保护；同一 session
+由 lease 排他。输入完成后立即释放全局锁，后续只读取目标 transcript，所以不同 session 的核验
+可以并行。每条 `start()` 监控循环绑定自己的 lifecycle epoch；stop 会先清空未投递动作并推进 epoch，再获取并释放 `delivery_lock` 作为不可逆投递 fence。已经越过检查的输入会在 stop 返回前完成，等待中的旧动作拿锁后因 epoch 失效退出，因此 stop 返回后不会再落入旧生命周期的自动输入；只读核验和记账仍可继续。
+
+排队不授予投递许可。真正出手前再次重验：运行开关、session 状态、额度、冷却、记录版本、
+PID + `process_started_at`、Windows 原始 creation `FILETIME` tick 和 lifecycle epoch。任何一个事实变化都取消旧动作；Windows 手动前台路径在不可逆输入前重新核验目标代际与唯一窗口，不能因为持有 PID/process handle 就把外部 console 提升为精确后台端点。
+
+### 6.5 transcript 精确 prompt 核验
+
+旧的 `(mtime, len)` 指纹只能证明文件发生了变化，不能证明这次提示词进入目标会话。v1.10 在投递前
+记录文件长度基线，只扫描基线之后新增的结构化 user message：Codex 的 `event_msg/user_message`、
+`response_item/message(role=user)`，以及 Claude 的 `type=user/message.content`。
+
+只有提取出的**整个 user message**与本次 prompt **逐字符精确相等**才是 `Landed`，不会 `trim` 首尾空格或换行。数组形式必须恰好只有一个 `text` / `input_text` block；匹配文本旁带额外文本、图片或其他 block 均拒绝。
+assistant/tool 簿记、mtime 变化、不同 prompt、基线之前已有的相同 prompt 都不能算成功。
+
+| `ResumeOutcome` | 含义 | 记账 |
 |---|---|---|
-| `Failed` | 通道自己报错，字肯定没出去 | `resume_failures`（通道健康）|
-| `Landed` | 记录长了 → 它动了 | 成功，清零失败计数 |
-| `Silent` | 脚本成功但记录一动不动 → 没落地 | `resume_failures` |
-| `Unverifiable` | 这个 agent 没有可核验的记录文件 | **刻意不算失败** |
+| `Landed` | 本次精确 prompt 已被 transcript/协议确认 | 唯一计入成功和“催过”的状态 |
+| `Silent` | transport 接受后未找到本次 prompt | 失败 |
+| `Failed` | transport/定位明确失败 | 失败 |
+| `Unverifiable` | 手动通道没有可验证记录 | 不算成功，不冒充已确认 |
+| `Deferred` | 自动模式没有安全后台通道 | 不算成功，也不算失败 |
 
-`Unverifiable` 不算失败是个明确取舍：没有证据不等于有反证，把它记成失败会让
-没有 transcript 的适配器永远显示「敲不进去」。
+### 6.6 演练仍然只是定位诊断
 
-三个计数器因此各管一件事，不能再共用一个：`resume_count` 是终身累计（只用于显示）、
-`resume_streak` 是连续没效果的次数（对 `max_resume_count`，`Verdict::Running` 时清零）、
-`resume_failures` 是通道健康（驱动 `effective_cooldown` 的线性退避与升级告警）。
-其中最要紧的一条：**敲不进去不算「催过了」**（`failed_deliveries_never_exhaust_the_budget`）
-—— 否则一个坏掉的通道会在 5 轮里静静烧完额度，然后彻底沉默。
+`probe_resume` 走定位链路但不输入，适合提前发现缺少依赖、权限或精确目标。它不能证明字符真的进入
+Agent，也不能替代 transcript 核验和真机验收。自动模式的最终许可仍由 Rust 的能力模型决定，
+前端不根据 probe 文案自行放宽。
 
 ## 7. ④ 洞察层：花费与时间线
 
@@ -348,81 +374,67 @@ pane 刚被关掉、授权中途失效 —— 每一种都让脚本成功而字�
 | `engine-stopped` | `()` | 引擎停了 |
 | `attention-alert` | `AttentionAlert` | 该叫人了；前端据此响声、高亮会话、立刻补一次状态 |
 
+桌面外壳本身也按窗口宽度自适应：顶栏使用可换行 Grid，导航只在自身区域横向滚动；主内容、
+历史筛选、会话行与续跑诊断统一设置 `min-width: 0` 和长文本断行策略，诊断错误和完整工作目录可选择并提供明确复制操作。Tauri 主窗口 `minWidth` 已降至 360，配置契约测试锁定 360×700 可达；页面级 `scrollWidth`、真实字体/缩放和长文本组合仍须按 `docs/manual-test.md` 完成正式窗口验收。历史诊断默认不挂载，避免为了响应式重新引入重复数据。
+
 前端的兜底轮询是**自适应**的，不是固定 3 秒：守护中取扫描周期的一半（夹在
 2–8 秒），没在守护降到 10 秒，**窗口不可见时整轮跳过**，切回来立刻补一次。
 原来那个无条件 `setInterval(3000)` 在窗口收进托盘时照样每 3 秒敲一次后端。
 
-## 11. 一次自动续跑的完整路径（v1.10 两阶段流水线）
+## 11. 一次自动续跑的完整路径（v1.10）
 
-v1.9 先解决了“扫描不该等待续跑”：`scan_once` 只发现、取证、判定并生成动作，常驻
-worker 在后台消费。因此多个会话各自最长 6 秒的核验不会再冻结下一轮检测和界面刷新。
+### 11.1 稳定身份
 
-v1.10 继续缩小临界区。旧协调器仍让最长 6 秒的**只读记录核验**占着全局
-`delivery_lock`；会话 A 已经敲完但 transcript 暂时不增长时，会话 B 的自动续跑和用户手动
-续跑都要白等。现在资源边界按事实拆成两阶段：
+适配器先确定逻辑会话和运行代际。Codex 只接受精确命令形状 `codex resume <UUID>`，随后递归寻找对应 rollout JSONL，并核验 `session_meta.payload.id` / `session_id`。Claude 从保留参数边界的 argv 中只接受显式 `--session-id/--resume <UUID>`，并要求 cwd 对应 project 目录唯一命中同名 JSONL；裸会话与 `--continue` 不关联 transcript。无法确认时统一退回 PID + process generation 的运行实例 ID，不按 cwd 猜“最新文件”。
+
+历史页默认显示会话档案：有稳定身份的条目标为“逻辑会话”，无法证明身份的旧数据标为“旧运行记录”。
+旧数据迁移只合并可证明属于同一旧 session ID + cwd 的碎片，不使用前端 `Set`、SQL `DISTINCT`
+或 cwd 单独强行合并；逐次投递记录放在默认折叠的诊断区。
+
+### 11.2 连续观测 reducer
+
+检测快照进入纯 reducer：
 
 ```text
-后台节拍 / 托盘 / 前端扫描
-             │
-             ▼
-       scan_lock（只保护发现、取证、判定、状态合并）
-             │
-    DetectionSnapshot
-  （记录 len + mtime）
-             │
-             ▼
- ResumeAction（会话快照 + 活动指纹 + stuck_secs + lifecycle_epoch）
-             │
-             ▼
- ResumeQueue：同 session upsert 最新动作，不堆旧快照
-             │ notify
-             ▼
- pop_ready：跳过仍有 lease 的 session，继续找后面的可执行动作
-             │
-      owned ResumeLease（同会话闭环排他，可移动进任务）
-             │
-             ├──────── Phase 1：不可逆投递，全局严格串行 ────────┐
-             │     delivery_lock（自动 + 手动共享）                │
-             │     出手前重验 lifecycle / running / 配置 / 状态     │
-             │       / tactic / 额度 / 冷却 / 记录指纹              │
-             │     Resumer 再验 PID + 启动代际 + 命令行             │
-             │     先取 before 指纹 → 定位 → 剪贴板 → 回车 → 恢复   │
-             └────────────────── 立即释放 delivery_lock ───────────┘
-             │
-             ├──────── Phase 2：只读核验，跨 session 并行 ─────────┐
-             │     最长 6 秒轮询本 session 的 transcript 指纹       │
-             └──────────────────────────────────────────────────────┘
-             │
-             ▼
- commit_resume_outcome → SQLite / 日志 / 通知 / 计数器
-             │
-             ▼
- 释放 ResumeLease；notify worker 接上同 session 的最新后继
+Observing → Suspected { evidence_hash, observations }
+          → Eligible  { decision_id, evidence_hash }
 ```
 
-关键不变式：
+同一份稳定结构证据必须连续出现达到 `idle_threshold` 才进入 `Eligible`。恢复健康、只有可疑证据或
+证据 hash 变化都会重置/重开观察窗口。hash 不包含每轮变化的“已空闲 N 秒”文案。
 
-1. **扫描不等投递。** `scan_lock` 在 `enqueue_resume_actions` 前释放；桌面脚本和核验都不会
-   拖住后续发现、状态刷新和“立即扫描”。
-2. **只串行共享资源。** 前台窗口、剪贴板、键盘和真实输入仍由 `delivery_lock` 全局串行；
-   输入完成、剪贴板恢复后立即释放锁。核验只读各自 transcript，不占桌面锁。
-3. **同会话仍最多一个在途闭环。** `ResumeLease` 拥有 `Arc<ResumeRegistry>`，可移动进派发任务，
-   一直活到核验、记账和通知结束；同 session 不会因为锁提前释放而二次输入。
-4. **忙会话不产生队头阻塞。** `ResumeQueue::pop_ready` 最多检查当前队列一圈；拿不到 lease 的
-   动作原样轮转到队尾，后面的其他 session 可以先投递。所有 session 都忙时返回并睡眠，不自旋。
-5. **同会话队列有界。** 第一次入队决定 FIFO 位置，后续扫描只替换动作快照；在途 session 也
-   最多保留一个最新后继，内存不会随扫描次数增长。
-6. **停止是不可逆输入的取消边界。** `stop()` 清队列并推进 `lifecycle_epoch`；已经派发但仍等
-   投递锁的任务会在锁内重验失败。若回车已经发生则不能撤销，仍要完成核验和记账。
-7. **排队不等于许可。** `auto_action_is_current` 在拿到投递锁后重新读取最新配置和状态，记录
-   指纹必须仍与检测时一致；会话自己恢复、额度用光或策略变化都会取消旧动作。
-8. **进程身份按代际而非裸 PID。** 新进程即使命令行一样，只要启动时刻不同就不是原会话。
-9. **扫描与投递重叠但不能丢账。** `merge_resume_runtime` 保留最新 `resume_count`、失败退避和
-   `last_resume_at`；只有本轮明确观察到 `Running` 才清空 `resume_streak`。
-10. **状态只有 Rust 一个来源。** `resume_pending` 由队列长度与等待/执行投递的 RAII 计数合成，
-    `resume_verifying` 单列；`MonitorEngine::snapshot` 返回合并快照，前端页脚只展示、不重算。
+### 11.3 Attempt Ledger 与动作许可
 
-更完整的资源模型、复杂度和验收矩阵见
+Eligible 动作带 `decision_id` 和 `evidence_hash`。SQLite `resume_attempts` 使用：
+
+```text
+UNIQUE(session_generation, evidence_hash, prompt_hash)
+```
+
+作为不可逆动作的幂等键，并区分 `created → delivering → transport_acked → verified`、`deferred`、
+`unverifiable`、`failed`。transport ACK 只是 transport 接受写入，不是 verified。只有单实例仲裁成功后的
+主实例会在 setup 阶段把遗留 `delivering/transport_acked` 以 `IMMEDIATE` 事务收敛为 `unverifiable`；
+第二实例不会改写首实例的活跃 attempt。`Existing(deferred)` 只有设置了有效且已到期的
+`next_retry_at` 才能重新 CAS 到 `delivering`。最终 `delivery_started` claim 会在同一 SQLite 原子更新中按 generation 重新确认单赢家；任意 prompt 下的危险状态都会按整个 generation 阻断
+新 attempt，提示词热更新不能绕过未决外部副作用。任何 ACK 或最终状态转换失败，
+都不会更新内存计数、写“已送达”历史或发送成功通知。更细的 typed backoff/quarantine 仍是后续计划。
+
+### 11.4 两阶段协调
+
+1. 扫描生成候选动作并按 runtime generation 合并最新快照；
+2. worker 绕过正在核验的忙 runtime generation；
+3. 拿到 runtime-generation lease 与全局 delivery lock 后重验所有可变事实；
+4. `BackgroundOnly` 能力不满足就 `Deferred`，不碰前台；
+5. 允许的 transport 完成不可逆输入后立即释放全局锁；
+6. transcript 精确 prompt 核验在锁外执行，不同 session 可并行；
+7. outcome、attempt、会话计数、日志和通知在 Rust 中统一归约；前端只展示快照。
+
+### 11.5 Rust 是唯一事实源
+
+`ResumeDecisionState`、transport capability、attempt 状态、`resume_pending`、`resume_verifying` 和
+最终 outcome 都由 Rust 产生。前端不能通过按钮状态、日志字符串或数组长度重算“是否允许自动续跑”。
+
+详细状态和验收矩阵见
 [`specs/v1.10_resume_pipeline_design.md`](../specs/v1.10_resume_pipeline_design.md)。
 
 ## 12. 八个花了很大代价才弄明白的事实
@@ -465,13 +477,16 @@ elements enabled'`（只读、不弹窗、不会把用户拽进设置面板）�
 **签名身份故意不写进 `tauri.conf.json`。** 写死了，没有这张证书的人连构建都过不去；
 放在环境变量里，本地用自签名、CI 用仓库 secrets 里的 Developer ID，两边都不用改配置。
 
-### 12.2 tmux 是唯一一条不需要授权的路
+### 12.2 只有可拥有或可精确寻址的 endpoint 才能后台自动化
 
-上面那条的直接推论：只要 agent 跑在 tmux 里，`send-keys -t %3 -l --` 按 pane id
-寻址，**不需要辅助功能授权、不需要窗口在前台、不过输入法、没有 shell 插值**。
-授权问题、IDE 内置终端定位不准、中文变「啊啊啊」这三类麻烦一次性全绕开。
+只要 agent 跑在 tmux exact pane 里，`send-keys -t %3 -l --` 就能按 pane id 寻址，
+不需要窗口在前台、不过输入法、没有 shell 插值。iTerm2 exact TTY 的 `write text` 同样能够
+绑定到明确 session。两者仍必须有 transcript/协议核验；“API 可调用”不能跳过验证层。
 
-所以「续跑总是不稳怎么办」的第一建议不是调参数，是把 agent 跑进 tmux。
+外部 Windows classic cmd/conhost 不同：console input buffer 是共享资源，`AttachConsole` /
+`WriteConsoleInputW` 不能提供只属于目标 PID/CLI 的 endpoint，因此自动路径必须延后。后续只有
+AgentPulse 自己持有的 Owned ConPTY，或提供稳定 session endpoint 的官方/server 协议，才可按同一
+标准评估为 Windows 后台 transport。
 
 ### 12.3 `abort()` 只是提交取消请求 —— 换绑地址会撞上自己
 
@@ -503,11 +518,11 @@ elements enabled'`（只读、不弹窗、不会把用户拽进设置面板）�
 「授权失效」、「粘到隔壁标签」、「IME 吃掉组合键」这些全部长成同一个样子：
 一条成功日志，加一个没动的 agent。
 
-所以 v1.5 把投递改成闭环（见 §6「落地核验」）：投递后回头看 agent 自己的记录
-文件有没有长出新内容，`Landed / Silent / Failed / Unverifiable` 四态分开记账。
+v1.5 先用“记录是否增长”建立闭环；v1.10 又把门槛提高为：只检查 transcript 基线之后
+新增的结构化 user message，并要求它与本次 prompt 精确相等。`Landed / Silent / Failed /
+Unverifiable / Deferred` 分开记账；transport ACK、mtime 或 assistant 簿记都不能报喜。
 **一个不会检查自己有没有生效的守护进程，坏掉的时候和正常的时候长得一模一样。**
-这条推论比这三个具体的坑更值钱：以后再加任何「替用户动手」的能力，都要连着
-它的核验信号一起加，否则等于又造一个只会报喜的通道。
+以后再加任何「替用户动手」的能力，都必须同时定义 DeliveryConfirmed 证据。
 
 ### 12.5 减 86400000 毫秒不等于「前一天」
 
@@ -645,8 +660,8 @@ if total == last_len { continue; }   // 满环之后恒真
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 263 passed（macOS / Linux）；Windows 另有 1 个 PowerShell helper 运行时编译测试 |
-| 前端单测 | `pnpm test`（vitest） | 99 passed（8 files） |
+| Rust 单测 | `cargo test` | 325 passed（本轮 macOS 门禁）；Windows CI 另执行 PowerShell helper 的真实编译与 Win32 结构布局测试 |
+| 前端单测 | `pnpm test`（vitest） | 103 passed（9 files） |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |
 
@@ -747,14 +762,19 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 
 - 三平台真实续跑仍没有本轮可引用的正式真机验收记录；代码、脚本语法与单元测试通过
   不等于字符一定落进了正确终端。所有平台继续按 `docs/manual-test.md` 保持未勾选。
-- tmux/screen 通道编译通过、有 4 个单元测试，**没有对着真实 tmux pane 试过**。
+- 当前自动后台能力只承诺 tmux exact pane 与 iTerm2 exact TTY，且都要求 transcript/协议核验；
+  Terminal.app、Linux 普通终端、外部 Windows cmd/conhost、Windows Terminal/ConPTY、IDE 集成终端、
+  screen 非精确 window 自动延后，只有手动才允许前台降级。
+- Windows 外部 console 不能按 PID 精确寻址；必须先确认自动路径安全延后，再在真实
+  `cmd.exe + Codex CLI` 上复测用户手动点击后的 Unicode `SendInput`：完整文本、独立 Enter、
+  无 PowerShell 弹窗、无剪贴板/图片粘贴错误、不串线，并在 transcript 基线之后看到本次精确 prompt。
+- tmux/screen 通道有单元测试，但**没有对着真实 tmux pane / screen window 走完本轮验收**。
 - v1.9 的队列合并、生命周期失效、RAII 租约、进程代际复核和并发状态归约都有单测，
   但**真实多会话排队投递**仍需手工验收：特别是“6 秒 × N 不阻塞扫描”、stop/start 取消、
   手动与自动同刻触发、PID 复用这几条只能在真实桌面环境确认端到端行为。
-- 落地核验的 6 秒窗口是**推理出来的，不是测出来的**：它假设 agent 收到输入后 6 秒内
-  会往记录里写点什么。真机上如果某个 agent 反应更慢，核验会把 `Landed` 误判成
-  `Silent` —— 后果是冷却变长、多一条失败日志，不会误伤额度（`Silent` 也不算「催过了」），
-  但这个数值该由真机数据定，不该由我拍。
+- 精确 prompt 核验的 6 秒窗口仍是**推理出来的，不是测出来的**：它要求 Agent 在窗口内把本次
+  user prompt 持久化到 transcript。真机若写盘更慢会被判为 `Silent`；不会误报成功，但窗口应由
+  真实投递延迟分布校准。
 - 手机看板的修复是推理 + 单元测试（换绑同端口能成功），**没有用真手机端到端复现过**。
 - AI 判断（`ai_judge`）走的是 OpenAI 兼容端点，刻意保持中立、不绑某一家。v1.6 起接进了
   自动回路，但只在「关键词命中、记录仍增长、结构证据用尽」这一处提问（`monitor/mod.rs`
@@ -765,7 +785,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 - 导出的 CSV 有 18 个单元测试盯着转义边界，但**没有真的用 Excel / Numbers /
   pandas 各打开过一次**。BOM 和 `\r\n` 这两条是照标准写的，不是实测出来的。
 - 前端测试只到纯函数层（工具函数、显示映射、store 归约、历史分组、趋势、
-  图表刻度、会话搜索筛选、版本一致性，共 99 个），**组件渲染层没有任何测试**。
+  图表刻度、会话搜索筛选、版本一致性和窄屏静态契约，共 103 个），**组件渲染层仍没有真实 DOM 测试**。
 - **供应商身份在代码里不存在**，是刻意的：读运行中进程的 environ 能拿到 `base_url`，
   但同一个 block 里就是 `ANTHROPIC_AUTH_TOKEN`，等于让本应用具备读密钥的能力。
   v1.8 改成不靠身份也能兜住：关键词全落空时看 HTTP 形状和中转站说法
@@ -799,7 +819,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 | v1.7 记录与导出 ✅ | 会话生命周期收拢（关掉的会话不再显示「运行中」）、续跑记录中心、统计趋势对比、会话档案抽屉、图表补时间刻度、**CSV 导出**（`Text` / `Value` 双变体转义）、跨夏令时的日期分组 |
 | v1.8 限流保持 ✅ | 关键词落空后的兜底形状识别、从消息里抠等待时间（中英）、新原因 `UpstreamRejected`、**保持窗口**（证据被顶出 40 行之后仍然不敲字）、四族枚举 i18n 门禁、变异检查脚本 |
 | v1.9 续跑协调器 ✅ | 扫描/投递解耦、按会话合并队列、常驻 worker、RAII 会话租约、stop 生命周期代数、出队全量重验、并发状态归约、PID + 启动代际身份；首次三步引导与多会话搜索筛选 |
-| v1.10 两阶段续跑流水线 ✅ | 不可逆桌面投递严格串行、跨会话只读核验并行、忙会话绕行避免队头阻塞、owned lease 覆盖完整闭环、Rust pipeline 快照与前端状态可视化 |
+| v1.10 两阶段续跑流水线（代码层 ✅，真机待验） | 不可逆桌面投递严格串行、跨会话只读核验并行、忙会话绕行避免队头阻塞、owned lease 覆盖完整闭环、Rust pipeline 快照与前端状态可视化；360px 与 Windows 手动前台路径仍按验收清单执行 |
 | v2.0 编排层 ⛔ | **与「非侵入」定位冲突，已搁置** —— 不经确认不动工 |
 | v2.1+ 自治层 ⛔ | 同上 |
 

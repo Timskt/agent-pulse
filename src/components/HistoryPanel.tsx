@@ -28,6 +28,7 @@ import type {
   SessionHistoryEntry,
   SessionStatus,
 } from "../types";
+import { ResumeRecordsPanel } from "./ResumeRecordsPanel";
 import { SessionDetailDrawer } from "./SessionDetailDrawer";
 import {
   Badge,
@@ -48,16 +49,12 @@ const KNOWN_STATUS = new Set<string>(Object.keys(STATUS_DOT));
 /**
  * 会话档案
  *
- * 这一页以前是一条平铺的列表，用户的评价是「布局不合理，也不知道有什么作用」。
- * 那句话是对的，而且原因比排版更深：当时的行标识里含着 `discovered_at`，
- * 应用一重启同一个会话就多出一行——**它列的其实是重启记录，不是会话**。
- * 真实库里一个会话摊成过 16 行。修好键之后这一页才第一次真的「一行一个会话」。
+ * 这里刻意区分两种身份：有稳定会话记录路径的条目代表逻辑会话；没有稳定
+ * 身份的旧数据只能诚实地保留为一次进程运行，不能在前端按目录或名字猜测合并。
+ * 后一种条目会显示「旧运行记录」徽标，避免用户把进程重启误读成新对话。
  *
- * 现在它回答三个问题，从上到下：
- * 1. 顶上的汇总条——总共攒了多少、还有几个在跑、一共花了多少；
- * 2. 中间的列表按天分组——「上周四那天我在忙什么」是按日子回忆的，
- *    不是按分页序号；
- * 3. 点开任意一行——那个会话到底经历了什么（生命周期、中断、每次续跑的结果）。
+ * 默认视图只回答「我有哪些会话/运行记录」；逐次续跑投递属于诊断数据，
+ * 已经在会话详情里有时间线，因此收进页面底部默认折叠的诊断入口。
  */
 export function HistoryPanel() {
   const { t } = useI18n();
@@ -70,6 +67,8 @@ export function HistoryPanel() {
 
   // 输入框自己拿着字，防抖之后才发请求；store 里那份是「已经问过后端的条件」
   const [query, setQuery] = useState(filter.query);
+  // 逐次投递记录只在排障时需要；不展开就不挂载，也不会额外拉取一套重复数据。
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
 
   useEffect(() => {
     const timer = window.setTimeout(() => void fetchSessionHistory({ query }), 250);
@@ -93,11 +92,11 @@ export function HistoryPanel() {
   const pageCount = Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE));
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4">
-      <Card>
-        <CardBody>
+    <div className="mx-auto w-full min-w-0 max-w-3xl space-y-4">
+      <Card className="min-w-0 overflow-hidden">
+        <CardBody className="history-card-body min-w-0">
           <CardHeader
-            className="mb-4"
+            className="history-card-header mb-4"
             title={t("history.title")}
             desc={t("history.desc")}
             aside={
@@ -112,14 +111,15 @@ export function HistoryPanel() {
 
           {summary && <SummaryStrip summary={summary} />}
 
-          <div className="mt-4 flex items-center gap-2">
+          <div className="history-filter mt-4 flex min-w-0 items-center gap-2">
             <TextInput
-              className="flex-1"
+              className="min-w-0 flex-1"
               value={query}
               placeholder={t("history.search")}
               onChange={(e) => setQuery(e.target.value)}
             />
             <Segmented
+              className="history-segmented min-w-0 max-w-full shrink-0 overflow-x-auto"
               value={filter.status}
               options={statusOptions}
               ariaLabel={t("history.title")}
@@ -170,8 +170,67 @@ export function HistoryPanel() {
         </CardBody>
       </Card>
 
+      <ResumeDiagnostics
+        open={diagnosticsOpen}
+        onToggle={() => setDiagnosticsOpen((value) => !value)}
+      />
+
       <SessionDetailDrawer />
     </div>
+  );
+}
+
+/**
+ * 逐次续跑记录是排障视图，不再和会话档案同时铺开。
+ *
+ * 条件挂载很重要：默认折叠不仅减少视觉重复，也避免用户只是查看会话历史时
+ * 再请求一次全局续跑列表。按钮保留 `aria-expanded/controls`，键盘和读屏仍可访问。
+ */
+function ResumeDiagnostics({
+  open,
+  onToggle,
+}: {
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const { t } = useI18n();
+  const panelId = "resume-diagnostics-panel";
+
+  return (
+    <section aria-labelledby="resume-diagnostics-title" className="space-y-3">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={onToggle}
+        className={cn(
+          "resume-diagnostics-toggle flex w-full min-w-0 items-center justify-between gap-4 rounded-lg border border-neutral-200 bg-white px-4 py-3 text-left",
+          "outline-none transition-colors hover:border-neutral-300 hover:bg-neutral-50",
+          "focus-visible:ring-2 focus-visible:ring-neutral-400 focus-visible:ring-offset-2",
+        )}
+      >
+        <span className="min-w-0">
+          <span
+            id="resume-diagnostics-title"
+            className="block text-xs font-medium text-neutral-700"
+          >
+            {t("history.diagnostics_title")}
+          </span>
+          <span className="mt-0.5 block text-[10px] leading-relaxed text-neutral-400">
+            {t("history.diagnostics_desc")}
+          </span>
+        </span>
+        <span className="resume-diagnostics-action shrink-0 text-[10px] font-medium text-neutral-500">
+          {t(open ? "history.diagnostics_hide" : "history.diagnostics_show")}
+        </span>
+      </button>
+
+      {open && (
+        <div id={panelId} className="min-w-0">
+          <ResumeRecordsPanel />
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -199,7 +258,7 @@ function SummaryStrip({
     { label: t("history.sum_cost"), value: `$${formatUsd(summary.cost_usd)}` },
   ];
   return (
-    <div className="grid grid-cols-4 gap-2 rounded-lg bg-neutral-50 p-3">
+    <div className="grid grid-cols-2 gap-2 rounded-lg bg-neutral-50 p-3 sm:grid-cols-4">
       {tiles.map((tile) => (
         <div key={tile.label} className="min-w-0">
           <p className="truncate text-[10px] text-neutral-400">{tile.label}</p>
@@ -239,7 +298,7 @@ function HistoryRow({
       type="button"
       onClick={onOpen}
       className={cn(
-        "flex w-full items-start gap-3 py-2.5 text-left outline-none transition-colors",
+        "history-row flex w-full min-w-0 flex-wrap items-start gap-3 py-2.5 text-left outline-none transition-colors",
         "hover:bg-neutral-50 focus-visible:bg-neutral-50",
       )}
     >
@@ -253,14 +312,23 @@ function HistoryRow({
         )}
       />
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 basis-56">
         {/* 第一行：项目名是主角，字号和颜色都比别的重 */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <Tooltip content={entry.working_dir}>
-            <span className="truncate text-xs font-medium text-neutral-800">
+            <span className="min-w-0 max-w-full flex-1 basis-32 truncate text-xs font-medium text-neutral-800">
               {baseName(entry.working_dir)}
             </span>
           </Tooltip>
+          {entry.session_file ? (
+            <Tooltip content={t("history.logical_session_hint")}>
+              <Badge tone="blue">{t("history.logical_session")}</Badge>
+            </Tooltip>
+          ) : (
+            <Tooltip content={t("history.legacy_runtime_hint")}>
+              <Badge tone="neutral">{t("history.legacy_runtime")}</Badge>
+            </Tooltip>
+          )}
           {live ? (
             <Badge tone="green">{t("history.live")}</Badge>
           ) : (
@@ -279,15 +347,17 @@ function HistoryRow({
 
         {/* 第二行：谁、在哪个终端、活了多久——都是次要信息，压成一行灰字 */}
         <p className="mt-1 flex flex-wrap items-center gap-x-2 text-[10px] tabular-nums text-neutral-400">
-          <span>{entry.agent_name}</span>
-          {terminal && <span className="font-mono">{terminal}</span>}
+          <span className="min-w-0 max-w-full break-anywhere">{entry.agent_name}</span>
+          {terminal && (
+            <span className="max-w-full break-all font-mono">{terminal}</span>
+          )}
           <span>{formatShortTime(entry.first_seen)}</span>
           <Lifespan entry={entry} />
         </p>
       </div>
 
       {entry.total_tokens > 0 && (
-        <span className="shrink-0 text-right text-[10px] tabular-nums text-neutral-400">
+        <span className="history-row-usage shrink-0 text-right text-[10px] tabular-nums text-neutral-400">
           <span className="block font-medium text-neutral-600">
             ${formatUsd(entry.cost_usd)}
           </span>
@@ -318,7 +388,7 @@ function Pager({
 }) {
   const { t } = useI18n();
   return (
-    <div className="mt-4 flex items-center justify-between border-t border-neutral-100 pt-3">
+    <div className="mt-4 flex min-w-0 items-center justify-between gap-2 border-t border-neutral-100 pt-3">
       <Button
         size="xs"
         variant="ghost"
@@ -327,7 +397,7 @@ function Pager({
       >
         {t("history.previous")}
       </Button>
-      <span className="text-[10px] tabular-nums text-neutral-400">
+      <span className="min-w-0 text-center text-[10px] tabular-nums text-neutral-400">
         {t("history.page", { page: page + 1, total: pageCount })}
       </span>
       <Button
@@ -341,4 +411,3 @@ function Pager({
     </div>
   );
 }
-

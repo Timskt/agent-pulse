@@ -6,6 +6,72 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+#[cfg(target_os = "windows")]
+mod windows_process_identity {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessTimes(
+            process: *mut c_void,
+            creation_time: *mut FileTime,
+            exit_time: *mut FileTime,
+            kernel_time: *mut FileTime,
+            user_time: *mut FileTime,
+        ) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub(super) fn creation_ticks(process_id: u32) -> u64 {
+        // SAFETY: 只传入普通 PID；成功后所有输出指针都指向有效、可写的本地 FileTime，
+        // 且无论 GetProcessTimes 成败都在返回前关闭拥有的 process handle。
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+            if process.is_null() {
+                return 0;
+            }
+            let mut creation = FileTime { low: 0, high: 0 };
+            let mut exit = FileTime { low: 0, high: 0 };
+            let mut kernel = FileTime { low: 0, high: 0 };
+            let mut user = FileTime { low: 0, high: 0 };
+            let ok = GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user);
+            CloseHandle(process);
+            if ok == 0 {
+                return 0;
+            }
+            (u64::from(creation.high) << 32) | u64::from(creation.low)
+        }
+    }
+}
+
+/// Windows 原始进程创建 FILETIME tick；其他平台返回 0。
+///
+/// Unix 秒不足以区分同一秒内的 PID 复用。自动投递把这个值一路带到 Windows helper，
+/// 并在不可逆写入期间持有已核验进程句柄，形成严格的进程代际身份。
+#[cfg(target_os = "windows")]
+pub(crate) fn process_creation_ticks(process_id: u32) -> u64 {
+    windows_process_identity::creation_ticks(process_id)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn process_creation_ticks(_process_id: u32) -> u64 {
+    0
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn stable_creation_ticks(before: u64, identity_matches: bool, after: u64) -> Option<u64> {
+    (identity_matches && before != 0 && before == after).then_some(after)
+}
+
 /// 进程快照 — 一次扫描共享，避免每个适配器重复枚举进程
 #[derive(Debug, Clone)]
 pub struct ProcessSnapshot {
@@ -14,8 +80,10 @@ pub struct ProcessSnapshot {
     pub started_at: u64,
     /// 小写进程名（Windows 含 .exe 后缀）
     pub name: String,
-    /// 完整命令行
+    /// 完整命令行（用于展示和跨扫描身份核验）
     pub cmd: String,
+    /// 保留参数边界的 argv。身份提取必须使用它，不能从展示字符串反推参数。
+    pub argv: Vec<String>,
     /// 工作目录
     pub cwd: String,
 }
@@ -34,22 +102,81 @@ pub fn take_process_snapshot() -> Vec<ProcessSnapshot> {
     system
         .processes()
         .iter()
-        .map(|(pid, process)| ProcessSnapshot {
-            pid: pid.as_u32(),
-            started_at: process.start_time(),
-            name: process.name().to_string_lossy().to_lowercase(),
-            cmd: process
-                .cmd()
-                .iter()
-                .map(|c| c.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(" "),
-            cwd: process
-                .cwd()
-                .map(|c| c.to_string_lossy().to_string())
-                .unwrap_or_default(),
+        .map(|(pid, process)| {
+            let argv = process_args(process);
+            ProcessSnapshot {
+                pid: pid.as_u32(),
+                started_at: process.start_time(),
+                name: process.name().to_string_lossy().to_lowercase(),
+                cmd: argv.join(" "),
+                argv,
+                cwd: process_cwd(process),
+            }
         })
         .collect()
+}
+
+fn process_args(process: &sysinfo::Process) -> Vec<String> {
+    process
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy().to_string())
+        .collect()
+}
+
+fn process_cwd(process: &sysinfo::Process) -> String {
+    process
+        .cwd()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// 对进程快照补充经过双重验证的 Windows creation FILETIME。
+///
+/// 全量进程枚举与适配器消费之间存在时间窗口；若 PID 在窗口内复用，直接再按 PID 读取
+/// FILETIME 会把旧快照的命令行/cwd 与新进程的 generation 拼在一起。Windows 因此执行：
+///
+/// 1. 读取一次 creation ticks；
+/// 2. 定向刷新同一 PID，并严格核对 start_time、进程名、命令行和可用的 cwd；
+/// 3. 再读一次 creation ticks，只有前后相等且非零才接受。
+///
+/// 非 Windows 沿用原来的 `0` 语义，使调用方可以统一用 `Option`：只有 Windows 的
+/// `None` 表示候选身份无法证明，适配器必须 fail closed。
+#[cfg(target_os = "windows")]
+pub(crate) fn validated_process_creation_ticks(process: &ProcessSnapshot) -> Option<u64> {
+    let before = process_creation_ticks(process.pid);
+    if before == 0 {
+        return None;
+    }
+
+    let pid = sysinfo::Pid::from_u32(process.pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always),
+    );
+    let current = system.process(pid)?;
+    let current_name = current.name().to_string_lossy().to_lowercase();
+    let current_command = process_args(current).join(" ");
+    let current_cwd = process_cwd(current);
+    let identity_matches = process.started_at != 0
+        && current.start_time() == process.started_at
+        && !process.name.is_empty()
+        && current_name == process.name
+        && !process.cmd.is_empty()
+        && current_command == process.cmd
+        && (process.cwd.is_empty() || current_cwd == process.cwd);
+
+    let after = process_creation_ticks(process.pid);
+    stable_creation_ticks(before, identity_matches, after)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn validated_process_creation_ticks(_process: &ProcessSnapshot) -> Option<u64> {
+    Some(0)
 }
 
 /// 用「PID + 启动时刻」生成进程代际稳定的会话 id。
@@ -58,7 +185,22 @@ pub fn take_process_snapshot() -> Vec<ProcessSnapshot> {
 /// 连带继承旧会话的冷却、失败退避和自动续跑额度。启动时刻跨 AgentPulse 重启稳定，
 /// 又能在 PID 复用时自然换代，因此比首次发现时间更适合做身份的一部分。
 pub fn process_session_id(prefix: &str, process: &ProcessSnapshot) -> String {
-    format!("{prefix}-{}-{}", process.pid, process.started_at)
+    process_session_id_with_creation_ticks(prefix, process, 0)
+}
+
+/// 用调用方已经读取到的 Windows 原始 creation FILETIME 生成严格进程代际 ID。
+/// 非 Windows 或读取失败时退回跨平台 Unix 秒语义。
+pub fn process_session_id_with_creation_ticks(
+    prefix: &str,
+    process: &ProcessSnapshot,
+    process_created_at_ticks: u64,
+) -> String {
+    let generation = if process_created_at_ticks == 0 {
+        process.started_at
+    } else {
+        process_created_at_ticks
+    };
+    format!("{prefix}-{}-{generation}", process.pid)
 }
 
 /// 续跑前确认「这个 PID 仍然是刚才发现的那一代 Agent 进程」。
@@ -79,6 +221,11 @@ pub fn process_matches_session(session: &AgentSession) -> bool {
     };
 
     if session.process_started_at != 0 && current.start_time() != session.process_started_at {
+        return false;
+    }
+    if session.process_created_at_ticks != 0
+        && process_creation_ticks(session.pid) != session.process_created_at_ticks
+    {
         return false;
     }
 
@@ -110,9 +257,16 @@ pub struct AgentSession {
     pub agent_name: String,
     /// 关联的进程 PID
     pub pid: u32,
+    /// Rust 生成、前端只回传的不透明运行时代际键。手动续跑必须精确绑定该值，
+    /// 防止旧界面行在 PID 复用后误投到新的进程实例。
+    #[serde(default)]
+    pub runtime_generation: String,
     /// 进程启动时刻（Unix 秒）。只在 Rust 内参与进程代际识别，不暴露给界面。
     #[serde(default, skip_serializing)]
     pub process_started_at: u64,
+    /// Windows 原始进程创建 FILETIME tick；用于排除同秒 PID 复用。
+    #[serde(default, skip_serializing)]
+    pub process_created_at_ticks: u64,
     /// 进程命令行
     pub command: String,
     /// 工作目录
@@ -248,12 +402,17 @@ impl AgentSession {
     /// 判成已结束——一个字面量抄两遍就够犯这个错，所以收成一个方法。
     pub fn history_key(&self) -> String {
         self.session_file.clone().unwrap_or_else(|| {
-            if self.process_started_at == 0 {
+            let generation = if self.process_created_at_ticks == 0 {
+                self.process_started_at
+            } else {
+                self.process_created_at_ticks
+            };
+            if generation == 0 {
                 format!("{}-{}-{}", self.adapter_id, self.pid, self.working_dir)
             } else {
                 format!(
                     "{}-{}-{}-{}",
-                    self.adapter_id, self.pid, self.process_started_at, self.working_dir
+                    self.adapter_id, self.pid, generation, self.working_dir
                 )
             }
         })
@@ -267,7 +426,9 @@ impl Default for AgentSession {
             adapter_id: String::new(),
             agent_name: String::new(),
             pid: 0,
+            runtime_generation: String::new(),
             process_started_at: 0,
+            process_created_at_ticks: 0,
             command: String::new(),
             working_dir: String::new(),
             session_file: None,
@@ -398,7 +559,7 @@ pub trait AgentAdapter: Send + Sync {
 pub fn all_adapters() -> Vec<Box<dyn AgentAdapter>> {
     vec![
         Box::new(claude_code::ClaudeCodeAdapter::new()),
-        Box::new(codex::CodexAdapter),
+        Box::new(codex::CodexAdapter::new()),
         Box::new(opencode::OpenCodeAdapter),
     ]
 }
@@ -420,6 +581,44 @@ mod tests {
             ..Default::default()
         };
         assert!(process_matches_session(&session));
+    }
+
+    #[test]
+    fn creation_tick_validation_requires_a_stable_nonzero_generation_and_matching_identity() {
+        assert_eq!(stable_creation_ticks(100, true, 100), Some(100));
+        assert_eq!(stable_creation_ticks(0, true, 0), None);
+        assert_eq!(stable_creation_ticks(100, false, 100), None);
+        assert_eq!(stable_creation_ticks(100, true, 101), None);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_creation_tick_validation_keeps_the_legacy_zero_generation() {
+        let snapshot = ProcessSnapshot {
+            pid: 42,
+            started_at: 100,
+            name: "codex".into(),
+            cmd: "codex".into(),
+            argv: vec!["codex".into()],
+            cwd: "/tmp/project".into(),
+        };
+        assert_eq!(validated_process_creation_ticks(&snapshot), Some(0));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_creation_tick_validation_accepts_only_the_same_snapshot_identity() {
+        let snapshot = take_process_snapshot()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("测试进程应该在系统快照里");
+        let ticks = validated_process_creation_ticks(&snapshot)
+            .expect("当前测试进程的 generation 应可被双重验证");
+        assert_ne!(ticks, 0);
+
+        let mut stale = snapshot;
+        stale.cmd.push_str(" --different-generation");
+        assert_eq!(validated_process_creation_ticks(&stale), None);
     }
 
     #[test]
@@ -455,6 +654,7 @@ mod tests {
             started_at: 100,
             name: "codex".into(),
             cmd: "codex".into(),
+            argv: vec!["codex".into()],
             cwd: "/tmp/project".into(),
         };
         let mut replacement = base.clone();

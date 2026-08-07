@@ -616,8 +616,9 @@ impl Detector {
         if let Ok(last) = NaiveDateTime::parse_from_str(&session.last_activity, "%Y-%m-%d %H:%M:%S")
         {
             let elapsed = now.naive_local() - last;
-            let timeout =
-                self.config.idle_timeout_secs * self.config.idle_threshold as u64 * stale_grace;
+            // `idle_threshold` 的产品语义是“连续无活动次数”，由 monitor 里的
+            // 时序 reducer 逐轮累计；这里仅判断本轮是否已经超过单次空闲时长。
+            let timeout = self.config.idle_timeout_secs * stale_grace;
             if elapsed.num_seconds() as u64 > timeout {
                 signals.push(DetectionSignal {
                     kind: SignalKind::HeartbeatTimeout,

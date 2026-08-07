@@ -3,7 +3,6 @@ import { ConfigPanel } from "./components/ConfigPanel";
 import { CostPanel } from "./components/CostPanel";
 import { DashboardPanel } from "./components/DashboardPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
-import { ResumeRecordsPanel } from "./components/ResumeRecordsPanel";
 import { StatsPanel } from "./components/StatsPanel";
 import {
   Badge,
@@ -83,10 +82,10 @@ export default function App() {
       <Tabs
         value={activeTab}
         onValueChange={(value) => setActiveTab(value as TabId)}
-        className="flex h-screen flex-col bg-[#fafafa]"
+        className="app-shell flex h-screen min-w-0 flex-col bg-[#fafafa]"
       >
-        <header className="titlebar-drag flex items-center justify-between gap-4 border-b border-neutral-200 bg-white px-6 py-3">
-          <div className="flex min-w-0 items-center gap-3">
+        <header className="app-header titlebar-drag border-b border-neutral-200 bg-white px-6 py-3">
+          <div className="app-brand flex min-w-0 items-center gap-3">
             <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-neutral-900 text-xs font-bold text-white">
               A
             </div>
@@ -97,23 +96,23 @@ export default function App() {
               <p className="truncate text-[10px] text-neutral-400">{t("app.subtitle")}</p>
             </div>
             {running ? (
-              <Badge tone="green" className="ml-1">
+              <Badge tone="green" className="app-status-badge ml-1">
                 <span className="h-1.5 w-1.5 animate-pulse-soft rounded-full bg-emerald-500" />
                 {t("app.running")}
               </Badge>
             ) : (
-              <Badge className="ml-1">{t("app.stopped")}</Badge>
+              <Badge className="app-status-badge ml-1">{t("app.stopped")}</Badge>
             )}
           </div>
-          <TabsList className="titlebar-no-drag shrink-0">
+          <TabsList className="app-tabs titlebar-no-drag">
             {TABS.map((tab) => (
-              <TabsTrigger key={tab.id} value={tab.id}>
+              <TabsTrigger className="app-tab-trigger" key={tab.id} value={tab.id}>
                 {t(tab.label)}
               </TabsTrigger>
             ))}
           </TabsList>
 
-          <div className="titlebar-no-drag flex shrink-0 items-center gap-2">
+          <div className="app-actions titlebar-no-drag flex items-center gap-2">
             <Button disabled={loading} onClick={() => void scanNow()}>
               {t("btn.scan_now")}
             </Button>
@@ -127,29 +126,28 @@ export default function App() {
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-6">
-          <TabsContent value="dashboard" className="animate-fade-in">
+        <main className="app-main min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-6">
+          <TabsContent value="dashboard" className="min-w-0 animate-fade-in">
             <DashboardPanel />
           </TabsContent>
-          <TabsContent value="stats" className="animate-fade-in">
+          <TabsContent value="stats" className="min-w-0 animate-fade-in">
             <StatsPanel />
           </TabsContent>
-          <TabsContent value="cost" className="animate-fade-in">
+          <TabsContent value="cost" className="min-w-0 animate-fade-in">
             <CostPanel />
           </TabsContent>
-          {/* 会话历史和续跑记录都是「过去发生了什么」，放同一页；
-              续跑记录在下，因为它是排查用的，会话历史才是先看的那个 */}
-          <TabsContent value="history" className="animate-fade-in space-y-4">
+          {/* 历史页默认只呈现会话档案；逐次续跑记录由 HistoryPanel 收进
+              按需展开的诊断入口，避免与会话详情里的续跑时间线重复。 */}
+          <TabsContent value="history" className="min-w-0 animate-fade-in">
             <HistoryPanel />
-            <ResumeRecordsPanel />
           </TabsContent>
-          <TabsContent value="config" className="animate-fade-in">
+          <TabsContent value="config" className="min-w-0 animate-fade-in">
             <ConfigPanel />
           </TabsContent>
         </main>
-        <footer className="flex items-center justify-between gap-4 border-t border-neutral-200 bg-white px-6 py-2 text-[10px] text-neutral-400">
+        <footer className="app-footer flex items-center justify-between gap-4 border-t border-neutral-200 bg-white px-6 py-2 text-[10px] text-neutral-400">
           <span className="tabular-nums">AgentPulse v{APP_VERSION}</span>
-          <div className="flex items-center gap-4 tabular-nums">
+          <div className="app-footer-meta flex min-w-0 items-center gap-4 tabular-nums">
             {(status.resume_pending > 0 || status.resume_verifying > 0) && (
               <span className="font-medium text-amber-600">
                 {t("footer.resume_pipeline", {

@@ -20,6 +20,7 @@ vi.mock("../lib/chime", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import type { AgentSession } from "../types";
 import { useAppStore } from "./useAppStore";
 
 const mockedInvoke = vi.mocked(invoke);
@@ -110,7 +111,14 @@ describe("useAppStore — 命令归约", () => {
       },
     });
 
-    const result = await useAppStore.getState().manualResume("s1");
+    const result = await useAppStore
+      .getState()
+      .manualResume("s1", "s1:4242:opaque-generation");
+    expect(mockedInvoke).toHaveBeenNthCalledWith(1, "manual_resume", {
+      sessionId: "s1",
+      runtimeGeneration: "s1:4242:opaque-generation",
+      useGoalPrompt: false,
+    });
     expect(result.ok).toBe(true);
     expect(result.message).toBe("已续跑");
   });
@@ -120,9 +128,44 @@ describe("useAppStore — 命令归约", () => {
     // fetchState 也会调 invoke
     mockedInvoke.mockResolvedValueOnce(useAppStore.getState().monitorState);
 
-    const result = await useAppStore.getState().manualResume("s1");
+    const result = await useAppStore
+      .getState()
+      .manualResume("s1", "stale-runtime-generation");
+    expect(mockedInvoke).toHaveBeenNthCalledWith(1, "manual_resume", {
+      sessionId: "s1",
+      runtimeGeneration: "stale-runtime-generation",
+      useGoalPrompt: false,
+    });
     expect(result.ok).toBe(false);
     expect(result.message).toBe("定位不到 Windsurf");
+  });
+
+  it("manualResume 原样提交旧行的 runtime generation，不按同 ID 当前状态重新绑定", async () => {
+    const staleGeneration = "s1:old-process:opaque";
+    const currentRow = {
+      id: "s1",
+      runtime_generation: "s1:new-process:opaque",
+    } as AgentSession;
+    useAppStore.setState((state) => ({
+      monitorState: {
+        ...state.monitorState,
+        sessions: [currentRow],
+      },
+    }));
+    mockedInvoke.mockRejectedValueOnce("STALE_TARGET");
+    mockedInvoke.mockResolvedValueOnce(useAppStore.getState().monitorState);
+
+    const result = await useAppStore
+      .getState()
+      .manualResume("s1", staleGeneration, true);
+
+    expect(mockedInvoke).toHaveBeenNthCalledWith(1, "manual_resume", {
+      sessionId: "s1",
+      runtimeGeneration: staleGeneration,
+      useGoalPrompt: true,
+    });
+    expect(mockedInvoke.mock.calls[0]?.[1]).not.toHaveProperty("pid");
+    expect(result).toEqual({ ok: false, message: "STALE_TARGET" });
   });
 
   it("probeResume 原样透传后端的演练结论", async () => {

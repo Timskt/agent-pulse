@@ -26,15 +26,16 @@
 | Warp | `refused`（默认） | `定位不到 Warp`（无脚本接口） | ☐ |
 | 未安装 / 已退出的 App | `refused` | `应用未在运行` 或 `定位不到` | ☐ |
 
-### 1.2 真实续跑（有风险，确认演练结果后再做）
+### 1.2 自动静默与手动前台
 
 | 终端 | 验证点 | 通过 |
 |---|---|---|
-| iTerm2 | 中文提示词完整落入正确标签，不变"啊啊啊" | ☐ |
-| Terminal.app | 同上；多标签时只落到 TTY 对应的那个 | ☐ |
-| VS Code | 提示词落入集成终端而非编辑器；焦点在编辑器时应拒绝 | ☐ |
-| Warp（开盲敲） | 提示词落入前台 Warp 窗口 | ☐ |
-| 盲敲=关 + 定位不到 | 不敲任何字，返回"定位不到"错误 | ☐ |
+| iTerm2 exact TTY（自动） | 在其他应用工作时后台 `write text` 到正确 session；不 activate、不 select，transcript 有精确 prompt | ☐ |
+| Terminal.app（自动） | 显示延后，不切换窗口、不输入 | ☐ |
+| VS Code / Cursor / Windsurf（自动） | 显示延后，不把文本写入编辑器或当前终端 | ☐ |
+| Terminal.app（手动） | 用户点击后才允许选择 TTY 对应标签并输入，中文完整 | ☐ |
+| IDE 集成终端（手动） | 证据唯一时输入到集成终端；无法精确定位时拒绝 | ☐ |
+| Warp / 未知目标 | 自动延后；手动也必须满足显式盲跟随配置，默认拒绝 | ☐ |
 
 ### 1.3 辅助功能权限
 
@@ -46,30 +47,64 @@
 
 ## 2. Windows
 
-### 2.1 演练定位
+> v1.10 不把外部 Windows console 宣称为可按 PID 精确寻址的后台 transport。`AttachConsole` /
+> `WriteConsoleInputW` 操作的是 console 级共享输入缓冲，不能保证输入只进入某个目标 CLI。因此
+> classic cmd/conhost、Windows Terminal/ConPTY 和 IDE 集成终端的**自动路径都应安全延后**；
+> 只有用户明确点击“续跑”后，才允许前台定位并使用 Unicode `SendInput`。以下路径尚未完成正式
+> Windows 真机复测。
 
-| 终端 | 预期 level | 预期 message 关键词 | 通过 |
-|---|---|---|---|
-| cmd / conhost | `exact` | `精确匹配` + 窗口标题 | ☐ |
-| Windows Terminal（单标签） | `exact` | 同上 | ☐ |
-| Windows Terminal（多标签） | `window` | `窗口级匹配` + 标题含项目名 | ☐ |
-| VS Code 集成终端 | `window` | `窗口级匹配 Code` | ☐ |
-| Hyper / Tabby / ConEmu | `window` | 多标签宿主标题匹配 | ☐ |
-| 找不到窗口 | `refused` | `定位不到` | ☐ |
+### 2.1 自动安全延后矩阵（P0）
 
-### 2.2 真实续跑
+| 终端 / 场景 | 自动模式预期 | 通过 |
+|---|---|---|
+| classic `cmd.exe` / conhost 中的外部 Codex CLI | `deferred/no-safe-transport`；不附加/写入共享 console input buffer | ☐ |
+| Windows Terminal / ConPTY 中既有会话 | `deferred/no-safe-transport`；不激活窗口、不输入 | ☐ |
+| VS Code / Cursor / Windsurf 集成终端 | 延后；不得把文本写进编辑器或当前终端 | ☐ |
+| 多标签终端且无法精确到目标标签 | 延后；不能因标题相似而抢焦点 | ☐ |
+| 无 transcript / 协议确认 | 延后；不能把 transport ACK 冒充 `Landed` | ☐ |
+| PID 已退出或被复用 | 拒绝/取消；不向新进程或当前窗口补敲 | ☐ |
+
+逐项确认：不切换前台、不抢焦点、不输入、不读取或覆盖剪贴板、不弹 PowerShell 窗口，且不增加
+成功/失败统计、不消耗续跑连击。
+
+### 2.2 用户手动点击：前台 Unicode SendInput（P0）
+
+前置：在经典 `cmd.exe` 中启动 Codex CLI，确保进程命令行、唯一窗口目标与 transcript 能被
+AgentPulse 关联。提示词建议包含 ASCII、中文、emoji 和单引号，例如：
+`请继续 v1.10's check ✅`。
+
+- [ ] 自动续跑先显示安全延后；只有点击“续跑”后才进入前台路径；
+- [ ] 点击后重新核验目标进程代际；目标退出、PID 复用或窗口不唯一时明确拒绝；
+- [ ] 只激活证据唯一匹配的目标窗口，不把文本写入当前编辑器、其他终端或相似标题窗口；
+- [ ] 使用 Unicode `SendInput` 发送**完整提示词**，所有字符顺序正确；
+- [ ] 文本事件完成后再独立发送 Enter，Codex 实际提交提示词，**不能只多一个换行**；
+- [ ] 不出现 `Failed to paste image: no image on clipboard`；
+- [ ] 用户剪贴板前后保持不变，不发送 `Ctrl+V` / `SendKeys`；
+- [ ] 不弹出可见 PowerShell 窗口；
+- [ ] transcript 基线之后出现与本次提示词精确相等的整个 user message；
+- [ ] 匹配文本旁带额外文本 block 或图片 block 时不误报 `Landed`；
+- [ ] 只有 mtime/assistant/tool 记录变化时不显示 `Landed`；
+- [ ] 文本事件未完整发送、焦点在提交前变化或目标代际失效时明确失败，不补敲到当前窗口。
+
+请记录：Windows 版本、终端宿主与版本、Codex CLI 版本、AgentPulse 构建、prompt、目标 PID、
+窗口证据、transcript 路径、实际 outcome 和日志。
+
+### 2.3 其他手动前台路径
+
+只有用户明确点击“续跑”时才允许测试：
 
 | 终端 | 验证点 | 通过 |
 |---|---|---|
-| cmd | 中文提示词完整送入，无乱码 | ☐ |
-| Windows Terminal 多标签 | 只送到标题匹配的那个标签 | ☐ |
-| VS Code | 送入集成终端而非编辑器 | ☐ |
-| 盲敲=关 + 找不到窗口 | 不发送，返回拒绝 | ☐ |
+| Windows Terminal 多标签 | 只发送到标题/进程证据唯一匹配的目标；并列或冲突时拒绝 | ☐ |
+| VS Code / Cursor | 明确定位到终端后才允许前台输入，不能写入编辑器 | ☐ |
+| classic cmd/conhost | 前台 Unicode 文本 + 独立 Enter 完整进入，不使用 console 共享缓冲冒充精确后台通道 | ☐ |
+| 找不到窗口 | 返回拒绝，不盲敲当前窗口 | ☐ |
 
-### 2.3 特殊环境
+### 2.4 特殊环境
 
-- [ ] Git Bash / MSYS2 下 TTY 为 None，走窗口标题路径
-- [ ] 管理员权限终端 vs 普通权限终端的 UIPI 隔离提示
+- [ ] Git Bash / MSYS2 下 TTY 为 None 时，自动模式不因此放宽为前台输入
+- [ ] 管理员权限终端 vs 普通权限 AgentPulse 的 UIPI/前台输入失败有明确提示
+- [ ] 手动投递全程没有可见 PowerShell 窗口
 
 ## 3. Linux
 
@@ -82,13 +117,15 @@
 | VS Code 集成终端 (X11) | `window` | 同上 | ☐ |
 | 任何终端 (Wayland) | `refused` | `定位不到`（xdotool 不可用） | ☐ |
 
-### 3.2 真实续跑
+### 3.2 自动延后与手动前台
 
 | 终端 / 桌面 | 验证点 | 通过 |
 |---|---|---|
-| GNOME Terminal (X11) | xdotool 聚焦 + 剪贴板粘贴成功 | ☐ |
-| ydotool 路径 (Wayland) | uinput 权限就绪后可用；无权限时报明确错误 | ☐ |
-| 盲敲=关 + 无窗口 | 不操作，返回拒绝 | ☐ |
+| GNOME Terminal / Kitty / Alacritty（自动） | 返回延后，不运行 xdotool/ydotool、不激活窗口 | ☐ |
+| VS Code 集成终端（自动） | 返回延后，不写入编辑器或前台终端 | ☐ |
+| GNOME Terminal X11（手动） | 用户点击后才允许 xdotool 聚焦 + 剪贴板粘贴 | ☐ |
+| Wayland ydotool（手动） | 用户点击且 uinput 权限就绪后可用；无权限明确失败 | ☐ |
+| 无窗口/未知目标 | 自动延后；手动拒绝，不操作当前窗口 | ☐ |
 
 ### 3.3 权限
 
@@ -123,12 +160,13 @@
 | 二次启动 | 应用已在跑时再启动一次 → **不出现第二个窗口**，原窗口切到前台 | ☐ |
 | 托盘里的旧版 | 装新版前先退出旧版；忘了退也只会有一个进程在守护 | ☐ |
 | 不重复续跑 | 制造一次中断 → 记录中心里那个时间点**只有一条**续跑记录 | ☐ |
+| 活跃账本不被二次启动破坏 | 首实例正在投递时再次启动应用 → 第二实例退出且不得把首实例的 `delivering/transport_acked` attempt 改成 `unverifiable`；首实例仍能正常 ACK/finalize | ☐ |
 
 ## 7. 续跑记录中心 & 统计趋势（v1.7）
 
 | 项 | 验证点 | 通过 |
 |---|---|---|
-| 四态徽标 | 记录里能分别看到「已落地 / 没反应 / 没送达 / 无法核验」，颜色各不同 | ☐ |
+| outcome 徽标 | 记录里能区分「已落地 / 没反应 / 没送达 / 无法核验 / 已延后」；延后不显示成成功或失败 | ☐ |
 | 悬浮解释 | 鼠标停在左侧圆标上 → 出现「所以我该去查什么」那句话 | ☐ |
 | 旧记录 | 升级前写的记录显示「旧记录」，**不是**被补成「已落地」 | ☐ |
 | 筛选 + 搜索 | 按结果、按提示词类型筛；搜项目名 / Agent / 失败原因都能命中 | ☐ |
@@ -286,10 +324,24 @@ done
 
 | 项 | 操作与预期 | 通过 |
 |---|---|---|
+| 自动策略不前台降级 | 在 Terminal.app、Linux 普通终端、外部 Windows cmd/conhost、Windows Terminal/ConPTY、IDE 集成终端或 screen 非精确 window 触发自动条件 → 显示“延后”，当前窗口、焦点和剪贴板不变 | ☐ |
+| 手动策略才可前台 | 对同一无后台通道会话，自动先延后；随后用户点击手动续跑 → 才允许受控的前台定位/输入，未知目标仍拒绝 | ☐ |
+| 连续观测 reducer | 同一结构证据未达到 `idle_threshold` 前只显示稳定性等待；证据变化或恢复健康后观察次数重置；达到阈值才生成一次 Eligible 动作 | ☐ |
+| 精确 prompt 核验 | 投递后只追加 mtime、assistant/tool 事件或不同 prompt → 不得 `Landed`；基线之后追加完全相同的 user prompt → 才 `Landed` | ☐ |
+| Attempt 幂等 | 同一 session generation + evidence + prompt 被多入口同时触发 → ledger 只有一个 attempt 获得真实投递许可；transport ACK 与 verified 时间分开 | ☐ |
+| Deferred 记账 | 无安全 transport → attempt 为 deferred；不增加成功/失败、不消耗续跑连击、不重复刷错误通知 | ☐ |
+| 稳定逻辑历史 | 同一个 `codex resume <UUID>` 跨 CLI 进程重启仍显示一条逻辑会话；同 cwd 启动两个无显式 UUID 的 Claude 会话时保持两条独立运行记录，不得共同关联“最新 transcript”；无法精确关联的数据不按 cwd 合并 | ☐ |
+| 历史诊断折叠 | 历史页默认只拉取/展示会话档案；“续跑投递诊断”未展开时不挂载、不额外请求重复数据 | ☐ |
+| 历史汇总跟筛选 | 切换“运行中 / 已结束”后，顶部总数、运行中数、续跑数、成本与 token 汇总跟当前状态筛选一致 | ☐ |
+| 窄窗口正式验收 | 代码与静态布局已覆盖；仍需分别缩到 900×600、500×700、360×700 → 顶栏/导航/操作按钮合理换行，页面无横向滚动 | ☐ |
+| 360px 极端指标 | 在 360×700 下把次数/金额模拟成超长数字 → 顶部指标卡保持两列、数字可换行且不把页面撑出横向滚动 | ☐ |
+| 长文本不撑破 | 用超长路径、session ID、Agent 名、错误详情和 prompt → 卡片/Tooltip/记录行可截断或折行，按钮和中英文文案不溢出 | ☐ |
 | 手动连点幂等 | 同一会话快速连点两次手动续跑 → 只投递一次；第二次明确提示“续跑处理中” | ☐ |
-| Windows cmd / Codex 输入通道 | 在 Windows 的 cmd.exe 中运行 Codex CLI，点“续跑” → 不弹 PowerShell 窗口；提示词以 Unicode 原样进入并提交；不得出现 `Failed to paste image: no image on clipboard` | ☐ |
+| 旧界面行失效 | 保留旧进程行，退出并恢复同一逻辑会话（尽量制造 PID 复用），再点旧行续跑 → 后端按不透明 `runtime_generation` 返回 stale/not found，绝不重新绑定到新进程 | ☐ |
+| Windows cmd / Codex 输入通道 | 在 Windows 的 cmd.exe 中运行 Codex CLI，点“续跑” → 不弹 PowerShell 窗口；提示词以 Unicode 原样进入并提交，不能只出现一个换行；不得出现 `Failed to paste image: no image on clipboard` | ☐ |
 | 手动 / 自动同刻 | 让会话恰好满足自动续跑，同时点手动续跑 → 同一会话最终只有一条真实输入和一条记录 | ☐ |
 | 多入口扫描防重 | 后台节拍到点时同时点界面/托盘“立即扫描” → 同一会话只生成一个待处理动作 | ☐ |
+| prompt 变化不绕过账本 | 让同 generation 留下 `delivering/transport_acked/unverifiable/failed`，再切换 generic/goal 或修改提示词 → 不得创建第二次自动投递 | ☐ |
 | 扫描不被 `6 秒 × N` 阻塞 | 同时准备多个需核验的中断会话 → worker 逐个投递期间，会话状态、上次扫描时间和日志仍持续刷新 | ☐ |
 | A 核验不堵 B 投递 | 让会话 A 的记录在输入后静默、进入约 6 秒核验；此时让会话 B 自动续跑 → B 应立即进入真实投递，不等待 A 核验结束 | ☐ |
 | 手动续跑不等别人的核验 | A 仍在核验时手动续跑 B → 只需等待当下真实投递临界区，不应等待 A 的 6 秒核验窗口 | ☐ |
@@ -302,7 +354,8 @@ done
 | PID 复用不继承 | 旧 Agent 退出后启动新进程（若系统复用 PID）→ 新会话 id/历史键不同，不继承旧冷却、失败退避或自动连击 | ☐ |
 | 停止清队列 | 多会话排队时点“停止守护” → 尚未投递的自动动作全部不再执行 | ☐ |
 | 停止发生在核验阶段 | 某动作已经真实回车并进入核验后点“停止守护” → 不再派发尚未输入的动作；已输入动作仍完成核验与记账，不能伪装成没发生 | ☐ |
-| stop/start 不复活 | 停止后立刻重新开始守护 → 上一个生命周期已经排队的动作仍不能执行，只允许新扫描生成的新动作 | ☐ |
+| stop fence | 在自动投递刚越过许可检查时点击停止 → 停止调用等待不可逆输入结束；停止返回后不再出现旧输入 | ☐ |
+| stop/start 不复活 | 在通道体检等待期间停止后立刻重新开始守护 → 旧 start 不会复活成第二条扫描循环；旧动作仍不能执行 | ☐ |
 | 停止不禁手动 | 守护停止时点手动续跑 → 仍可按用户明确意图执行（但仍受会话租约、定位和进程复核约束） | ☐ |
 | 后续动作出队重验 | 多会话排队时修改开关/额度/冷却，或让后续会话恢复 → 后续动作按出队时事实取消，不按旧快照补敲 | ☐ |
 | 并发扫描不丢账 | 续跑正在落地核验时触发扫描 → 完成后 `resume_count`、`last_resume_at`、失败退避与冷却不回退 | ☐ |
@@ -311,4 +364,4 @@ done
 
 ---
 
-*最后更新：v1.10.0 — 新增投递/核验两阶段流水线、跨会话并行核验、忙会话绕行、阶段状态与停止边界验收；Windows cmd/Codex 改用隐藏 helper + Unicode SendInput，补充不弹窗、不触发图片粘贴的回归项。*
+*最后更新：v1.10.0 — 补齐自动静默安全边界、后台通道/自动延后矩阵、手动前台降级、连续观测 reducer、Attempt Ledger、精确 prompt 核验、稳定逻辑历史、360px 代码/静态覆盖，以及 Windows 手动前台 Unicode 文本 + 独立 Enter 真机复测清单；未勾选项不得宣称已验证。*

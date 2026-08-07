@@ -198,9 +198,15 @@ describe("display — 跨语言：投递核验结论", () => {
 
   it("确实读到了 Rust 那边的结论表", () => {
     // 正则失配会返回空数组，那样后面每条断言都会「通过」
-    expect(rustOutcomes).toHaveLength(4);
+    expect(rustOutcomes).toHaveLength(5);
     expect(rustOutcomes).toEqual(
-      expect.arrayContaining(["landed", "silent", "failed", "unverifiable"]),
+      expect.arrayContaining([
+        "deferred",
+        "landed",
+        "silent",
+        "failed",
+        "unverifiable",
+      ]),
     );
   });
 

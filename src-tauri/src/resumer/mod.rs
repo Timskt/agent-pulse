@@ -3,6 +3,10 @@ use crate::config::AppConfig;
 use crate::i18n::I18n;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 /// 续跑执行器 — 向中断的 Agent 发送续跑指令
 ///
@@ -18,7 +22,7 @@ use std::process::Command;
 ///
 /// 平台支持：
 /// - macOS: AppleScript + TTY 匹配（v0.1.0）
-/// - Windows: hidden PowerShell locator + Win32 Unicode `SendInput`
+/// - Windows: automatic delivery safely defers; manual delivery uses a hidden PowerShell locator + Unicode `SendInput`
 /// - Linux: xdotool / ydotool (v0.2.0)
 pub struct Resumer {
     config: AppConfig,
@@ -37,8 +41,18 @@ pub struct Resumer {
 #[derive(Debug)]
 pub(crate) struct ResumeDelivery {
     before: Option<ActivityFingerprint>,
+    prompt: String,
     detail: String,
 }
+
+// 对外继续从 resumer 暴露策略，实际定义收口在纯 `resume_core`，避免平台层复制规则。
+pub use crate::resume_core::DeliveryPolicy;
+
+/// 已确认目标仍在运行，但当前没有可精确寻址的后台投递通道。
+///
+/// 这是“安全延后”而不是投递失败：上层可据此进入冷却/等待，而不是把它记作一次
+/// 已续跑、连续失败，或自动降级成抢焦点输入。
+pub const DEFERRED_NO_SAFE_TRANSPORT: &str = "deferred/no-safe-transport";
 
 /// 一次续跑投递**在现实里**的结果
 ///
@@ -50,19 +64,21 @@ pub(crate) struct ResumeDelivery {
 /// 会话一动没动」。于是整条续跑链是**开环**的：发出动作，从不观察世界有没有变，
 /// 也就永远学不会自己坏了。
 ///
-/// 闭环靠的信号本来就躺在磁盘上：**agent 只要真的动起来，就会往自己的会话记录里
-/// 写东西**。所以投递完盯一小会儿那个文件，长了就是落地了，没长就是没落地——
-/// 至于为什么没落地（权限、焦点、输入法、通道），这一层不必知道，也正因如此
-/// 以后新增通道不需要再配一套失败识别。
+/// 闭环靠的信号本来就躺在磁盘上：投递前记录 transcript 基线，投递后只接受
+/// **基线之后新增、且与本次 prompt 精确相等的 user message**。文件仅仅变长、assistant
+/// 输出或工具簿记都不能证明文本落到了目标会话；至于未落地的原因（权限、焦点、输入法、
+/// 通道），这一层不猜测，也正因如此以后新增 transport 仍可复用同一验证契约。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeOutcome {
+    /// 当前没有符合策略的安全通道；这是安全延后，不是投递失败。
+    Deferred,
     /// 通道自己就报错了：权限不在、定位不到、脚本超时
     Failed,
-    /// 字敲出去了，而且**看见**会话动了起来
+    /// 字已投递，而且基线之后出现了与本次 prompt 精确相等的 user message
     Landed,
-    /// 字敲出去了，但盯完那一小会儿会话还是没动——按键很可能进了别的窗口
+    /// transport 接受了写入，但核验窗口内没有出现本次精确 prompt
     Silent,
-    /// 字敲出去了；这个会话没有可读的记录文件，核验不了，只能按「大概进去了」记账
+    /// transport 接受了写入，但记录文件在核验时不可用；不算成功，也不冒充失败
     Unverifiable,
 }
 
@@ -75,7 +91,7 @@ impl ResumeOutcome {
     /// 真的敲进去过。macOS 的辅助功能授权每次重新构建应用都会失效，失败因此是
     /// 系统性的，不是偶发，用户看到的就是「自动续跑好像根本不工作」。
     pub fn counts_as_nudge(&self) -> bool {
-        matches!(self, ResumeOutcome::Landed | ResumeOutcome::Unverifiable)
+        matches!(self, ResumeOutcome::Landed)
     }
 
     /// 这一次要不要计进「这条通道是不是坏了」
@@ -93,6 +109,7 @@ impl ResumeOutcome {
     /// 显示走那个，两者不共用一个字符串。
     pub fn storage_key(&self) -> &'static str {
         match self {
+            ResumeOutcome::Deferred => "deferred",
             ResumeOutcome::Failed => "failed",
             ResumeOutcome::Landed => "landed",
             ResumeOutcome::Silent => "silent",
@@ -103,6 +120,7 @@ impl ResumeOutcome {
     /// 日志里那句「结果如何」的文案键
     pub fn i18n_key(&self) -> &'static str {
         match self {
+            ResumeOutcome::Deferred => "resume.outcome_deferred",
             ResumeOutcome::Failed => "resume.outcome_failed",
             ResumeOutcome::Landed => "resume.outcome_landed",
             ResumeOutcome::Silent => "resume.outcome_silent",
@@ -127,6 +145,76 @@ const VERIFY_POLL_MS: u64 = 300;
 /// agent 自然拿不到指纹，那种情况是「核验不可用」（[`ResumeOutcome::Unverifiable`]），
 /// 不是失败——宁可少管，也不要给一个本来好使的通道判死刑。
 pub(crate) type ActivityFingerprint = (u64, std::time::SystemTime);
+
+fn content_contains_exact_prompt(content: &serde_json::Value, prompt: &str) -> bool {
+    if content.as_str().is_some_and(|text| text == prompt) {
+        return true;
+    }
+    content.as_array().is_some_and(|blocks| {
+        let [block] = blocks.as_slice() else {
+            return false;
+        };
+        matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("text" | "input_text")
+        ) && block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text == prompt)
+    })
+}
+
+fn json_line_contains_user_prompt(line: &str, prompt: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    match (
+        value.get("type").and_then(serde_json::Value::as_str),
+        value
+            .pointer("/payload/type")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        (Some("event_msg"), Some("user_message")) => value
+            .pointer("/payload/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text == prompt),
+        (Some("response_item"), Some("message"))
+            if value
+                .pointer("/payload/role")
+                .and_then(serde_json::Value::as_str)
+                == Some("user") =>
+        {
+            value
+                .pointer("/payload/content")
+                .is_some_and(|content| content_contains_exact_prompt(content, prompt))
+        }
+        (Some("user"), _) => value
+            .pointer("/message/content")
+            .is_some_and(|content| content_contains_exact_prompt(content, prompt)),
+        _ => false,
+    }
+}
+
+/// 只接受“基线之后新增了本次 user prompt”作为落地证据。mtime/文件长度变化可能只是
+/// agent 自己写了一行簿记，不能证明本次输入进了正确会话。
+fn transcript_contains_prompt_since(path: &Path, baseline_len: u64, prompt: &str) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(current_len) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    if current_len <= baseline_len || file.seek(SeekFrom::Start(baseline_len)).is_err() {
+        return false;
+    }
+    let mut appended = String::new();
+    if file.read_to_string(&mut appended).is_err() {
+        return false;
+    }
+    appended
+        .lines()
+        .any(|line| json_line_contains_user_prompt(line, prompt))
+}
 
 pub(crate) fn activity_fingerprint(session: &AgentSession) -> Option<ActivityFingerprint> {
     let path = session.session_file.as_ref()?;
@@ -1384,25 +1472,38 @@ impl Resumer {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn outcome_text(&self, raw: &str) -> String {
         match raw {
-            "matched" | "vscode-window" => self.i18n.t("resume.matched").to_string(),
-            "fallback" | "generic" | "warp" | "no-project-match" => {
-                self.i18n.t("resume.followed").to_string()
+            "matched" | "matched-console" | "matched-input" | "vscode-window" => {
+                self.i18n.t("resume.matched").to_string()
             }
+            "fallback" | "fallback-console" | "fallback-input" | "generic" | "warp"
+            | "no-project-match" => self.i18n.t("resume.followed").to_string(),
             other => self.i18n.tf("resume.outcome_other", &[("raw", other)]),
         }
     }
 
-    /// 执行续跑
-    /// `use_goal_prompt`: 是否使用 Goal 专用提示词（检测到活跃 goal 时为 true）
+    /// 执行自动续跑。
     ///
-    /// 通道优先级：**先 tmux/screen，再 GUI 终端**。
-    /// 复用器那条路按 pane id 寻址、不经输入法、不需要前台窗口，
-    /// 确定性比任何 AppleScript / SendKeys / xdotool 路径都高一档，
-    /// 所以只要认得出来就用它，认不出来才退回到窗口定位。
+    /// 默认策略故意是 [`DeliveryPolicy::BackgroundOnly`]：调用方没有显式声明“这是用户
+    /// 手动点击”时，绝不能因为后台通道不可用就抢占前台窗口。
     pub async fn resume(
         &self,
         session: &AgentSession,
         use_goal_prompt: bool,
+    ) -> Result<String, String> {
+        self.resume_with_policy(session, use_goal_prompt, DeliveryPolicy::BackgroundOnly)
+            .await
+    }
+
+    /// 按指定可见性策略执行续跑。
+    ///
+    /// 通道优先级：**先 tmux/screen，再平台后台通道，最后（仅手动策略）GUI 终端**。
+    /// 复用器和原生控制台按会话端点寻址、不经输入法、不需要前台窗口，确定性比任何
+    /// AppleScript / SendInput / xdotool 路径都高一档。
+    pub async fn resume_with_policy(
+        &self,
+        session: &AgentSession,
+        use_goal_prompt: bool,
+        policy: DeliveryPolicy,
     ) -> Result<String, String> {
         // 检测和真正投递之间可能隔着通知、AI 仲裁以及前一个会话的 6 秒核验。
         // 这期间进程完全可能已经退出；若还按旧 PID 去找终端，开启盲跟随后尤其危险，
@@ -1417,23 +1518,33 @@ impl Resumer {
             &self.config.resume_prompt
         };
 
-        if let Some(result) = self.try_resume_mux(session, prompt).await {
+        // 无人值守动作必须先建立本次 transcript 基线，才能在投递后确认文本确实
+        // 落到了这个 Agent。路径存在但文件不可读/已被删除同样不可核验；不能先盲投
+        // 再把结果记成 Unverifiable。
+        if policy == DeliveryPolicy::BackgroundOnly && activity_fingerprint(session).is_none() {
+            return Err(DEFERRED_NO_SAFE_TRANSPORT.to_string());
+        }
+
+        if let Some(result) = self.try_resume_mux(session, prompt, policy).await {
             return result;
         }
 
+        #[cfg(not(target_os = "windows"))]
+        let _ = policy;
+
         #[cfg(target_os = "macos")]
         {
-            self.resume_macos(session, prompt).await
+            self.resume_macos(session, prompt, policy).await
         }
 
         #[cfg(target_os = "windows")]
         {
-            self.resume_windows(session, prompt).await
+            self.resume_windows(session, prompt, policy).await
         }
 
         #[cfg(target_os = "linux")]
         {
-            self.resume_linux(session, prompt).await
+            self.resume_linux(session, prompt, policy).await
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -1452,9 +1563,32 @@ impl Resumer {
         session: &AgentSession,
         use_goal_prompt: bool,
     ) -> Result<ResumeDelivery, String> {
+        self.deliver_with_policy(session, use_goal_prompt, DeliveryPolicy::BackgroundOnly)
+            .await
+    }
+
+    /// 手动入口可显式传入 [`DeliveryPolicy::AllowForeground`]；自动入口应继续调用
+    /// [`Self::deliver`]，从类型入口上避免无意间启用抢焦点降级。
+    pub(crate) async fn deliver_with_policy(
+        &self,
+        session: &AgentSession,
+        use_goal_prompt: bool,
+        policy: DeliveryPolicy,
+    ) -> Result<ResumeDelivery, String> {
         let before = activity_fingerprint(session);
-        let detail = self.resume(session, use_goal_prompt).await?;
-        Ok(ResumeDelivery { before, detail })
+        let prompt = if use_goal_prompt {
+            self.config.goal_resume_prompt.clone()
+        } else {
+            self.config.resume_prompt.clone()
+        };
+        let detail = self
+            .resume_with_policy(session, use_goal_prompt, policy)
+            .await?;
+        Ok(ResumeDelivery {
+            before,
+            prompt,
+            detail,
+        })
     }
 
     /// 在锁外核验一次已经完成的投递。
@@ -1466,8 +1600,15 @@ impl Resumer {
         session: &AgentSession,
         delivery: ResumeDelivery,
     ) -> (ResumeOutcome, String) {
-        let ResumeDelivery { before, detail } = delivery;
-        let Some(before) = before else {
+        let ResumeDelivery {
+            before,
+            prompt,
+            detail,
+        } = delivery;
+        let Some((baseline_len, _)) = before else {
+            return (ResumeOutcome::Unverifiable, detail);
+        };
+        let Some(session_file) = session.session_file.as_deref() else {
             return (ResumeOutcome::Unverifiable, detail);
         };
 
@@ -1475,7 +1616,7 @@ impl Resumer {
             tokio::time::Instant::now() + std::time::Duration::from_secs(VERIFY_WINDOW_SECS);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(VERIFY_POLL_MS)).await;
-            if activity_fingerprint(session).is_some_and(|now| now != before) {
+            if transcript_contains_prompt_since(Path::new(session_file), baseline_len, &prompt) {
                 return (ResumeOutcome::Landed, detail);
             }
         }
@@ -1493,6 +1634,7 @@ impl Resumer {
     ) -> (ResumeOutcome, String) {
         match self.deliver(session, use_goal_prompt).await {
             Ok(delivery) => self.verify_delivery(session, delivery).await,
+            Err(error) if error == DEFERRED_NO_SAFE_TRANSPORT => (ResumeOutcome::Deferred, error),
             Err(error) => (ResumeOutcome::Failed, error),
         }
     }
@@ -1505,13 +1647,19 @@ impl Resumer {
         &self,
         session: &AgentSession,
         prompt: &str,
+        policy: DeliveryPolicy,
     ) -> Option<Result<String, String>> {
         let target = mux_target_for_pid(session.pid)?;
 
         // screen 只能投给「该 session 当前选中的 window」，属于窗口级不确定，
         // 跟其它盲敲路径同样的门槛
-        if !target.is_exact() && !self.allow_blind_any() {
-            return Some(Err(self.i18n.t("resume.blind_refused").to_string()));
+        if !target.is_exact() {
+            if policy == DeliveryPolicy::BackgroundOnly {
+                return Some(Err(DEFERRED_NO_SAFE_TRANSPORT.to_string()));
+            }
+            if !self.allow_blind_any() {
+                return Some(Err(self.i18n.t("resume.blind_refused").to_string()));
+            }
         }
 
         tracing::info!(
@@ -1558,7 +1706,12 @@ impl Resumer {
 
     /// macOS: 通过 TTY 精确定位终端窗口并发送续跑指令
     #[cfg(target_os = "macos")]
-    async fn resume_macos(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
+    async fn resume_macos(
+        &self,
+        session: &AgentSession,
+        prompt: &str,
+        policy: DeliveryPolicy,
+    ) -> Result<String, String> {
         // 1. 获取目标进程的 TTY
         let tty = Self::get_tty_for_pid(session.pid);
         // 2. 识别终端应用
@@ -1575,10 +1728,19 @@ impl Resumer {
         );
 
         // 4. 根据终端类型生成精确的 AppleScript
-        let Some(script) = self.macos_script(&terminal_app, tty.as_deref(), &project_name, prompt)
-        else {
-            // 定位不到又没开盲敲：到此为止，连 osascript 都不启动
-            return Err(self.i18n.t("resume.blind_refused").to_string());
+        let Some(script) = self.macos_script_with_policy(
+            &terminal_app,
+            tty.as_deref(),
+            &project_name,
+            prompt,
+            policy,
+        ) else {
+            // 自动策略没有后台精确通道时正常延后；手动策略沿用可解释的拒绝。
+            return Err(if policy == DeliveryPolicy::BackgroundOnly {
+                DEFERRED_NO_SAFE_TRANSPORT.to_string()
+            } else {
+                self.i18n.t("resume.blind_refused").to_string()
+            });
         };
 
         // 5. 先问权限，再动手
@@ -1655,7 +1817,7 @@ impl Resumer {
     ///
     /// 抽成纯函数是为了能测：AppleScript 的语法错误只有真去编译一次才看得见，
     /// 而真去编译不能顺带把字敲进用户的终端。
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     fn macos_script(
         &self,
         terminal_app: &str,
@@ -1663,19 +1825,40 @@ impl Resumer {
         project_name: &str,
         prompt: &str,
     ) -> Option<String> {
+        self.macos_script_with_policy(
+            terminal_app,
+            tty,
+            project_name,
+            prompt,
+            DeliveryPolicy::AllowForeground,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_script_with_policy(
+        &self,
+        terminal_app: &str,
+        tty: Option<&str>,
+        project_name: &str,
+        prompt: &str,
+        policy: DeliveryPolicy,
+    ) -> Option<String> {
         let escaped_prompt = prompt
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('\n', "\\n");
         let allow_blind = self.allow_blind();
         let stage = stage_clipboard(&escaped_prompt);
+        if policy == DeliveryPolicy::BackgroundOnly && (terminal_app != "iTerm2" || tty.is_none()) {
+            return None;
+        }
         let script = match (terminal_app, tty) {
             // iTerm2: 遍历所有 session，按 TTY 精确匹配
             // （`write text` 直接写入伪终端，对前台 TUI 有效；仍加 timeout 兜底防挂起）
             ("iTerm2", Some(tty_path)) => {
                 // 遍历完都没对上 TTY，就说明这个会话不在 iTerm2 里（或者标签已经关了）。
                 // 老代码在这里往 `current session` 里写——那正是把字敲进别人窗口的路径。
-                let fallback = if allow_blind {
+                let fallback = if policy == DeliveryPolicy::AllowForeground && allow_blind {
                     format!(
                         r#"        tell current session of current window
             write text "{escaped_prompt}"
@@ -1685,6 +1868,11 @@ impl Resumer {
                 } else {
                     r#"        return "refused""#.to_string()
                 };
+                let select = if policy == DeliveryPolicy::AllowForeground {
+                    "select aSession"
+                } else {
+                    "-- background delivery: do not select the session"
+                };
                 format!(
                     r#"with timeout of 8 seconds
     tell application "iTerm2"
@@ -1692,7 +1880,7 @@ impl Resumer {
             repeat with aTab in tabs of aWindow
                 repeat with aSession in sessions of aTab
                     if tty of aSession contains "{tty_path}" then
-                        select aSession
+                        {select}
                         tell aSession
                             write text "{escaped_prompt}"
                         end tell
@@ -2060,27 +2248,43 @@ return "refused""#
         String::new()
     }
 
-    /// Windows: 通过隐藏的 PowerShell helper 定位终端窗口，再用 Win32 `SendInput`
-    /// 投递 UTF-16 文本。
-    ///
-    /// 策略：
-    /// 1. 通过 PID 沿父进程链找到会话所属窗口；
-    /// 2. 多标签宿主继续核对项目标题，定位不确定仍然拒绝；
-    /// 3. 前台窗口二次核验通过后，用 `KEYEVENTF_UNICODE` 逐 UTF-16 code unit 输入，
-    ///    最后单独发送 Enter。
-    ///
-    /// 这里**不能**再用剪贴板 + `Ctrl+V`：Codex CLI 会把没有被 conhost 截获的
-    /// `Ctrl+V` 当成“粘贴图片”快捷键，随后报 `Failed to paste image: no image on
-    /// clipboard`。`SendInput(KEYEVENTF_UNICODE)` 不经过键盘布局和输入法，也不会触发
-    /// CLI 的粘贴快捷键；同时完全不读写用户剪贴板。
+    /// Windows 当前没有可按 Agent 会话精确寻址的后台输入端点。
+    /// 自动策略必须在创建脚本或启动任何辅助进程之前安全延后；只有用户明确点击手动续跑，
+    /// 才允许经过进程代际核验的前台 Unicode 输入。
     #[cfg(target_os = "windows")]
-    async fn resume_windows(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
+    async fn resume_windows(
+        &self,
+        session: &AgentSession,
+        prompt: &str,
+        policy: DeliveryPolicy,
+    ) -> Result<String, String> {
+        match policy {
+            DeliveryPolicy::BackgroundOnly => Err(DEFERRED_NO_SAFE_TRANSPORT.to_string()),
+            DeliveryPolicy::AllowForeground => {
+                self.resume_windows_manual_foreground(session, prompt).await
+            }
+        }
+    }
+
+    /// 只有用户明确触发的策略才能进入这里。把辅助进程启动与自动分支物理拆开，避免后续
+    /// 新增定位逻辑时不小心让 `BackgroundOnly` 穿透到前台输入。
+    #[cfg(target_os = "windows")]
+    async fn resume_windows_manual_foreground(
+        &self,
+        session: &AgentSession,
+        prompt: &str,
+    ) -> Result<String, String> {
         let project_name = project_name_of(&session.working_dir);
-        let ps_script =
-            Self::windows_resume_script(session.pid, prompt, project_name, self.allow_blind());
+        let ps_script = Self::windows_resume_script(
+            session.pid,
+            session.process_created_at_ticks,
+            prompt,
+            project_name,
+            self.allow_blind(),
+        );
 
         tracing::info!(
-            "[Resumer] 会话 {} → PID {}, 项目: {}",
+            "[Resumer] 手动前台续跑：会话 {} → PID {}, 项目: {}",
             session.id,
             session.pid,
             project_name
@@ -2095,13 +2299,12 @@ return "refused""#
         .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // 脚本自己判断出“不能安全投递”时是正常退出的，所以先看结果码再看退出码。
         let raw = stdout.lines().last().unwrap_or_default().trim();
         match raw {
             "REFUSED" => return Err(self.i18n.t("resume.blind_refused").to_string()),
             "NO_FOCUS" => return Err(self.i18n.t("resume.focus_failed").to_string()),
             "INPUT_FAILED" => return Err(self.i18n.t("resume.input_failed").to_string()),
-            "NO_WINDOW" => {
+            "STALE_TARGET" | "NO_WINDOW" => {
                 return Err(self
                     .i18n
                     .tf("resume.no_window", &[("pid", &session.pid.to_string())]))
@@ -2120,21 +2323,41 @@ return "refused""#
         }
     }
 
-    /// Windows 续跑脚本的生成器。
+    /// 兼容原有脚本生成 API：显式生成允许前台降级的“手动续跑”脚本。
     ///
-    /// **故意不加 `#[cfg(target_os = "windows")]`**：脚本内容是纯字符串拼接，
-    /// 不依赖当前平台 API，因此三个平台的 CI 都会编译和测试它。
-    ///
-    /// 定位安全边界保持不变：沿父进程链找宿主，多标签宿主必须核标题，真正输入前
-    /// 必须确认目标窗口仍是前台。变化只发生在输入算法：不再借剪贴板并发送 `Ctrl+V`，
-    /// 而是调用 Win32 `SendInput` 的 Unicode 模式。这样 cmd/conhost 不需要替应用拦截
-    /// 粘贴快捷键，Codex 也不会把续跑误判为“粘贴图片”。
+    /// 自动续跑不会生成脚本；保留这个包装器只用于显式的手动前台投递。
     pub fn windows_resume_script(
         pid: u32,
+        process_created_at_ticks: u64,
         prompt: &str,
         project_name: &str,
         allow_blind: bool,
     ) -> String {
+        Self::windows_resume_script_with_policy(
+            pid,
+            process_created_at_ticks,
+            prompt,
+            project_name,
+            allow_blind,
+            DeliveryPolicy::AllowForeground,
+        )
+    }
+
+    /// Windows 续跑脚本生成器。
+    ///
+    /// **故意不加 `#[cfg(target_os = "windows")]`**：三平台 CI 都能审查自动策略是否
+    /// 纯延后，以及手动脚本是否只保留代际核验后的 Unicode 前台输入。
+    pub fn windows_resume_script_with_policy(
+        pid: u32,
+        process_created_at_ticks: u64,
+        prompt: &str,
+        project_name: &str,
+        allow_blind: bool,
+        policy: DeliveryPolicy,
+    ) -> String {
+        if policy == DeliveryPolicy::BackgroundOnly {
+            return DEFERRED_NO_SAFE_TRANSPORT.to_string();
+        }
         // PowerShell 单引号字符串不做变量展开，只需把单引号翻倍。
         let ps_literal = prompt.replace('\'', "''");
         let ps_project = project_name.replace('\'', "''");
@@ -2151,11 +2374,36 @@ Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public class WinAPI {{
+    // 此 helper 只会由用户明确触发的手动前台路径生成。
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetProcessTimes(
+        IntPtr hProcess,
+        out FILETIME lpCreationTime,
+        out FILETIME lpExitTime,
+        out FILETIME lpKernelTime,
+        out FILETIME lpUserTime);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    // 以下 API 只属于手动前台投递。
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILETIME {{
+        public uint dwLowDateTime;
+        public uint dwHighDateTime;
+    }}
 
     [StructLayout(LayoutKind.Sequential)]
     public struct INPUT {{
@@ -2196,6 +2444,8 @@ public class WinAPI {{
         public ushort wParamH;
     }}
 
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const uint STILL_ACTIVE = 259;
     private const uint INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
@@ -2210,29 +2460,210 @@ public class WinAPI {{
         return input;
     }}
 
-    public static bool SendUnicodeText(string text) {{
-        // .NET string 本来就是 UTF-16；逐 code unit 发送也覆盖代理项对（emoji 等）。
-        INPUT[] inputs = new INPUT[(text.Length * 2) + 2];
+    public static bool IsProcessAlive(IntPtr process) {{
+        if (process == IntPtr.Zero) return false;
+        uint exitCode;
+        return GetExitCodeProcess(process, out exitCode) && exitCode == STILL_ACTIVE;
+    }}
+
+    public static IntPtr OpenAliveProcess(uint processId, out ulong creationTicks) {{
+        creationTicks = 0;
+        if (processId == 0) return IntPtr.Zero;
+        IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+        if (process == IntPtr.Zero) return IntPtr.Zero;
+
+        FILETIME creationTime;
+        FILETIME exitTime;
+        FILETIME kernelTime;
+        FILETIME userTime;
+        if (!GetProcessTimes(process, out creationTime, out exitTime, out kernelTime, out userTime)) {{
+            CloseHandle(process);
+            return IntPtr.Zero;
+        }}
+        creationTicks = ((ulong)creationTime.dwHighDateTime << 32) | creationTime.dwLowDateTime;
+        if (creationTicks == 0 || !IsProcessAlive(process)) {{
+            CloseHandle(process);
+            return IntPtr.Zero;
+        }}
+        return process;
+    }}
+
+    public static IntPtr OpenVerifiedProcess(uint processId, ulong expectedCreationTicks) {{
+        if (processId == 0 || expectedCreationTicks == 0) return IntPtr.Zero;
+        ulong actualCreationTicks;
+        IntPtr process = OpenAliveProcess(processId, out actualCreationTicks);
+        if (process == IntPtr.Zero) return IntPtr.Zero;
+        if (actualCreationTicks != expectedCreationTicks) {{
+            CloseHandle(process);
+            return IntPtr.Zero;
+        }}
+        return process;
+    }}
+
+    // 持有旧 handle 只能固定旧进程对象，不能阻止它退出或数值 PID 被复用。
+    // 每个不可逆输入阶段前都 fresh-open 当前 PID，并同时确认旧对象仍存活。
+    public static IntPtr ReopenVerifiedAliveProcess(
+        IntPtr originalProcess,
+        uint processId,
+        ulong expectedCreationTicks) {{
+        if (!IsProcessAlive(originalProcess)) return IntPtr.Zero;
+
+        IntPtr currentProcess = OpenVerifiedProcess(processId, expectedCreationTicks);
+        if (currentProcess == IntPtr.Zero) return IntPtr.Zero;
+        if (!IsProcessAlive(originalProcess) || !IsProcessAlive(currentProcess)) {{
+            CloseHandle(currentProcess);
+            return IntPtr.Zero;
+        }}
+        return currentProcess;
+    }}
+
+    // SendInput 面向全局前台窗口，无法绑定 HWND。把完整 fence 和 SendInput 收进同一个
+    // C# 调用，并在 native 调用紧邻前最后复核，尽可能缩短 PowerShell 与输入之间的 TOCTOU。
+    private static string VerifyInputTarget(
+        IntPtr originalAgentProcess,
+        uint agentProcessId,
+        ulong expectedAgentCreationTicks,
+        IntPtr originalHostProcess,
+        uint hostProcessId,
+        ulong expectedHostCreationTicks,
+        IntPtr expectedHwnd,
+        out IntPtr currentAgentProcess,
+        out IntPtr currentHostProcess) {{
+        currentAgentProcess = IntPtr.Zero;
+        currentHostProcess = IntPtr.Zero;
+
+        currentAgentProcess = ReopenVerifiedAliveProcess(
+            originalAgentProcess, agentProcessId, expectedAgentCreationTicks);
+        if (currentAgentProcess == IntPtr.Zero) return "STALE_TARGET";
+
+        currentHostProcess = ReopenVerifiedAliveProcess(
+            originalHostProcess, hostProcessId, expectedHostCreationTicks);
+        if (currentHostProcess == IntPtr.Zero) {{
+            CloseHandle(currentAgentProcess);
+            currentAgentProcess = IntPtr.Zero;
+            return "STALE_TARGET";
+        }}
+
+        uint windowOwnerProcessId;
+        if (!IsWindow(expectedHwnd)
+            || GetWindowThreadProcessId(expectedHwnd, out windowOwnerProcessId) == 0
+            || windowOwnerProcessId != hostProcessId) {{
+            return "STALE_TARGET";
+        }}
+        if (GetForegroundWindow() != expectedHwnd) return "REFUSED";
+
+        // fresh handle 打开后对象仍可能退出；在返回 READY 前再次完整复核。调用方随后立即
+        // SendInput，中间不再执行 PowerShell、sleep、窗口切换或其他可阻塞操作。
+        if (!IsProcessAlive(originalAgentProcess)
+            || !IsProcessAlive(currentAgentProcess)
+            || !IsProcessAlive(originalHostProcess)
+            || !IsProcessAlive(currentHostProcess)) {{
+            return "STALE_TARGET";
+        }}
+        if (!IsWindow(expectedHwnd)
+            || GetWindowThreadProcessId(expectedHwnd, out windowOwnerProcessId) == 0
+            || windowOwnerProcessId != hostProcessId) {{
+            return "STALE_TARGET";
+        }}
+        return GetForegroundWindow() == expectedHwnd ? "READY" : "REFUSED";
+    }}
+
+    private static void CloseFreshProcesses(IntPtr agentProcess, IntPtr hostProcess) {{
+        if (agentProcess != IntPtr.Zero) CloseHandle(agentProcess);
+        if (hostProcess != IntPtr.Zero) CloseHandle(hostProcess);
+    }}
+
+    // 用户明确点击后的前台 Unicode 文本输入。整段文本在一次 SendInput 中提交，
+    // 回车由独立调用发送，避免把“文本完整写入”和“确认提交”混成一个不可区分的结果。
+    public static string SendUnicodeTextVerified(
+        string text,
+        IntPtr originalAgentProcess,
+        uint agentProcessId,
+        ulong expectedAgentCreationTicks,
+        IntPtr originalHostProcess,
+        uint hostProcessId,
+        ulong expectedHostCreationTicks,
+        IntPtr expectedHwnd) {{
+        INPUT[] textInputs = new INPUT[text.Length * 2];
         int index = 0;
         foreach (char ch in text) {{
-            inputs[index++] = Key(0, ch, KEYEVENTF_UNICODE);
-            inputs[index++] = Key(0, ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+            textInputs[index++] = Key(0, ch, KEYEVENTF_UNICODE);
+            textInputs[index++] = Key(0, ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
         }}
-        inputs[index++] = Key(VK_RETURN, 0, 0);
-        inputs[index] = Key(VK_RETURN, 0, KEYEVENTF_KEYUP);
+        if (textInputs.Length == 0) return "INPUT_FAILED";
 
-        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
-        return sent == inputs.Length;
+        IntPtr currentAgentProcess;
+        IntPtr currentHostProcess;
+        string fence = VerifyInputTarget(
+            originalAgentProcess,
+            agentProcessId,
+            expectedAgentCreationTicks,
+            originalHostProcess,
+            hostProcessId,
+            expectedHostCreationTicks,
+            expectedHwnd,
+            out currentAgentProcess,
+            out currentHostProcess);
+        try {{
+            if (fence != "READY") return fence;
+            uint sent = SendInput(
+                (uint)textInputs.Length, textInputs, Marshal.SizeOf(typeof(INPUT)));
+            return sent == (uint)textInputs.Length ? "SENT" : "INPUT_FAILED";
+        }} finally {{
+            CloseFreshProcesses(currentAgentProcess, currentHostProcess);
+        }}
+    }}
+
+    public static string SendEnterVerified(
+        IntPtr originalAgentProcess,
+        uint agentProcessId,
+        ulong expectedAgentCreationTicks,
+        IntPtr originalHostProcess,
+        uint hostProcessId,
+        ulong expectedHostCreationTicks,
+        IntPtr expectedHwnd) {{
+        INPUT[] enterInputs = new INPUT[2];
+        enterInputs[0] = Key(VK_RETURN, 0, 0);
+        enterInputs[1] = Key(VK_RETURN, 0, KEYEVENTF_KEYUP);
+
+        IntPtr currentAgentProcess;
+        IntPtr currentHostProcess;
+        string fence = VerifyInputTarget(
+            originalAgentProcess,
+            agentProcessId,
+            expectedAgentCreationTicks,
+            originalHostProcess,
+            hostProcessId,
+            expectedHostCreationTicks,
+            expectedHwnd,
+            out currentAgentProcess,
+            out currentHostProcess);
+        try {{
+            if (fence != "READY") return fence;
+            uint sent = SendInput(
+                (uint)enterInputs.Length, enterInputs, Marshal.SizeOf(typeof(INPUT)));
+            return sent == (uint)enterInputs.Length ? "SENT" : "INPUT_FAILED";
+        }} finally {{
+            CloseFreshProcesses(currentAgentProcess, currentHostProcess);
+        }}
     }}
 }}
 "@
 
 $target = {pid}
+$expectedCreationTicks = [uint64]{process_created_at_ticks}
 $project = '{ps_project}'
 $prompt = '{ps_literal}'
 $allowBlind = {ps_blind}
-
-# 沿父进程链往上找第一个带窗口的祖先：agent 自己是控制台程序，窗口属于宿主
+# 自动策略不会生成或执行此脚本；这里开始就是用户明确点击后的前台路径。
+# 重新打开并核验目标进程代际；窗口定位和输入都不能按未核验的裸 PID 继续。
+$verifiedProcess = [WinAPI]::OpenVerifiedProcess([uint32]$target, $expectedCreationTicks)
+if ($verifiedProcess -eq [IntPtr]::Zero) {{
+    Write-Output "STALE_TARGET"
+    exit 0
+}}
+try {{
+# 沿父进程链往上找第一个带窗口的祖先：agent 自己是控制台程序，窗口属于宿主。
 $hostProc = $null
 $cur = $target
 for ($i = 0; $i -lt 8; $i++) {{
@@ -2250,7 +2681,16 @@ if (-not $hostProc) {{
     exit 1
 }}
 
-# 一个窗口挂多个标签的宿主：认到窗口不等于认到标签，要核标题
+$hostPid = [uint32]$hostProc.Id
+$hostCreationTicks = [uint64]0
+$verifiedHostProcess = [WinAPI]::OpenAliveProcess($hostPid, [ref]$hostCreationTicks)
+if ($verifiedHostProcess -eq [IntPtr]::Zero -or $hostCreationTicks -eq 0) {{
+    Write-Output "STALE_TARGET"
+    exit 0
+}}
+try {{
+
+# 一个窗口挂多个标签的宿主：认到窗口不等于认到标签，要核标题。
 $multiTab = @({multi_tab})
 $hostName = $hostProc.ProcessName.ToLower()
 $title = [string]$hostProc.MainWindowTitle
@@ -2268,23 +2708,94 @@ if ($located -eq "unlocated" -and -not $allowBlind) {{
 }}
 
 $hwnd = $hostProc.MainWindowHandle
+$focusHostProcess = [WinAPI]::ReopenVerifiedAliveProcess(
+    $verifiedHostProcess, $hostPid, $hostCreationTicks)
+if ($focusHostProcess -eq [IntPtr]::Zero) {{
+    Write-Output "STALE_TARGET"
+    exit 0
+}}
+try {{
+    $focusOwnerPid = [uint32]0
+    if (-not [WinAPI]::IsWindow($hwnd) -or
+        [WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$focusOwnerPid) -eq 0 -or
+        $focusOwnerPid -ne $hostPid) {{
+        Write-Output "STALE_TARGET"
+        exit 0
+    }}
+}} finally {{
+    [void][WinAPI]::CloseHandle($focusHostProcess)
+}}
 [void][WinAPI]::ShowWindow($hwnd, 9)  # SW_RESTORE
 Start-Sleep -Milliseconds 300
 [void][WinAPI]::SetForegroundWindow($hwnd)
 Start-Sleep -Milliseconds 500
-
-# SendInput 仍然投给当前前台窗口；切不过去就拒绝，不能把提示词发给别的应用。
 if ([WinAPI]::GetForegroundWindow() -ne $hwnd) {{
     Write-Output "NO_FOCUS"
     exit 0
 }}
 
-if (-not [WinAPI]::SendUnicodeText($prompt)) {{
-    Write-Output "INPUT_FAILED"
+# 多标签宿主在每一个不可逆输入阶段前都重新核标题；即使文本已经写入，只要 Enter 前
+# 标签或窗口身份发生变化，就留下未提交文本并拒绝把 Enter 交给未知输入消费者。
+if ($multiTab -contains $hostName -and -not $allowBlind) {{
+    $textHost = Get-Process -Id $hostPid -ErrorAction SilentlyContinue
+    if (-not $textHost -or $textHost.MainWindowHandle -ne $hwnd) {{
+        Write-Output "STALE_TARGET"
+        exit 0
+    }}
+    $textTitle = [string]$textHost.MainWindowTitle
+    if ($project -eq '' -or -not $textTitle.ToLower().Contains($project.ToLower())) {{
+        Write-Output "REFUSED"
+        exit 0
+    }}
+}}
+$textResult = [WinAPI]::SendUnicodeTextVerified(
+    $prompt,
+    $verifiedProcess,
+    [uint32]$target,
+    $expectedCreationTicks,
+    $verifiedHostProcess,
+    $hostPid,
+    $hostCreationTicks,
+    $hwnd)
+if ($textResult -ne "SENT") {{
+    Write-Output $textResult
     exit 0
 }}
 
-if ($located -eq "unlocated") {{ Write-Output "fallback" }} else {{ Write-Output "matched" }}
+# 文本后、Enter 前完整复验多标签窗口；C# 内部还会在 SendInput 紧邻前再次复验
+# foreground HWND、owner PID、host generation 与 agent generation/alive。
+if ($multiTab -contains $hostName -and -not $allowBlind) {{
+    $enterHost = Get-Process -Id $hostPid -ErrorAction SilentlyContinue
+    if (-not $enterHost -or $enterHost.MainWindowHandle -ne $hwnd) {{
+        Write-Output "STALE_TARGET"
+        exit 0
+    }}
+    $enterTitle = [string]$enterHost.MainWindowTitle
+    if ($project -eq '' -or -not $enterTitle.ToLower().Contains($project.ToLower())) {{
+        Write-Output "REFUSED"
+        exit 0
+    }}
+}}
+$enterResult = [WinAPI]::SendEnterVerified(
+    $verifiedProcess,
+    [uint32]$target,
+    $expectedCreationTicks,
+    $verifiedHostProcess,
+    $hostPid,
+    $hostCreationTicks,
+    $hwnd)
+if ($enterResult -ne "SENT") {{
+    Write-Output $enterResult
+    exit 0
+}}
+
+if ($located -eq "unlocated") {{ Write-Output "fallback-input" }} else {{ Write-Output "matched-input" }}
+}} finally {{
+    [void][WinAPI]::CloseHandle($verifiedHostProcess)
+}}
+}} finally {{
+    [void][WinAPI]::CloseHandle($verifiedProcess)
+}}
 "#
         )
     }
@@ -2362,7 +2873,15 @@ if ($multiTab -contains $hostName) {{
     /// 4. Wayland（拿不到窗口）时才回退到 ydotool，而 ydotool 是对着当前焦点盲敲的，
     ///    所以那条路必须先有 `auto_follow_latest` 授权
     #[cfg(target_os = "linux")]
-    async fn resume_linux(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
+    async fn resume_linux(
+        &self,
+        session: &AgentSession,
+        prompt: &str,
+        policy: DeliveryPolicy,
+    ) -> Result<String, String> {
+        if policy == DeliveryPolicy::BackgroundOnly {
+            return Err(DEFERRED_NO_SAFE_TRANSPORT.to_string());
+        }
         let pid = session.pid;
 
         // 尝试通过 xdotool 查找窗口
@@ -2560,6 +3079,174 @@ pub const YDOTOOL_PASTE_KEYS: [&str; 6] = ["29:1", "42:1", "47:1", "47:0", "42:0
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transcript_fixture(initial: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "agent-pulse-resume-verification-{}-{nonce}-{sequence}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, initial).unwrap();
+        path
+    }
+
+    #[test]
+    fn transcript_verification_requires_the_exact_new_codex_user_prompt() {
+        let path = transcript_fixture(
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"旧提示"}}
+"#,
+        );
+        let baseline = std::fs::metadata(&path).unwrap().len();
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"继续"}}}}"#
+        )
+        .unwrap();
+        assert!(
+            !transcript_contains_prompt_since(&path, baseline, "继续"),
+            "assistant/簿记增长不能冒充 user prompt 已落地"
+        );
+        writeln!(
+            file,
+            r#"{{"type":"event_msg","payload":{{"type":"user_message","message":"别的提示"}}}}"#
+        )
+        .unwrap();
+        assert!(!transcript_contains_prompt_since(&path, baseline, "继续"));
+        writeln!(
+            file,
+            r#"{{"type":"event_msg","payload":{{"type":"user_message","message":"继续"}}}}"#
+        )
+        .unwrap();
+        assert!(transcript_contains_prompt_since(&path, baseline, "继续"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn transcript_verification_preserves_prompt_boundary_whitespace() {
+        let path = transcript_fixture("");
+        let baseline = 0;
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":" 继续"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"继续\n"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert!(
+            !transcript_contains_prompt_since(&path, baseline, "继续"),
+            "首尾空白不同的 user message 不能冒充本次精确 prompt"
+        );
+
+        use std::io::Write as _;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            r#"{{"type":"event_msg","payload":{{"type":"user_message","message":"继续"}}}}"#
+        )
+        .unwrap();
+        assert!(transcript_contains_prompt_since(&path, baseline, "继续"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn transcript_verification_accepts_codex_response_item_user_content() {
+        let path = transcript_fixture("");
+        let baseline = 0;
+        std::fs::write(
+            &path,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"继续完成"}]}}
+"#,
+        )
+        .unwrap();
+        assert!(transcript_contains_prompt_since(
+            &path,
+            baseline,
+            "继续完成"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn transcript_verification_rejects_composite_user_content() {
+        for content in [
+            r#"[{"type":"input_text","text":"继续"},{"type":"input_text","text":"额外内容"}]"#,
+            r#"[{"type":"text","text":"继续"},{"type":"image","source":"clipboard"}]"#,
+        ] {
+            let path = transcript_fixture("");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":{content}}}}}
+"#
+                ),
+            )
+            .unwrap();
+            assert!(
+                !transcript_contains_prompt_since(&path, 0, "继续"),
+                "整个 user message 含额外 block 时不能冒充精确 prompt: {content}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn transcript_verification_accepts_one_exact_text_block_only() {
+        for block_type in ["text", "input_text"] {
+            let path = transcript_fixture("");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"{block_type}","text":"继续"}}]}}}}
+"#
+                ),
+            )
+            .unwrap();
+            assert!(transcript_contains_prompt_since(&path, 0, "继续"));
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn transcript_verification_accepts_claude_user_content_after_baseline_only() {
+        let old = r#"{"type":"user","message":{"content":[{"type":"text","text":"继续"}]}}
+"#;
+        let path = transcript_fixture(old);
+        let baseline = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            !transcript_contains_prompt_since(&path, baseline, "继续"),
+            "基线前已有相同提示不能证明本次投递"
+        );
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"text","text":"继续"}}]}}}}"#
+        )
+        .unwrap();
+        assert!(transcript_contains_prompt_since(&path, baseline, "继续"));
+        let _ = std::fs::remove_file(path);
+    }
 
     // ── tmux / screen 投递通道 ──
     //
@@ -2772,49 +3459,270 @@ mod tests {
     }
     // ── Windows 投递脚本 ──
     //
-    // Windows 上一个字都验不了（这台机器上没有），所以脚本生成器故意没加 cfg，
-    // 每个平台都跑下面这几条。
+    // 脚本生成器故意不加 cfg：非 Windows CI 也能验证自动路径纯延后、手动路径不再
+    // 携带任何 shared-console 或剪贴板传输。
 
-    fn win_script(project: &str, blind: bool) -> String {
-        Resumer::windows_resume_script(4242, "继续完成刚才的任务", project, blind)
+    fn win_manual_script(project: &str, blind: bool) -> String {
+        Resumer::windows_resume_script(
+            4242,
+            133_000_000_000_000_000,
+            "继续完成刚才的任务",
+            project,
+            blind,
+        )
+    }
+
+    fn win_background_result(project: &str) -> String {
+        Resumer::windows_resume_script_with_policy(
+            4242,
+            133_000_000_000_000_000,
+            "继续完成刚才的任务",
+            project,
+            false,
+            DeliveryPolicy::BackgroundOnly,
+        )
     }
 
     #[test]
-    fn windows_walks_up_to_the_host_window() {
-        // agent 是控制台程序，自己永远没有窗口：cmd.exe 直接开的会有 conhost 窗口，
-        // Windows Terminal / VS Code 里开的要往上走三四层才碰得到。
-        // 旧版只在「进程根本不存在」时才看父进程，于是正常情况一律 NO_WINDOW。
-        let script = win_script("agent-pulse", false);
+    fn windows_background_policy_is_a_pure_defer_without_any_transport() {
+        let result = win_background_result("agent-pulse");
+        assert_eq!(result, DEFERRED_NO_SAFE_TRANSPORT);
+        assert_eq!(DEFERRED_NO_SAFE_TRANSPORT, "deferred/no-safe-transport");
+
+        for forbidden in [
+            "Add-Type",
+            "powershell",
+            "PowerShell",
+            "SendInput",
+            "AttachConsole",
+            "FreeConsole",
+            "WriteConsoleInput",
+            "TryWriteConsoleText",
+            "INPUT_RECORD",
+            "KEY_EVENT_RECORD",
+            "CONIN$",
+            "OpenProcess",
+            "GetProcessTimes",
+            "SetForegroundWindow",
+            "clipboard",
+            "Clipboard",
+            "Ctrl+V",
+            "SendKeys",
+        ] {
+            assert!(
+                !result.contains(forbidden),
+                "自动路径必须纯延后，不得包含 {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_manual_policy_is_the_only_mode_with_a_foreground_path() {
+        let manual = win_manual_script("agent-pulse", true);
+        let automatic = win_background_result("agent-pulse");
+
+        assert!(manual.contains("Add-Type"));
+        assert!(manual.contains("[void][WinAPI]::ShowWindow($hwnd, 9)"));
+        assert!(manual.contains("[void][WinAPI]::SetForegroundWindow($hwnd)"));
+        assert!(manual.contains("if ([WinAPI]::GetForegroundWindow() -ne $hwnd)"));
+        assert!(manual.contains("[WinAPI]::SendUnicodeTextVerified("));
+        assert!(manual.contains("[WinAPI]::SendEnterVerified("));
+
+        assert_eq!(automatic, DEFERRED_NO_SAFE_TRANSPORT);
+        assert!(!automatic.contains("$hostProc"));
+        assert!(!automatic.contains("SendInput"));
+    }
+
+    #[test]
+    fn windows_walks_up_to_the_host_window_only_for_manual_delivery() {
+        let manual = win_manual_script("agent-pulse", false);
+        let automatic = win_background_result("agent-pulse");
+        let lookup = manual
+            .find("for ($i = 0; $i -lt 8; $i++)")
+            .expect("手动投递要沿父进程链往上找窗口");
+        let input = manual
+            .find("[WinAPI]::SendUnicodeTextVerified(")
+            .expect("手动投递要发送 Unicode 文本");
+
+        assert!(lookup < input);
+        assert!(manual.contains("Win32_Process -Filter \"ProcessId=$cur\""));
+        assert!(manual.contains("if ($cur -le 4) { break }"));
+        assert!(!automatic.contains("Win32_Process"));
+    }
+
+    #[test]
+    fn windows_manual_delivery_has_no_legacy_console_or_clipboard_transport() {
+        let script = win_manual_script("agent-pulse", true);
+        for forbidden in [
+            "AttachConsole",
+            "FreeConsole",
+            "GetConsoleProcessList",
+            "WriteConsoleInput",
+            "TryWriteConsoleText",
+            "INPUT_RECORD",
+            "KEY_EVENT_RECORD",
+            "CONIN$",
+            "SendKeys",
+            "SendWait",
+            "^v",
+            "Ctrl+V",
+            "Set-Clipboard",
+            "Get-Clipboard",
+            "System.Windows.Forms",
+            "clipboard",
+            "Clipboard",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "手动前台路径不得依赖旧 transport: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_manual_delivery_revalidates_agent_host_window_and_focus_before_each_send_input() {
+        let script = win_manual_script("agent-pulse", true);
+        assert!(script.contains("$expectedCreationTicks = [uint64]133000000000000000"));
+        assert!(script.contains("PROCESS_QUERY_LIMITED_INFORMATION"));
+        assert!(script.contains("public static extern IntPtr OpenProcess"));
+        assert!(script.contains("public static extern bool GetProcessTimes"));
+        assert!(script.contains("public static extern bool GetExitCodeProcess"));
+        assert!(script.contains("private const uint STILL_ACTIVE = 259"));
+        assert!(script.contains("actualCreationTicks != expectedCreationTicks"));
+        assert!(script.contains("public static bool IsProcessAlive"));
+        assert!(script.contains("public static IntPtr ReopenVerifiedAliveProcess"));
+
+        assert!(script.contains("public static extern bool IsWindow"));
+        assert!(script.contains("public static extern uint GetWindowThreadProcessId"));
+        assert!(script.contains("$hostCreationTicks = [uint64]0"));
+        assert!(script.contains(
+            "$verifiedHostProcess = [WinAPI]::OpenAliveProcess($hostPid, [ref]$hostCreationTicks)"
+        ));
+        assert!(script.contains("$focusOwnerPid -ne $hostPid"));
+
+        let verify_method_at = script
+            .find("private static string VerifyInputTarget")
+            .expect("每次 SendInput 都必须经过同一个完整目标 fence");
+        let text_method_at = script
+            .find("public static string SendUnicodeTextVerified")
+            .expect("文本只能通过带 fence 的方法投递");
+        let enter_method_at = script
+            .find("public static string SendEnterVerified")
+            .expect("Enter 只能通过带 fence 的方法投递");
+        let csharp_end_at = script
+            .find("\"@\n\n$target")
+            .expect("C# helper 应当完整结束");
+        let verify_method = &script[verify_method_at..text_method_at];
+        for required in [
+            "originalAgentProcess",
+            "expectedAgentCreationTicks",
+            "originalHostProcess",
+            "expectedHostCreationTicks",
+            "IsWindow(expectedHwnd)",
+            "GetWindowThreadProcessId(expectedHwnd, out windowOwnerProcessId)",
+            "windowOwnerProcessId != hostProcessId",
+            "GetForegroundWindow() != expectedHwnd",
+            "IsProcessAlive(originalAgentProcess)",
+            "IsProcessAlive(currentAgentProcess)",
+            "IsProcessAlive(originalHostProcess)",
+            "IsProcessAlive(currentHostProcess)",
+            "return \"STALE_TARGET\"",
+            "return \"REFUSED\"",
+        ] {
+            assert!(
+                verify_method.contains(required),
+                "完整输入 fence 缺少 {required}"
+            );
+        }
+
+        let text_method = &script[text_method_at..enter_method_at];
+        let enter_method = &script[enter_method_at..csharp_end_at];
+        for (name, method) in [("text", text_method), ("enter", enter_method)] {
+            let fence_at = method
+                .find("string fence = VerifyInputTarget(")
+                .unwrap_or_else(|| panic!("{name} SendInput 前缺少完整 fence"));
+            let ready_at = method
+                .find("if (fence != \"READY\") return fence;")
+                .unwrap_or_else(|| panic!("{name} 必须 fail closed"));
+            let send_at = method
+                .find("uint sent = SendInput(")
+                .unwrap_or_else(|| panic!("{name} 缺少 SendInput"));
+            assert!(fence_at < ready_at && ready_at < send_at);
+            assert!(
+                !method[ready_at..send_at].contains("Start-Sleep"),
+                "{name} fence 与 SendInput 之间不得插入阻塞操作"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_post_text_path_fully_revalidates_before_enter_and_fails_closed() {
+        let script = win_manual_script("agent-pulse", false);
+        let text_at = script
+            .find("$textResult = [WinAPI]::SendUnicodeTextVerified(")
+            .unwrap();
+        let enter_at = script
+            .find("$enterResult = [WinAPI]::SendEnterVerified(")
+            .unwrap();
+        let fence = &script[text_at..enter_at];
+
+        assert!(fence.contains("if ($textResult -ne \"SENT\")"));
+        assert!(fence.contains("Write-Output $textResult"));
+        assert!(fence.contains("exit 0"));
+        assert!(fence.contains("$enterHost = Get-Process -Id $hostPid"));
+        assert!(fence.contains("$enterHost.MainWindowHandle -ne $hwnd"));
+        assert!(fence.contains("$enterTitle = [string]$enterHost.MainWindowTitle"));
+        assert!(fence.contains(r#"Write-Output "STALE_TARGET""#));
+        assert!(fence.contains(r#"Write-Output "REFUSED""#));
+        assert!(fence.contains("$verifiedProcess"));
+        assert!(fence.contains("$verifiedHostProcess"));
+        assert!(fence.contains("$hostCreationTicks"));
+        assert!(text_at < enter_at);
+    }
+
+    #[test]
+    fn windows_manual_delivery_refuses_an_unknown_process_generation() {
+        let script = Resumer::windows_resume_script(4242, 0, "继续", "agent-pulse", false);
+        assert!(script.contains("$expectedCreationTicks = [uint64]0"));
+        assert!(script
+            .contains("if (processId == 0 || expectedCreationTicks == 0) return IntPtr.Zero;"));
+        assert!(script.contains(r#"Write-Output "STALE_TARGET""#));
+
+        let stale_at = script.find(r#"Write-Output "STALE_TARGET""#).unwrap();
+        let input_at = script.find("[WinAPI]::SendUnicodeTextVerified(").unwrap();
+        assert!(stale_at < input_at);
+    }
+
+    #[test]
+    fn windows_manual_unicode_text_is_complete_and_enter_is_a_separate_send_input() {
+        let script = win_manual_script("agent-pulse", false);
+        assert!(script.contains("INPUT[] textInputs = new INPUT[text.Length * 2]"));
+        assert!(script.contains("Key(0, ch, KEYEVENTF_UNICODE)"));
+        assert!(script.contains("Key(0, ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)"));
+        assert!(script.contains("(uint)textInputs.Length, textInputs"));
+        assert!(script.contains("Marshal.SizeOf(typeof(INPUT))"));
         assert!(
-            script.contains("for ($i = 0; $i -lt 8; $i++)"),
-            "要沿父进程链往上找"
+            script.contains("return sent == (uint)textInputs.Length ? \"SENT\" : \"INPUT_FAILED\"")
         );
-        assert!(script.contains("Win32_Process -Filter \"ProcessId=$cur\""));
-        assert!(
-            script.contains("if ($cur -le 4) { break }"),
-            "走到 System/Idle 就该停"
-        );
+
+        let text_method = script
+            .find("public static string SendUnicodeTextVerified")
+            .unwrap();
+        let enter_method = script
+            .find("public static string SendEnterVerified")
+            .unwrap();
+        assert!(text_method < enter_method, "文本和回车必须是两个独立方法");
+        assert!(script.contains("INPUT[] enterInputs = new INPUT[2]"));
+        assert!(script.contains("enterInputs[0] = Key(VK_RETURN, 0, 0)"));
+        assert!(script.contains("enterInputs[1] = Key(VK_RETURN, 0, KEYEVENTF_KEYUP)"));
+        assert!(script.contains("(uint)enterInputs.Length, enterInputs"));
+        assert!(script
+            .contains("return sent == (uint)enterInputs.Length ? \"SENT\" : \"INPUT_FAILED\""));
     }
 
     #[test]
-    fn windows_confirms_the_window_actually_came_forward() {
-        // SendInput 打的是“当时的前台窗口”，SetForegroundWindow 在后台进程里经常被拒。
-        // 不核一下，这段提示词就会落进用户正在看的窗口。
-        let script = win_script("agent-pulse", true);
-        let focus_at = script
-            .find("GetForegroundWindow() -ne $hwnd")
-            .expect("要核前台窗口");
-        let input_at = script
-            .find("[WinAPI]::SendUnicodeText($prompt)")
-            .expect("要走 Unicode SendInput");
-        assert!(focus_at < input_at, "确认前台必须在按键之前");
-    }
-
-    #[test]
-    fn windows_multi_tab_hosts_need_a_title_match() {
-        // conhost 一个窗口就是一个控制台；Windows Terminal / VS Code / IDEA
-        // 一个窗口挂好几个标签，认到窗口只等于认到应用
-        let script = win_script("agent-pulse", false);
+    fn windows_multi_tab_hosts_need_a_title_match_before_manual_input() {
+        let script = win_manual_script("agent-pulse", false);
         for host in ["windowsterminal", "code", "cursor", "idea64", "pycharm64"] {
             assert!(
                 script.contains(&format!("'{host}'")),
@@ -2830,60 +3738,41 @@ mod tests {
             .find(r#"Write-Output "REFUSED""#)
             .expect("默认要能拒绝");
         let input_at = script
-            .find("[WinAPI]::SendUnicodeText($prompt)")
-            .expect("要有最终输入动作");
-        assert!(refuse_at < input_at, "拒绝分支必须发生在输入之前");
+            .find("[WinAPI]::SendUnicodeTextVerified(")
+            .expect("手动模式要保留最终 UI 输入动作");
+        assert!(refuse_at < input_at, "标题拒绝必须发生在 UI 输入之前");
     }
 
     #[test]
-    fn windows_blind_permission_is_the_only_way_past_an_unmatched_tab() {
-        assert!(win_script("agent-pulse", false).contains("$allowBlind = $false"));
-        assert!(win_script("agent-pulse", true).contains("$allowBlind = $true"));
-    }
-
-    #[test]
-    fn windows_prompts_use_unicode_sendinput_without_clipboard_shortcuts() {
-        // Ctrl+V 如果没有被 conhost 截获，会直接交给 Codex 并触发“粘贴图片”。
-        // Unicode SendInput 既不经过键盘布局，也不借用户剪贴板。
-        let script = win_script("agent-pulse", true);
-        assert!(script.contains("$prompt = '继续完成刚才的任务'"));
-        assert!(script.contains("KEYEVENTF_UNICODE"));
-        assert!(script.contains("[WinAPI]::SendUnicodeText($prompt)"));
-        for forbidden in [
-            "SendKeys",
-            "SendWait",
-            "^v",
-            "Set-Clipboard",
-            "Get-Clipboard",
-            "System.Windows.Forms",
-        ] {
-            assert!(!script.contains(forbidden), "不得再依赖 {forbidden}");
-        }
-    }
-
-    #[test]
-    fn windows_unicode_input_sends_enter_separately_and_checks_the_result() {
-        let script = win_script("agent-pulse", true);
-        assert!(script.contains("Key(VK_RETURN, 0, 0)"));
-        assert!(script.contains("Key(VK_RETURN, 0, KEYEVENTF_KEYUP)"));
-        assert!(script.contains("sent == inputs.Length"));
-        assert!(script.contains(r#"Write-Output "INPUT_FAILED""#));
+    fn windows_blind_permission_only_affects_manual_unmatched_tabs() {
+        assert!(win_manual_script("agent-pulse", false).contains("$allowBlind = $false"));
+        assert!(win_manual_script("agent-pulse", true).contains("$allowBlind = $true"));
+        assert_eq!(
+            win_background_result("agent-pulse"),
+            DEFERRED_NO_SAFE_TRANSPORT
+        );
     }
 
     #[test]
     fn windows_prompt_quotes_cannot_break_out_of_the_literal() {
         // PowerShell 单引号串不做变量展开，只需把单引号翻倍。
         // 双引号串会把 `$` 当变量，那是另一种“敲出乱码”。
-        let script = Resumer::windows_resume_script(1, "别用 $HOME，用 'pwd' 的结果", "p", false);
+        let script = Resumer::windows_resume_script(
+            1,
+            133_000_000_000_000_000,
+            "别用 $HOME，用 'pwd' 的结果",
+            "p",
+            false,
+        );
         assert!(script.contains("$prompt = '别用 $HOME，用 ''pwd'' 的结果'"));
     }
 
     #[cfg(target_os = "windows")]
     #[tokio::test]
-    async fn windows_resume_helper_compiles_before_window_lookup() {
-        // PID 0 不可能定位到用户窗口，因此不会产生键盘输入；但 Add-Type 会先执行，
-        // 可在 Windows CI 上真实验证 PowerShell 语法和 SendInput P/Invoke 声明。
-        let script = Resumer::windows_resume_script(0, "继续", "agent-pulse", false);
+    async fn windows_manual_resume_helper_compiles_without_legacy_console_layouts() {
+        // PID 0 是无副作用自检入口：Add-Type 必须能编译，随后应在窗口定位和输入前
+        // 因未知进程代际返回 STALE_TARGET。
+        let script = Resumer::windows_resume_script(0, 0, "继续", "agent-pulse", false);
         let i18n = I18n::default();
         let output = run_with_timeout(
             "powershell",
@@ -2897,7 +3786,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stdout.lines().any(|line| line.trim() == "NO_WINDOW"),
+            stdout.lines().any(|line| line.trim() == "STALE_TARGET"),
             "stdout={stdout:?}, stderr={stderr:?}"
         );
         assert!(
@@ -3039,7 +3928,7 @@ mod tests {
 
     /// 只有 macOS 用得上这个 helper：它存在的意义是构造一个带盲敲授权的
     /// `Resumer` 去调 `macos_script` / `title_matched_script`。Windows 的脚本
-    /// 生成器是个自由函数（`win_script` 直接调它），Linux 那边则没有可单测的
+    /// 生成器是静态字符串入口，Linux 那边则没有可单测的
     /// 纯字符串入口。cfg 必须跟调用点严格对齐——多挂一个平台，那个平台的
     /// `-D warnings` 就会因为 dead_code 而红。
     #[cfg(target_os = "macos")]
@@ -3119,6 +4008,61 @@ mod tests {
         let restore_at = script.find("set the clipboard to savedClipboard").unwrap();
         assert!(paste_at < restore_at, "还原必须在粘贴之后");
         assert!(script.contains("set savedClipboard to the clipboard as text"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn automatic_macos_delivery_is_background_iterm_only() {
+        let resumer = resumer_with(true);
+        let script = resumer
+            .macos_script_with_policy(
+                "iTerm2",
+                Some("/dev/ttys003"),
+                "agent-pulse",
+                "继续",
+                DeliveryPolicy::BackgroundOnly,
+            )
+            .expect("精确 iTerm2 TTY 应生成后台脚本");
+        assert!(script.contains(r#"write text "继续""#));
+        for forbidden in [
+            "select aSession",
+            "activate",
+            "System Events",
+            "current session of current window",
+            "set the clipboard",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "自动后台脚本不得包含 {forbidden}"
+            );
+        }
+
+        for app in ["Terminal", "Code", "Cursor", "PyCharm", "Warp", ""] {
+            assert!(
+                resumer
+                    .macos_script_with_policy(
+                        app,
+                        Some("/dev/ttys003"),
+                        "agent-pulse",
+                        "继续",
+                        DeliveryPolicy::BackgroundOnly,
+                    )
+                    .is_none(),
+                "{app} 没有精确后台写入协议，应安全延后"
+            );
+        }
+        assert!(
+            resumer
+                .macos_script_with_policy(
+                    "iTerm2",
+                    None,
+                    "agent-pulse",
+                    "继续",
+                    DeliveryPolicy::BackgroundOnly,
+                )
+                .is_none(),
+            "iTerm2 缺少精确 TTY 也不能回退到当前标签"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3440,17 +4384,21 @@ mod tests {
         assert!(compiled >= 3, "只编译了 {compiled} 个定位脚本，覆盖太少");
     }
 
-    // ── 投递核验的四种结论 ──
+    // ── 投递核验的五种结论 ──
     //
-    // 这四种结论把「脚本没报错」和「字真的进去了」分开了。分类一旦搞错，
+    // 这五种结论把「脚本没报错」和「字真的进去了」分开了。分类一旦搞错，
     // 后果是整条自动续跑链自己把自己关掉，所以这里逐条钉住。
 
     #[test]
     fn only_real_deliveries_consume_the_budget() {
         assert!(ResumeOutcome::Landed.counts_as_nudge());
         assert!(
-            ResumeOutcome::Unverifiable.counts_as_nudge(),
-            "核验不了不等于失败：不落记录文件的 agent 不该被判死刑"
+            !ResumeOutcome::Unverifiable.counts_as_nudge(),
+            "只有看见精确提示词落盘才算真正续跑；不可核验不能消耗成功额度"
+        );
+        assert!(
+            !ResumeOutcome::Deferred.counts_as_nudge(),
+            "安全延后没有执行投递，不能消耗成功额度"
         );
         assert!(
             !ResumeOutcome::Failed.counts_as_nudge(),
@@ -3470,12 +4418,14 @@ mod tests {
             "从用户角度看，「按键进了别的窗口」和「脚本报错」是同一件事"
         );
         assert!(!ResumeOutcome::Landed.is_failure());
+        assert!(!ResumeOutcome::Deferred.is_failure());
         assert!(!ResumeOutcome::Unverifiable.is_failure());
     }
 
     #[test]
     fn every_outcome_has_localized_text() {
         for outcome in [
+            ResumeOutcome::Deferred,
             ResumeOutcome::Failed,
             ResumeOutcome::Landed,
             ResumeOutcome::Silent,

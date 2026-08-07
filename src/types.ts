@@ -85,6 +85,8 @@ export interface UsageSnapshot {
 
 export interface AgentSession {
   id: string;
+  /** 后端生成的不透明运行时代际；手动续跑必须原样回传，不能用 PID 重建 */
+  runtime_generation: string;
   adapter_id: string;
   agent_name: string;
   pid: number;
@@ -271,16 +273,21 @@ export interface DailyStats {
 }
 
 /**
- * 投递核验的四种结论（Rust `ResumeOutcome::storage_key`）
+ * 投递决策与核验的五种结论（Rust `ResumeOutcome::storage_key`）
  *
- * 刻意只列这四个、不把空串收进来：这个联合是**显示用**的，
- * `display.ts` 里几张 `Record<ResumeOutcome, …>` 要靠它保证四态都有配色和措辞。
+ * 刻意只列这五个、不把空串收进来：这个联合是**显示用**的，
+ * `display.ts` 里几张 `Record<ResumeOutcome, …>` 要靠它保证五态都有配色和措辞。
  * 把 `""` 塞进来的话，那几张表就得给「没有结论」也编一个颜色。
  * 旧记录的空串走 `asOutcome()` 收敛成 `null`。
  */
-export type ResumeOutcome = "landed" | "silent" | "failed" | "unverifiable";
+export type ResumeOutcome =
+  | "deferred"
+  | "landed"
+  | "silent"
+  | "failed"
+  | "unverifiable";
 
-/** 记录中心的筛选值：四态之外多一个「全部」 */
+/** 记录中心的筛选值：五态之外多一个「全部」 */
 export type OutcomeFilter = ResumeOutcome | "all";
 
 /** 提示词类型的筛选值 */

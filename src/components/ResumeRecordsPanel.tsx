@@ -40,7 +40,7 @@ import {
  * 是带着一个具体问题来翻的——那就需要搜索、筛选和翻页，而不是一个
  * 固定 50 条、只能上下滚的列表。
  *
- * 四态徽标是这一页的重点。以前只有 ✓ / ✗，「字发出去了但会话没反应」
+ * 五态徽标是这一页的重点。以前只有 ✓ / ✗，「字发出去了但会话没反应」
  * 和「压根没发出去」挤在同一个 ✗ 里，可这两种情况要查的地方完全不同。
  */
 export function ResumeRecordsPanel() {
@@ -67,6 +67,7 @@ export function ResumeRecordsPanel() {
   const outcomeOptions = useMemo<SelectOption<typeof filter.outcome>[]>(
     () => [
       { value: "all", label: t("records.all") },
+      { value: "deferred", label: t("outcome.deferred") },
       { value: "landed", label: t("outcome.landed") },
       { value: "silent", label: t("outcome.silent") },
       { value: "failed", label: t("outcome.failed") },
@@ -94,14 +95,14 @@ export function ResumeRecordsPanel() {
     filter.promptType !== "all";
 
   return (
-    <Card>
-      <CardBody>
+    <Card className="min-w-0 overflow-hidden">
+      <CardBody className="resume-records-card-body min-w-0">
         <CardHeader
-          className="mb-3"
+          className="resume-records-header mb-3"
           title={t("records.title")}
           desc={t("records.desc")}
           aside={
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               <span className="text-[10px] tabular-nums text-neutral-400">
                 {t("history.records", { count: total })}
               </span>
@@ -117,22 +118,22 @@ export function ResumeRecordsPanel() {
           }
         />
 
-        <div className="flex flex-col gap-2 sm:flex-row">
+        <div className="resume-records-filters flex min-w-0 flex-col gap-2 sm:flex-row">
           <TextInput
             value={draft}
             placeholder={t("records.search")}
-            className="flex-1"
+            className="min-w-0 flex-1"
             onChange={(e) => setDraft(e.target.value)}
           />
-          <div className="flex gap-2">
+          <div className="grid min-w-0 grid-cols-2 gap-2 sm:flex sm:shrink-0">
             <Select
-              className="w-32"
+              className="min-w-0 sm:w-32"
               value={filter.outcome}
               options={outcomeOptions}
               onValueChange={(outcome) => void fetchResumeRecords({ outcome })}
             />
             <Select
-              className="w-28"
+              className="min-w-0 sm:w-28"
               value={filter.promptType}
               options={typeOptions}
               onValueChange={(promptType) =>
@@ -159,7 +160,7 @@ export function ResumeRecordsPanel() {
         )}
 
         {total > RESUME_PAGE_SIZE && (
-          <div className="mt-4 flex items-center justify-between border-t border-neutral-100 pt-3">
+          <div className="mt-4 flex min-w-0 items-center justify-between gap-2 border-t border-neutral-100 pt-3">
             <Button
               size="xs"
               variant="ghost"
@@ -172,7 +173,7 @@ export function ResumeRecordsPanel() {
             >
               {t("history.previous")}
             </Button>
-            <span className="text-[10px] tabular-nums text-neutral-400">
+            <span className="min-w-0 text-center text-[10px] tabular-nums text-neutral-400">
               {t("history.page", { page: page + 1, total: pageCount })}
             </span>
             <Button
@@ -217,7 +218,7 @@ function RecordRow({ record }: { record: ResumeRecord }) {
       : "red";
 
   return (
-    <div className="flex items-start gap-3 py-2.5">
+    <div className="resume-record-row flex min-w-0 flex-wrap items-start gap-3 py-2.5">
       <Tooltip
         content={
           outcome ? t(outcomeHintKey(outcome)) : t("outcome.legacy_hint")
@@ -233,13 +234,17 @@ function RecordRow({ record }: { record: ResumeRecord }) {
         </span>
       </Tooltip>
       <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-1.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <Tooltip content={record.working_dir}>
-            <span className="truncate font-mono text-[11px] text-neutral-700">
+            <span
+              tabIndex={0}
+              aria-label={record.working_dir}
+              className="min-w-0 max-w-full flex-1 basis-24 truncate select-text font-mono text-[11px] text-neutral-700 outline-none focus-visible:ring-2 focus-visible:ring-neutral-300"
+            >
               {baseName(record.working_dir)}
             </span>
           </Tooltip>
-          <span className="text-[10px] text-neutral-400">
+          <span className="break-anywhere text-[10px] text-neutral-400">
             {record.agent_name}
           </span>
           <Badge tone={tone}>
@@ -255,22 +260,63 @@ function RecordRow({ record }: { record: ResumeRecord }) {
               </Badge>
             </Tooltip>
           )}
+          <CopyTextButton text={record.working_dir} label={t("records.copy_dir")} />
         </div>
         {record.message && (
-          <p
-            className={cn(
-              "mt-1 text-[10px] leading-relaxed",
-              record.success ? "text-neutral-400" : "text-neutral-500",
-            )}
-          >
-            {record.message}
-          </p>
+          <div className="mt-1 min-w-0">
+            <p
+              className={cn(
+                "break-anywhere whitespace-pre-wrap select-text text-[10px] leading-relaxed",
+                record.success ? "text-neutral-400" : "text-neutral-500",
+              )}
+            >
+              {record.message}
+            </p>
+            <div className="mt-1 flex justify-end">
+              <CopyTextButton text={record.message} label={t("records.copy_details")} />
+            </div>
+          </div>
         )}
       </div>
-      <span className="shrink-0 text-[10px] tabular-nums text-neutral-300">
+      <span className="resume-record-time shrink-0 text-[10px] tabular-nums text-neutral-300">
         {formatShortTime(record.created_at)}
       </span>
     </div>
+  );
+}
+
+/**
+ * 诊断记录里的复制操作。
+ *
+ * 路径和错误详情不能只依赖 hover tooltip：窄屏、触控和键盘用户都需要一个
+ * 明确可达的操作。复制成功后短暂反馈，行为与会话详情抽屉保持一致。
+ */
+function CopyTextButton({ text, label }: { text: string; label: string }) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  return (
+    <Button
+      size="xs"
+      variant="ghost"
+      title={text}
+      aria-label={label}
+      onClick={() => {
+        if (!navigator.clipboard) return;
+        void navigator.clipboard
+          .writeText(text)
+          .then(() => setCopied(true))
+          .catch(() => undefined);
+      }}
+    >
+      {copied ? t("common.copied") : label}
+    </Button>
   );
 }
 

@@ -168,6 +168,7 @@ interface AppStore {
   updateConfig: (config: AppConfig) => Promise<CommandResult>;
   manualResume: (
     sessionId: string,
+    runtimeGeneration: string,
     useGoalPrompt?: boolean,
   ) => Promise<CommandResult>;
   focusTerminal: (sessionId: string) => Promise<CommandResult>;
@@ -380,6 +381,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         }),
         invoke<SessionHistorySummary>("get_session_history_summary", {
           query: filter.query,
+          status: filter.status,
         }),
       ]);
       // 防抖发出的请求回来时条件可能又变了；只有仍然对得上才落库
@@ -459,9 +461,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     return result;
   },
 
-  manualResume: async (sessionId, useGoalPrompt = false) => {
+  manualResume: async (
+    sessionId,
+    runtimeGeneration,
+    useGoalPrompt = false,
+  ) => {
     const result = await run(() =>
-      invoke<string>("manual_resume", { sessionId, useGoalPrompt }),
+      invoke<string>("manual_resume", {
+        sessionId,
+        runtimeGeneration,
+        useGoalPrompt,
+      }),
     );
     await get().fetchState();
     return result;

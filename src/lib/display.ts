@@ -102,6 +102,7 @@ export const LOG_TONE: Record<LogLevel, string> = {
  *   给它红色会让人去修一个不存在的故障。
  */
 export const OUTCOME_TONE: Record<ResumeOutcome, BadgeTone> = {
+  deferred: "neutral",
   landed: "green",
   silent: "amber",
   failed: "red",
@@ -110,6 +111,7 @@ export const OUTCOME_TONE: Record<ResumeOutcome, BadgeTone> = {
 
 /** 记录行左侧那个小圆标里的字符 */
 export const OUTCOME_GLYPH: Record<ResumeOutcome, string> = {
+  deferred: "⏸",
   landed: "✓",
   silent: "?",
   failed: "✗",
@@ -134,7 +136,7 @@ export function outcomeHintKey(outcome: ResumeOutcome): I18nKey {
 const KNOWN_OUTCOME = new Set<string>(Object.keys(OUTCOME_TONE));
 
 /**
- * 库里那一列 → 四个核验态之一，认不出就是 `null`
+ * 库里那一列 → 五个投递/核验态之一，认不出就是 `null`
  *
  * v1.6 之前的行这一列是空串：那时候只存了 `success` 这一个布尔，没人问过
  * 「字真的进去了吗」。**不要拿 `success` 把空串补成 `landed`**——那是替

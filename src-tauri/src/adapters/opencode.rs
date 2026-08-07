@@ -33,12 +33,21 @@ impl AgentAdapter for OpenCodeAdapter {
                 continue;
             }
 
+            let Some(process_created_at_ticks) = super::validated_process_creation_ticks(proc)
+            else {
+                continue;
+            };
             sessions.push(AgentSession {
-                id: super::process_session_id("oc", proc),
+                id: super::process_session_id_with_creation_ticks(
+                    "oc",
+                    proc,
+                    process_created_at_ticks,
+                ),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
                 pid: proc.pid,
                 process_started_at: proc.started_at,
+                process_created_at_ticks,
                 command: proc.cmd.clone(),
                 working_dir: proc.cwd.clone(),
                 session_file: None,

@@ -245,14 +245,19 @@ const TABLE = {
 
   // ── 续跑记录中心 ──
   //
-  // 这四条是徽标上的**短标签**，跟后端 `resume.outcome_*` 那几句长话是两套：
+  // 这五条是徽标上的**短标签**，跟后端 `resume.outcome_*` 那几句长话是两套：
   // 那边要在日志里把事情说清楚（「按键发出去了，但盯了几秒会话一点没动……」），
   // 这边只有一个徽标的宽度。同一个概念两种长度，不要互相复用。
+  "outcome.deferred": ["已延后", "Deferred"],
   "outcome.landed": ["已落地", "Landed"],
   "outcome.silent": ["没反应", "No reaction"],
   "outcome.failed": ["没送达", "Not delivered"],
   "outcome.unverifiable": ["无法核验", "Unverifiable"],
   // 徽标只有两三个字，说不清「所以我该干什么」，所以把下一步动作放在悬浮解释里
+  "outcome.deferred_hint": [
+    "没有可精确寻址、可验证的后台通道，因此没有敲字，也没有抢占当前窗口",
+    "No exact, verifiable background transport was available, so nothing was typed and focus was not taken",
+  ],
   "outcome.landed_hint": [
     "字敲进去了，而且看见会话动了起来",
     "The text went in and the session was seen picking it up",
@@ -298,6 +303,8 @@ const TABLE = {
     "Try another keyword, or set the filters back to All",
   ],
   "records.reason": ["原因", "Reason"],
+  "records.copy_dir": ["复制工作目录", "Copy working directory"],
+  "records.copy_details": ["复制详情", "Copy details"],
   "records.stuck": ["卡了 {dur}", "Stuck {dur}"],
   "records.stuck_hint": [
     "出手前它已经这么久没动了。这个数越大，说明发现得越晚",
@@ -396,8 +403,8 @@ const TABLE = {
   // ── 会话历史 ──
   "history.title": ["会话档案", "Session records"],
   "history.desc": [
-    "每个会话一行，记着它活了多久、被续跑过几次、花了多少。点开看细节。",
-    "One row per session: how long it ran, how often it was resumed, what it cost. Click for details.",
+    "优先按可识别的逻辑会话归档；缺少稳定身份的旧数据会保留为单次运行记录，不会按目录猜测合并。点开可查看详情。",
+    "Stable identities are grouped as logical sessions. Older data without one stays as a single run record instead of being guessed together by directory. Click for details.",
   ],
   "history.search": ["搜索项目 / 终端…", "Search project or terminal…"],
   "history.empty": ["还没有历史会话", "No past sessions yet"],
@@ -408,8 +415,27 @@ const TABLE = {
   "history.next": ["下一页", "Next"],
   "history.page": ["第 {page} / {total} 页", "Page {page} of {total}"],
 
-  // 汇总条
-  "history.sum_total": ["会话总数", "Sessions"],
+  // 身份与诊断入口
+  "history.logical_session": ["逻辑会话", "Session"],
+  "history.logical_session_hint": [
+    "已找到稳定的会话记录，可跨进程运行归到同一个对话",
+    "A stable session record was found, so multiple process runs can belong to the same conversation",
+  ],
+  "history.legacy_runtime": ["旧运行记录", "Legacy run"],
+  "history.legacy_runtime_hint": [
+    "这条旧数据没有稳定的会话身份，只代表一次进程运行；同一对话可能因此出现多条，系统不会冒险误合并",
+    "This older entry has no stable session identity and represents one process run. The same conversation may have multiple entries; AgentPulse will not risk merging them incorrectly",
+  ],
+  "history.diagnostics_title": ["续跑投递诊断", "Resume delivery diagnostics"],
+  "history.diagnostics_desc": [
+    "按需查看所有逐次投递记录；单个会话的续跑过程仍可在会话详情中查看",
+    "Inspect every delivery attempt when needed. A single session's resume timeline remains available in its details",
+  ],
+  "history.diagnostics_show": ["展开诊断", "Show diagnostics"],
+  "history.diagnostics_hide": ["收起诊断", "Hide diagnostics"],
+
+  // 汇总条（既包含逻辑会话，也可能包含无法安全合并的旧运行记录）
+  "history.sum_total": ["档案条目", "Records"],
   "history.sum_live": ["仍在运行", "Still running"],
   "history.sum_resumes": ["续跑次数", "Resumes"],
   "history.sum_cost": ["累计花费", "Total spend"],

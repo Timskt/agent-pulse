@@ -100,6 +100,11 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("arbitration.unfinished", "这一轮还没完成", "this turn is unfinished"),
     ("log.resume_sent", "已触发续跑（{mode}，第 {count} 次）：{detail}", "Resume sent ({mode}, attempt {count}): {detail}"),
     ("log.resume_failed", "续跑失败：{detail}", "Resume failed: {detail}"),
+    (
+        "log.resume_stability_wait",
+        "中断证据正在稳定确认（{observed}/{required}），暂不投递",
+        "Interrupt evidence is stabilizing ({observed}/{required}); delivery deferred",
+    ),
     ("log.resume_manual", "手动续跑：{detail}", "Manual resume: {detail}"),
     (
         "log.resume_stale_skip",
@@ -174,9 +179,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("resume.matched", "已精确匹配到窗口", "matched the exact window"),
     ("resume.followed", "回退到当前窗口", "fell back to the current window"),
     ("resume.outcome_other", "结果 {raw}", "result {raw}"),
-    // ── 投递核验的四种结论 ──
+    // ── 投递决策与核验的五种结论 ──
     //
-    // 这四条是 v1.5 那个架构改动露到界面上的部分：以前日志只能说「脚本没报错」，
+    // 这五条从 v1.5 的核验结论扩展而来 那个架构改动露到界面上的部分：以前日志只能说「脚本没报错」，
     // 现在能说清「字到底进去了没有」。区分「盯完没动」和「没法核验」很要紧——
     // 前者是真出问题了，后者只是这类 agent 不落盘，别把两者混成一句话。
     ("resume.outcome_landed", "已确认会话动起来了", "confirmed the session picked it up"),
@@ -189,6 +194,11 @@ const TABLE: &[(&str, &str, &str)] = &[
         "resume.outcome_unverified",
         "已发送，这类会话没有可读的记录文件，核验不了",
         "sent — this kind of session keeps no readable transcript, so it can't be verified",
+    ),
+    (
+        "resume.outcome_deferred",
+        "无安全后台通道，已延后",
+        "Deferred: no safe background transport",
     ),
     ("resume.outcome_failed", "没能送达", "could not be delivered"),
     (
@@ -244,8 +254,8 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("resume.no_window", "找不到 PID {pid} 对应的终端窗口", "No terminal window found for PID {pid}"),
     (
         "resume.input_failed",
-        "Windows 没有接受完整的 Unicode 键盘输入，本次投递未记为成功",
-        "Windows did not accept the complete Unicode keyboard input; this delivery was not recorded as successful",
+        "Windows 没有接受完整的文本输入，本次投递未记为成功",
+        "Windows did not accept the complete text input; this delivery was not recorded as successful",
     ),
     // ── tmux / screen 通道 ──
     //
@@ -730,13 +740,15 @@ mod tests {
                 out.push(level.i18n_key());
             }
             for outcome in [
+                ResumeOutcome::Deferred,
                 ResumeOutcome::Landed,
                 ResumeOutcome::Silent,
                 ResumeOutcome::Failed,
                 ResumeOutcome::Unverifiable,
             ] {
                 match outcome {
-                    ResumeOutcome::Landed
+                    ResumeOutcome::Deferred
+                    | ResumeOutcome::Landed
                     | ResumeOutcome::Silent
                     | ResumeOutcome::Failed
                     | ResumeOutcome::Unverifiable => {}

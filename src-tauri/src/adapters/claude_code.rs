@@ -61,6 +61,79 @@ impl ClaudeCodeAdapter {
         candidates
     }
 
+    /// 从 Claude CLI 命令行提取可证明的会话 UUID。
+    ///
+    /// 只有 `--session-id <uuid>` / `--session-id=<uuid>` 与
+    /// `--resume <uuid>` / `--resume=<uuid>`（含短参数 `-r`）才携带稳定身份。
+    /// `--continue`、裸 `--resume` 和普通交互会话都不能证明当前进程对应哪份
+    /// transcript，必须保持未关联，不能按 cwd 猜最新文件。
+    fn explicit_session_id(args: &[String]) -> Option<String> {
+        let mut ids = Vec::new();
+        let mut index = 0;
+
+        while index < args.len() {
+            let arg = args[index].as_str();
+            if arg == "--" {
+                break;
+            }
+            let inline = arg
+                .strip_prefix("--session-id=")
+                .or_else(|| arg.strip_prefix("--resume="));
+            let candidate = if let Some(value) = inline {
+                Some(value)
+            } else if matches!(arg, "--session-id" | "--resume" | "-r") {
+                args.get(index + 1)
+                    .map(String::as_str)
+                    .filter(|value| !value.starts_with('-'))
+            } else {
+                None
+            };
+
+            if let Some(value) = candidate {
+                if let Ok(id) = uuid::Uuid::parse_str(value) {
+                    ids.push(id.hyphenated().to_string());
+                }
+            }
+            index += 1;
+        }
+
+        ids.sort();
+        ids.dedup();
+        (ids.len() == 1).then(|| ids.remove(0))
+    }
+
+    /// 将显式会话 UUID 关联到当前 cwd 下唯一的一份 transcript。
+    ///
+    /// 即便命令行里有 UUID，也必须在 cwd 对应的 Claude project 目录中恰好找到
+    /// 一个同名 JSONL 才接受。零个或多个候选都 fail closed，避免路径编码差异或
+    /// 异常数据把两个真实会话并成同一个历史键。
+    fn transcript_for_explicit_session(
+        &self,
+        working_dir: &str,
+        args: &[String],
+    ) -> Option<PathBuf> {
+        let session_id = Self::explicit_session_id(args)?;
+        if working_dir.is_empty() {
+            return None;
+        }
+
+        let mut matches = Vec::new();
+        for encoded in Self::encode_dir_candidates(working_dir) {
+            let project_dir = self.claude_dir.join("projects").join(encoded);
+            if !project_dir.is_dir() {
+                continue;
+            }
+            let pattern = to_glob_pattern(&project_dir, &format!("/**/{session_id}.jsonl"));
+            for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+                if path.is_file() && !matches.contains(&path) {
+                    matches.push(path);
+                }
+            }
+        }
+
+        (matches.len() == 1).then(|| matches.remove(0))
+    }
+
     /// 查找最新的会话 JSONL 文件
     fn find_latest_session_file(&self) -> Vec<PathBuf> {
         let base = self.claude_dir.join("projects");
@@ -336,63 +409,41 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 continue;
             }
 
+            let Some(process_created_at_ticks) = super::validated_process_creation_ticks(proc)
+            else {
+                continue;
+            };
+            let transcript = self.transcript_for_explicit_session(&proc.cwd, &proc.argv);
+            let last_activity = transcript
+                .as_ref()
+                .and_then(|path| fs::metadata(path).ok())
+                .and_then(|meta| meta.modified().ok())
+                .map(|modified| {
+                    let datetime: chrono::DateTime<Local> = modified.into();
+                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
+                .unwrap_or_else(|| now.clone());
             sessions.push(AgentSession {
-                id: super::process_session_id("cc", proc),
+                id: super::process_session_id_with_creation_ticks(
+                    "cc",
+                    proc,
+                    process_created_at_ticks,
+                ),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
                 pid: proc.pid,
                 process_started_at: proc.started_at,
+                process_created_at_ticks,
                 command: proc.cmd.clone(),
                 working_dir: proc.cwd.clone(),
-                session_file: None,
+                session_file: transcript.map(|path| path.to_string_lossy().to_string()),
                 discovered_at: now.clone(),
-                last_activity: now.clone(),
+                last_activity,
                 status: SessionStatus::Active,
                 resume_count: 0,
                 last_resume_at: None,
                 ..Default::default()
             });
-        }
-
-        // 多实例关联：按工作目录匹配对应的会话文件
-        // Claude Code 将会话存储在 ~/.claude/projects/<encoded-cwd>/ 下
-        for session in &mut sessions {
-            if session.working_dir.is_empty() {
-                continue;
-            }
-
-            // 生成所有可能的编码目录名（兼容各平台编码差异）
-            let encoded_candidates = Self::encode_dir_candidates(&session.working_dir);
-
-            for encoded in &encoded_candidates {
-                let project_dir = self.claude_dir.join("projects").join(encoded);
-                if !project_dir.exists() {
-                    continue;
-                }
-                // 找到该项目目录下最新的 .jsonl 文件
-                let pattern = to_glob_pattern(&project_dir, "/**/*.jsonl");
-                let mut files: Vec<PathBuf> = glob::glob(&pattern)
-                    .map(|paths| paths.filter_map(|p| p.ok()).collect())
-                    .unwrap_or_default();
-
-                files.sort_by(|a, b| {
-                    let ta = fs::metadata(a).and_then(|m| m.modified()).ok();
-                    let tb = fs::metadata(b).and_then(|m| m.modified()).ok();
-                    tb.cmp(&ta)
-                });
-
-                if let Some(latest) = files.first() {
-                    session.session_file = Some(latest.to_string_lossy().to_string());
-                    if let Ok(meta) = fs::metadata(latest) {
-                        if let Ok(modified) = meta.modified() {
-                            let datetime: chrono::DateTime<Local> = modified.into();
-                            session.last_activity =
-                                datetime.format("%Y-%m-%d %H:%M:%S").to_string();
-                        }
-                    }
-                }
-                break; // 找到匹配的目录就停止
-            }
         }
 
         sessions
@@ -455,6 +506,142 @@ mod tests {
 
     fn lines(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── 会话身份 ──
+
+    #[test]
+    fn only_explicit_uuid_flags_prove_a_claude_session_identity() {
+        let id = "66ae0f75-bbb7-4de6-a26e-26960df14bec";
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude", "--session-id", id])),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude", &format!("--resume={id}"),])),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude", "-r", id])),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude", "--continue"])),
+            None
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude", "--resume"])),
+            None
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude"])),
+            None
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&[
+                "claude",
+                "--session-id",
+                id,
+                "--resume",
+                "674e2443-86dd-412f-bcb3-a7ec7e8fed78",
+            ])),
+            None,
+            "冲突的显式身份也必须 fail closed"
+        );
+        assert_eq!(
+            ClaudeCodeAdapter::explicit_session_id(&args(&["claude", "--", "--resume", id])),
+            None,
+            "prompt 参数中的文字不能冒充 CLI 会话身份"
+        );
+    }
+
+    #[test]
+    fn explicit_uuid_must_uniquely_match_the_cwd_project() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-pulse-claude-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = "/workspace/shared-project";
+        let id = "66ae0f75-bbb7-4de6-a26e-26960df14bec";
+        let project = root
+            .join("projects")
+            .join(ClaudeCodeAdapter::encode_dir_candidates(cwd).remove(0));
+        fs::create_dir_all(&project).expect("建 Claude project 目录");
+        let transcript = project.join(format!("{id}.jsonl"));
+        fs::write(&transcript, "{}\n").expect("写 transcript");
+
+        let adapter = ClaudeCodeAdapter {
+            claude_dir: root.clone(),
+        };
+        assert_eq!(
+            adapter.transcript_for_explicit_session(cwd, &args(&["claude", "--resume", id])),
+            Some(transcript.clone())
+        );
+        assert_eq!(
+            adapter.transcript_for_explicit_session(cwd, &args(&["claude", "--continue"])),
+            None
+        );
+        assert_eq!(
+            adapter
+                .transcript_for_explicit_session("/workspace/other", &args(&["claude", "-r", id]),),
+            None,
+            "不能跨 cwd 仅凭同名文件关联"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn same_cwd_processes_without_explicit_ids_remain_distinct_runtime_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-pulse-claude-parallel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = "/workspace/shared-project";
+        let project = root
+            .join("projects")
+            .join(ClaudeCodeAdapter::encode_dir_candidates(cwd).remove(0));
+        fs::create_dir_all(&project).expect("建 Claude project 目录");
+        for id in [
+            "66ae0f75-bbb7-4de6-a26e-26960df14bec",
+            "674e2443-86dd-412f-bcb3-a7ec7e8fed78",
+        ] {
+            fs::write(project.join(format!("{id}.jsonl")), "{}\n").expect("写 transcript");
+        }
+
+        let adapter = ClaudeCodeAdapter {
+            claude_dir: root.clone(),
+        };
+        let sessions = adapter.discover_sessions(&[
+            ProcessSnapshot {
+                pid: 41001,
+                started_at: 1001,
+                name: "claude".to_string(),
+                cmd: "claude".to_string(),
+                argv: args(&["claude"]),
+                cwd: cwd.to_string(),
+            },
+            ProcessSnapshot {
+                pid: 41002,
+                started_at: 1002,
+                name: "claude".to_string(),
+                cmd: "claude --continue".to_string(),
+                argv: args(&["claude", "--continue"]),
+                cwd: cwd.to_string(),
+            },
+        ]);
+
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .all(|session| session.session_file.is_none()));
+        assert_ne!(sessions[0].history_key(), sessions[1].history_key());
+        fs::remove_dir_all(root).ok();
     }
 
     // ── 回合结构 ──

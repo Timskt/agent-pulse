@@ -8,6 +8,7 @@ pub mod i18n;
 pub mod monitor;
 pub mod notify;
 pub mod remote;
+pub mod resume_core;
 pub mod resumer;
 pub mod storage;
 pub mod webhook;
@@ -130,11 +131,16 @@ async fn update_config(
 async fn manual_resume(
     state: State<'_, AppState>,
     session_id: String,
+    runtime_generation: String,
     use_goal_prompt: Option<bool>,
 ) -> Result<String, String> {
     state
         .engine
-        .manual_resume(&session_id, use_goal_prompt.unwrap_or(false))
+        .manual_resume(
+            &session_id,
+            &runtime_generation,
+            use_goal_prompt.unwrap_or(false),
+        )
         .await
 }
 
@@ -384,10 +390,12 @@ async fn get_session_history_page(
 async fn get_session_history_summary(
     state: State<'_, AppState>,
     query: Option<String>,
+    status: Option<String>,
 ) -> Result<storage::SessionHistorySummary, String> {
-    Ok(state
-        .storage
-        .session_history_summary(query.as_deref().unwrap_or("")))
+    Ok(state.storage.session_history_summary_filtered(
+        query.as_deref().unwrap_or(""),
+        status.as_deref().unwrap_or("all"),
+    ))
 }
 
 /// 一个会话的完整档案：生命周期 + 续跑时间线 + 中断记录
@@ -716,6 +724,10 @@ pub fn run() {
             get_translations,
         ])
         .setup(move |app| {
+            // application setup 只会在 single-instance 插件确认本进程是主实例后执行。
+            // 在此之前绝不能收敛 inflight attempt，否则第二实例会破坏首实例事务。
+            let _ = engine.recover_attempt_ledger_after_single_instance();
+
             let config = config_manager.get();
             let lang = config.language.clone();
             let i18n = I18n::from_code(&lang);

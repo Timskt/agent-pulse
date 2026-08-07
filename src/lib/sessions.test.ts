@@ -13,6 +13,7 @@ function session(
 ): AgentSession {
   return {
     id,
+    runtime_generation: `${id}:4242:opaque-generation`,
     adapter_id: "claude-code",
     agent_name: "Claude Code",
     pid: 100,

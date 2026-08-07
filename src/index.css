@@ -99,3 +99,185 @@ body {
     animation: none;
   }
 }
+
+/*
+ * 响应式应用外壳
+ *
+ * 桌面窗口也会被缩窄或以 200% 缩放使用。这里不设置人为的页面最小宽度：
+ * 顶栏优先换行，导航只在自身范围内滚动，不能把整个窗口横向撑开。
+ */
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+}
+
+.app-shell {
+  width: 100%;
+  min-width: 0;
+}
+
+.app-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 1rem;
+  row-gap: 0.5rem;
+}
+
+.app-brand {
+  justify-self: start;
+}
+
+.app-tabs {
+  min-width: 0;
+  max-width: 100%;
+  justify-self: center;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: none;
+}
+
+.app-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.app-tab-trigger {
+  flex: 0 0 auto;
+}
+
+.app-actions {
+  min-width: 0;
+  justify-self: end;
+}
+
+.app-main > [role="tabpanel"] {
+  min-width: 0;
+}
+
+.app-footer-meta {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* 错误、路径和 agent 名可能是没有空格的一整段，必须允许在任意字符处折行。 */
+.break-anywhere,
+[role="tooltip"] {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+[role="tooltip"] {
+  max-width: min(20rem, calc(100vw - 1rem));
+}
+
+@media (max-width: 1050px) {
+  .app-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .app-tabs {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    justify-self: stretch;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-header {
+    padding: 0.625rem 0.75rem;
+  }
+
+  .app-main {
+    padding: 0.75rem;
+  }
+
+  .app-footer {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding-inline: 0.75rem;
+  }
+
+  .app-footer-meta {
+    width: 100%;
+    justify-content: flex-start;
+    column-gap: 1rem;
+    row-gap: 0.25rem;
+  }
+
+  .history-card-body,
+  .resume-records-card-body {
+    padding: 0.875rem;
+  }
+
+  .history-filter {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .history-segmented {
+    width: 100%;
+  }
+
+  .history-segmented > * {
+    min-width: 0;
+    flex: 1 0 auto;
+  }
+}
+
+@media (max-width: 480px) {
+  .history-card-header,
+  .resume-records-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .history-card-header > :last-child,
+  .resume-records-header > :last-child {
+    align-self: flex-end;
+  }
+
+  .resume-diagnostics-toggle {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .resume-diagnostics-action {
+    align-self: flex-end;
+  }
+
+  .resume-record-time {
+    width: 100%;
+    padding-left: 2rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .app-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-actions {
+    grid-row: 2;
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-self: stretch;
+  }
+
+  .app-actions > button {
+    width: 100%;
+  }
+
+  .app-tabs {
+    grid-row: 3;
+  }
+
+  .app-status-badge {
+    margin-left: auto;
+  }
+}

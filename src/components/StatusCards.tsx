@@ -27,15 +27,16 @@ export function StatusCards() {
   ];
 
   return (
-    <div className="grid grid-cols-3 gap-3 lg:grid-cols-6">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
       {cards.map((card) => (
-        <Card key={card.key} className="px-4 py-3.5">
+        <Card key={card.key} className="min-w-0 px-3 py-3.5 sm:px-4">
           <p
+            title={String(card.value)}
             className={
               // 有人在等你的时候这个数字要跳出来，其余保持克制
               card.alert && card.value !== 0
-                ? "text-2xl font-semibold tabular-nums text-red-500"
-                : "text-2xl font-semibold tabular-nums text-neutral-900"
+                ? "min-w-0 break-all text-xl font-semibold tabular-nums text-red-500 sm:text-2xl"
+                : "min-w-0 break-all text-xl font-semibold tabular-nums text-neutral-900 sm:text-2xl"
             }
           >
             {card.value}

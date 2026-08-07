@@ -1,5 +1,5 @@
 use crate::cost::{DailyCost, ProjectCost, UsageEntry, UsageSnapshot};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ pub struct ResumeRecord {
     pub working_dir: String,
     pub prompt_type: String,
     pub success: bool,
-    /// 核验结果的稳定键：`landed` / `silent` / `failed` / `unverifiable`。
+    /// 投递/核验结果的稳定键：`deferred` / `landed` / `silent` / `failed` / `unverifiable`。
     /// v1.6 之前的行是空串——那时候只存了 `success` 这一个布尔。
     pub outcome: String,
     /// 出手时它已经卡了多久（秒）。**`-1` 表示不知道**，不是「零秒」
@@ -168,13 +168,88 @@ pub struct ResumeEvent<'a> {
     pub prompt_type: &'a str,
     /// 这一次算不算「催过了」（[`crate::resumer::ResumeOutcome::counts_as_nudge`]）
     pub success: bool,
-    /// 四个核验态的稳定键（[`crate::resumer::ResumeOutcome::storage_key`]）
+    /// 五个投递/核验态的稳定键（[`crate::resumer::ResumeOutcome::storage_key`]）
     pub outcome: &'a str,
     /// 出手前它已经卡了多久（[`crate::adapters::AgentSession::stuck_secs`]）；
     /// `None` 落库成 `-1`，意思是「这条算不出来」
     pub stuck_secs: Option<i64>,
     /// 给人看的那句话：通道、失败原因
     pub message: &'a str,
+}
+
+/// 开始一次续跑尝试所需的稳定身份与核验基线。
+///
+/// `session_generation + evidence_hash + prompt_hash` 是幂等键：同一代会话在
+/// 同一份中断证据上，对同一条提示词最多只创建一个 attempt。调用方即使在
+/// 崩溃恢复后再次调用 [`Storage::begin_attempt`]，也只会拿回原来的记录。
+pub struct ResumeAttemptInput<'a> {
+    pub decision_id: &'a str,
+    pub session_generation: &'a str,
+    pub session_id: &'a str,
+    pub evidence_hash: &'a str,
+    pub prompt_hash: &'a str,
+    pub baseline_cursor: &'a str,
+}
+
+/// 持久化的续跑尝试。时间为空表示该阶段尚未发生，而不是发生时间未知。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeAttempt {
+    pub attempt_id: String,
+    pub decision_id: String,
+    pub session_generation: String,
+    pub session_id: String,
+    pub evidence_hash: String,
+    pub prompt_hash: String,
+    pub state: String,
+    pub failure_class: String,
+    pub baseline_cursor: String,
+    pub created_at: String,
+    pub delivery_started_at: Option<String>,
+    pub transport_acked_at: Option<String>,
+    pub verified_at: Option<String>,
+    pub next_retry_at: Option<String>,
+}
+
+/// [`Storage::begin_attempt`] 的幂等结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginAttemptResult {
+    Created(ResumeAttempt),
+    Existing(ResumeAttempt),
+}
+
+impl BeginAttemptResult {
+    pub fn attempt(&self) -> &ResumeAttempt {
+        match self {
+            Self::Created(attempt) | Self::Existing(attempt) => attempt,
+        }
+    }
+
+    pub fn was_created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
+const RESUME_ATTEMPT_COLUMNS: &str = "attempt_id, decision_id, session_generation, session_id, \
+     evidence_hash, prompt_hash, state, failure_class, baseline_cursor, created_at, \
+     delivery_started_at, transport_acked_at, verified_at, next_retry_at";
+
+fn row_to_resume_attempt(row: &rusqlite::Row) -> rusqlite::Result<ResumeAttempt> {
+    Ok(ResumeAttempt {
+        attempt_id: row.get(0)?,
+        decision_id: row.get(1)?,
+        session_generation: row.get(2)?,
+        session_id: row.get(3)?,
+        evidence_hash: row.get(4)?,
+        prompt_hash: row.get(5)?,
+        state: row.get(6)?,
+        failure_class: row.get(7)?,
+        baseline_cursor: row.get(8)?,
+        created_at: row.get(9)?,
+        delivery_started_at: row.get(10)?,
+        transport_acked_at: row.get(11)?,
+        verified_at: row.get(12)?,
+        next_retry_at: row.get(13)?,
+    })
 }
 
 /// 一行 `resume_records` → [`ResumeRecord`]
@@ -321,18 +396,35 @@ pub struct Storage {
 impl Storage {
     /// 打开或创建数据库
     pub fn new() -> Self {
-        let db_path = Self::db_path();
+        Self::open_persistent(Self::db_path())
+    }
+
+    fn open_persistent(db_path: PathBuf) -> Self {
         if let Some(parent) = db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+                panic!(
+                    "无法创建持久化目录 {}：{error}。为避免丢失 Attempt Ledger 后重复自动投递，应用已停止启动。",
+                    parent.display()
+                )
+            });
         }
 
-        let conn = Connection::open(&db_path)
-            .unwrap_or_else(|_| Connection::open_in_memory().expect("无法创建内存数据库"));
+        let conn = Connection::open(&db_path).unwrap_or_else(|error| {
+            panic!(
+                "无法打开持久化数据库 {}：{error}。为避免丢失 Attempt Ledger 后重复自动投递，应用已停止启动。",
+                db_path.display()
+            )
+        });
 
         let storage = Self {
             conn: Mutex::new(conn),
         };
-        storage.init_tables();
+        storage.init_tables().unwrap_or_else(|error| {
+            panic!(
+                "无法初始化持久化数据库 {}：{error}。为避免在不可靠账本上自动投递，应用已停止启动。",
+                db_path.display()
+            )
+        });
         storage
     }
 
@@ -348,18 +440,19 @@ impl Storage {
     /// [`Self::new`] 打开的是用户真正那份 `agentpulse.db`，跑一次测试就往里
     /// 塞几条假记录——统计页上会多出凭空的续跑次数。所以测试走这个入口。
     #[cfg(test)]
-    fn in_memory() -> Self {
+    pub(crate) fn in_memory() -> Self {
         let storage = Self {
             conn: Mutex::new(Connection::open_in_memory().expect("无法创建内存数据库")),
         };
-        storage.init_tables();
+        storage.init_tables().expect("无法初始化测试数据库");
         storage
     }
 
-    /// 初始化表结构
-    fn init_tables(&self) {
+    /// 初始化表结构。Attempt Ledger 属于自动续跑安全边界，迁移失败必须向上返回，
+    /// 不能像普通统计写入那样吞掉错误后继续运行。
+    fn init_tables(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute_batch(
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS resume_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -454,10 +547,39 @@ impl Storage {
                 cost_usd REAL DEFAULT 0
             );
 
-            CREATE INDEX IF NOT EXISTS idx_history_last_seen ON session_history(last_seen);",
-        );
+            CREATE INDEX IF NOT EXISTS idx_history_last_seen ON session_history(last_seen);
+
+            -- v1.10：续跑动作账本。它与给用户看的 resume_records 分开：前者保存
+            -- “准备投递 -> transport ack -> 核验”的事务状态，后者只是最终事件。
+            -- 稳定唯一约束让崩溃恢复或重复扫描不能对同一份证据重复投递。
+            CREATE TABLE IF NOT EXISTS resume_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                decision_id TEXT NOT NULL,
+                session_generation TEXT NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                evidence_hash TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'created',
+                failure_class TEXT NOT NULL DEFAULT '',
+                baseline_cursor TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                delivery_started_at TEXT,
+                transport_acked_at TEXT,
+                verified_at TEXT,
+                next_retry_at TEXT,
+                UNIQUE(session_generation, evidence_hash, prompt_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_resume_attempt_decision
+                ON resume_attempts(decision_id);
+            CREATE INDEX IF NOT EXISTS idx_resume_attempt_retry
+                ON resume_attempts(state, next_retry_at);
+            CREATE INDEX IF NOT EXISTS idx_resume_attempt_generation_prompt
+                ON resume_attempts(session_generation, prompt_hash, created_at);",
+        )?;
         drop(conn);
         self.migrate();
+        Ok(())
     }
 
     /// 给已经存在的库补列
@@ -506,18 +628,21 @@ impl Storage {
     /// [`crate::adapters::AgentSession::history_key`] 修好了，但**已经生出来的
     /// 那些行不会自己合起来**，历史页照样是一堆看不出意思的重复。
     ///
+    /// 只在旧行仍携带**进程代际**时合并。`session_id` 只有 `adapter-pid`
+    /// 的更老格式无法区分 PID 复用，不能仅凭工作目录猜测它们属于同一会话；
+    /// 这类行宁可保留重复，也不能冒险删除真实历史。
+    ///
     /// 合并规则跟 [`Self::upsert_session_history`] 本来的写法对齐，所以聚合值
     /// 一个都不会丢：`first_seen` 取最早、`last_seen` 取最晚，另外三个取
     /// 最大值（那个 upsert 一直是 `MAX`，因为同一份用量会被反复写入，
     /// 求和会把它累计成好几倍）。
     ///
-    /// 幂等：跑完就没有重复了，第二次跑是空操作。只碰
+    /// 幂等：跑完就没有**可证明**的重复了，第二次跑是空操作。只碰
     /// `session_file = ''` 的行——用记录文件当键的行从来没有这个毛病。
     fn merge_fragmented_history(&self) {
         let conn = self.conn.lock().unwrap();
-        // 同一个 `session_id` + 同一个工作目录 = 同一个会话。
-        // 不用重算新键，因为老行里没存 `adapter_id`；而 `session_id`
-        // 本身就带着 adapter 前缀和进程代际（旧形状如 `cc-68590`，新形状还含启动时刻）。
+        // 只有带进程代际的 `session_id` + 同一个工作目录才可证明是同一会话。
+        // 旧形状如 `cc-68590` 无法区分 PID 复用，因此已在上面的查询结果中过滤掉。
         let groups: Vec<(String, String, i64)> = {
             let mut stmt = match conn.prepare(
                 "SELECT session_id, working_dir, COUNT(*) FROM session_history \
@@ -527,8 +652,14 @@ impl Storage {
                 Err(_) => return,
             };
             let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .query_map([], |r| {
+                    Ok::<(String, String, i64), rusqlite::Error>((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .map(|it| {
+                    it.filter_map(|r| r.ok())
+                        .filter(|(session_id, _, _)| Self::has_process_generation(session_id))
+                        .collect()
+                })
                 .unwrap_or_default();
             rows
         };
@@ -578,6 +709,22 @@ impl Storage {
         }
     }
 
+    /// 只有 `adapter-pid-started_at` 这类带进程代际的 session id 才能安全参与
+    /// 历史裂行合并。旧版 `adapter-pid` 无法排除 PID 复用，必须保留原行。
+    fn has_process_generation(session_id: &str) -> bool {
+        let mut parts = session_id.rsplitn(3, '-');
+        let Some(started_at) = parts.next() else {
+            return false;
+        };
+        let Some(pid) = parts.next() else {
+            return false;
+        };
+        let Some(adapter) = parts.next() else {
+            return false;
+        };
+        !adapter.is_empty() && pid.parse::<u32>().is_ok() && started_at.parse::<u64>().is_ok()
+    }
+
     /// 列不存在就加上；存在就什么都不做
     fn ensure_column(&self, table: &str, column: &str, decl: &str) {
         let conn = self.conn.lock().unwrap();
@@ -594,6 +741,343 @@ impl Storage {
                 [],
             );
         }
+    }
+
+    /// 原子创建一次续跑尝试；相同幂等键已经存在时返回原记录。
+    ///
+    /// 使用 `IMMEDIATE` 事务把“抢占唯一键”和“读回赢家”放在同一个写事务里。
+    /// 即使未来不再依赖单实例插件，两个进程同时看到同一份中断证据，也只有
+    /// 一个能得到 [`BeginAttemptResult::Created`]。
+    pub fn begin_attempt(
+        &self,
+        input: ResumeAttemptInput<'_>,
+    ) -> rusqlite::Result<BeginAttemptResult> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // 危险状态的防重放边界是整个 runtime generation，不能包含 prompt hash。
+        // 用户改提示词、generic/goal 切换或配置热更新都不构成“旧输入绝对没发生”的
+        // 证据；只要任意提示词下存在可能产生过外部输入的 attempt，就必须 fail closed。
+        // 这道检查与 INSERT 同处一个 IMMEDIATE 事务，避免两个进程用不同 prompt/evidence
+        // 同时穿过许可检查。未知新状态也按危险状态处理。
+        let dangerous = tx
+            .query_row(
+                &format!(
+                    "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+                     WHERE session_generation = ?1
+                       AND state NOT IN ('created', 'deferred', 'verified')
+                     ORDER BY created_at ASC, attempt_id ASC
+                     LIMIT 1"
+                ),
+                params![input.session_generation],
+                row_to_resume_attempt,
+            )
+            .optional()?;
+        if let Some(attempt) = dangerous {
+            tx.commit()?;
+            return Ok(BeginAttemptResult::Existing(attempt));
+        }
+
+        // created/deferred 明确尚未发生不可逆输入，可以恢复，但只能续用同一个 prompt
+        // 的原 attempt。prompt 不同的安全占位不会授权本次投递；下面仍可创建新键，
+        // 而一旦任一 attempt 进入危险状态，generation-wide guard 会阻止其他键出手。
+        let recoverable = tx
+            .query_row(
+                &format!(
+                    "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+                     WHERE session_generation = ?1 AND prompt_hash = ?2
+                       AND state IN ('created', 'deferred')
+                     ORDER BY created_at ASC, attempt_id ASC
+                     LIMIT 1"
+                ),
+                params![input.session_generation, input.prompt_hash],
+                row_to_resume_attempt,
+            )
+            .optional()?;
+        if let Some(attempt) = recoverable {
+            tx.commit()?;
+            return Ok(BeginAttemptResult::Existing(attempt));
+        }
+
+        let candidate_id = uuid::Uuid::new_v4().simple().to_string();
+        let inserted = tx.execute(
+            "INSERT INTO resume_attempts (
+                attempt_id, decision_id, session_generation, session_id,
+                evidence_hash, prompt_hash, state, failure_class, baseline_cursor
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', '', ?7)
+             ON CONFLICT(session_generation, evidence_hash, prompt_hash) DO NOTHING",
+            params![
+                candidate_id,
+                input.decision_id,
+                input.session_generation,
+                input.session_id,
+                input.evidence_hash,
+                input.prompt_hash,
+                input.baseline_cursor,
+            ],
+        )?;
+        let attempt = tx.query_row(
+            &format!(
+                "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+                 WHERE session_generation = ?1 AND evidence_hash = ?2 AND prompt_hash = ?3"
+            ),
+            params![
+                input.session_generation,
+                input.evidence_hash,
+                input.prompt_hash
+            ],
+            row_to_resume_attempt,
+        )?;
+        tx.commit()?;
+
+        Ok(if inserted == 1 {
+            BeginAttemptResult::Created(attempt)
+        } else {
+            BeginAttemptResult::Existing(attempt)
+        })
+    }
+
+    /// 查询所有尚需 worker 处理或恢复判定的 attempt。
+    ///
+    /// `created` / `deferred` 仍可能取得投递资格；`delivering` / `transport_acked`
+    /// 则代表上一次进程可能已产生外部副作用，调用方必须先核验或调用
+    /// [`Self::reconcile_inflight_attempts_as_unverifiable`]，绝不能直接重放。
+    pub fn get_non_terminal_attempts(&self) -> rusqlite::Result<Vec<ResumeAttempt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+             WHERE state IN ('created', 'deferred', 'delivering', 'transport_acked')
+             ORDER BY created_at ASC, attempt_id ASC"
+        ))?;
+        let attempts = stmt
+            .query_map([], row_to_resume_attempt)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(attempts)
+    }
+
+    /// 查询同一运行时世代的全部 attempt，跨越不同 prompt/evidence。
+    ///
+    /// 这是 generation-wide 防重放栅栏的读侧：提示词变化不能让可能已产生外部输入的
+    /// attempt 消失。创建时的检查在 [`Self::begin_attempt`]，最终不可逆投递许可还会在
+    /// [`Self::mark_attempt_delivery_started`] 的原子 UPDATE 中按 generation 重新确认。
+    pub fn get_attempts_for_generation(
+        &self,
+        session_generation: &str,
+    ) -> rusqlite::Result<Vec<ResumeAttempt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+             WHERE session_generation = ?1
+             ORDER BY created_at ASC, attempt_id ASC"
+        ))?;
+        let attempts = stmt
+            .query_map(params![session_generation], row_to_resume_attempt)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(attempts)
+    }
+
+    /// 查询同一运行时世代、同一提示词的全部 attempt，跨越不同 evidence hash。
+    ///
+    /// monitor 在 evidence cursor 改变后也必须先查这里：只要旧 attempt 仍处于
+    /// `delivering` / `transport_acked` / `unverifiable` 等不能证明“未投递”的状态，
+    /// 就应 fail closed，而不是借新 evidence hash 创建第二次投递。
+    pub fn get_attempts_for_generation_and_prompt(
+        &self,
+        session_generation: &str,
+        prompt_hash: &str,
+    ) -> rusqlite::Result<Vec<ResumeAttempt>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+             WHERE session_generation = ?1 AND prompt_hash = ?2
+             ORDER BY created_at ASC, attempt_id ASC"
+        ))?;
+        let attempts = stmt
+            .query_map(
+                params![session_generation, prompt_hash],
+                row_to_resume_attempt,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(attempts)
+    }
+
+    /// 启动恢复时，将可能已经产生外部输入的遗留 attempt 原子收敛为 fail-closed。
+    ///
+    /// `delivering` 既可能崩溃在真实输入之前，也可能崩溃在输入之后；
+    /// `transport_acked` 更不能证明 transcript 已落盘。两者都不能自动重放。
+    /// 返回本次被收敛的完整记录，便于调用方记录诊断或继续做 transcript 核验。
+    pub fn reconcile_inflight_attempts_as_unverifiable(
+        &self,
+        reason: &str,
+    ) -> rusqlite::Result<Vec<ResumeAttempt>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut attempts = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts
+                 WHERE state IN ('delivering', 'transport_acked')
+                 ORDER BY created_at ASC, attempt_id ASC"
+            ))?;
+            let rows = stmt
+                .query_map([], row_to_resume_attempt)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        let changed = tx.execute(
+            "UPDATE resume_attempts SET
+                state = 'unverifiable',
+                failure_class = ?1,
+                next_retry_at = NULL
+             WHERE state IN ('delivering', 'transport_acked')",
+            params![reason],
+        )?;
+        debug_assert_eq!(changed, attempts.len());
+        tx.commit()?;
+
+        for attempt in &mut attempts {
+            attempt.state = "unverifiable".to_string();
+            attempt.failure_class = reason.to_string();
+            attempt.next_retry_at = None;
+        }
+        Ok(attempts)
+    }
+
+    /// 在调用不可回滚的 transport 之前先落这一步，避免进程崩溃后误以为从未出手。
+    ///
+    /// 这是 attempt 的原子投递租约：只有 `created`，或设置了合法 `next_retry_at`
+    /// 且已经到期、从而能确认上一轮未投递的 `deferred` 能进入。`delivering`、
+    /// `transport_acked` 以及所有终态都不会被重新 claim。最终 claim 还必须确认同一
+    /// runtime generation 下没有其他危险 attempt；因此即使不同 prompt/evidence 已经
+    /// 各自创建了安全占位，也只有第一个原子 UPDATE 能进入 `delivering`。未知状态同样
+    /// fail closed。SQLite 会把单条写语句串行化，所以该检查与状态更新不可分割。
+    pub fn mark_attempt_delivery_started(&self, attempt_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE resume_attempts SET
+                state = 'delivering',
+                delivery_started_at = COALESCE(
+                    delivery_started_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                failure_class = '',
+                next_retry_at = NULL
+             WHERE attempt_id = ?1
+               AND (
+                    state = 'created' OR (
+                        state = 'deferred'
+                        AND next_retry_at IS NOT NULL
+                        AND julianday(next_retry_at) IS NOT NULL
+                        AND julianday(next_retry_at) <= julianday('now')
+                    )
+               )
+               AND NOT EXISTS (
+                    SELECT 1
+                    FROM resume_attempts AS competing
+                    WHERE competing.session_generation = resume_attempts.session_generation
+                      AND competing.attempt_id <> resume_attempts.attempt_id
+                      AND (
+                          competing.state IS NULL OR
+                          competing.state NOT IN ('created', 'deferred', 'verified')
+                      )
+               )",
+            params![attempt_id],
+        )
+        .map(|changed| changed == 1)
+    }
+
+    /// transport 接受了写入请求；这还不等于文本已进入 transcript，更不等于有进展。
+    pub fn mark_attempt_transport_acked(&self, attempt_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE resume_attempts SET
+                state = 'transport_acked',
+                delivery_started_at = COALESCE(
+                    delivery_started_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                transport_acked_at = COALESCE(
+                    transport_acked_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                failure_class = '',
+                next_retry_at = NULL
+             WHERE attempt_id = ?1 AND state = 'delivering'",
+            params![attempt_id],
+        )
+        .map(|changed| changed == 1)
+    }
+
+    /// transcript 或协议证据确认本次提示词已经送达。
+    pub fn mark_attempt_verified(&self, attempt_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE resume_attempts SET
+                state = 'verified',
+                verified_at = COALESCE(
+                    verified_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                failure_class = '',
+                next_retry_at = NULL
+             WHERE attempt_id = ?1 AND state IN ('delivering', 'transport_acked')",
+            params![attempt_id],
+        )
+        .map(|changed| changed == 1)
+    }
+
+    /// 当前没有安全投递条件。deferred 不是失败，也不应计入成功/失败统计。
+    pub fn mark_attempt_deferred(
+        &self,
+        attempt_id: &str,
+        failure_class: &str,
+        next_retry_at: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        self.mark_attempt_stopped(attempt_id, "deferred", failure_class, next_retry_at)
+    }
+
+    /// transport 或核验明确失败；保留分类和下次允许重试的时间。
+    pub fn mark_attempt_failed(
+        &self,
+        attempt_id: &str,
+        failure_class: &str,
+        next_retry_at: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        self.mark_attempt_stopped(attempt_id, "failed", failure_class, next_retry_at)
+    }
+
+    /// transport 已接受写入，但核验所需记录暂时不可用；这不是失败，不能冒充失败告警。
+    pub fn mark_attempt_unverifiable(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+        next_retry_at: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        self.mark_attempt_stopped(attempt_id, "unverifiable", reason, next_retry_at)
+    }
+
+    fn mark_attempt_stopped(
+        &self,
+        attempt_id: &str,
+        state: &str,
+        failure_class: &str,
+        next_retry_at: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        debug_assert!(matches!(state, "deferred" | "failed" | "unverifiable"));
+        let conn = self.conn.lock().unwrap();
+        let allowed_from = match state {
+            "deferred" => "state = 'delivering'",
+            "failed" | "unverifiable" => "state IN ('delivering', 'transport_acked')",
+            _ => unreachable!("unsupported terminal attempt state"),
+        };
+        conn.execute(
+            &format!(
+                "UPDATE resume_attempts SET state = ?2, failure_class = ?3, next_retry_at = ?4
+                 WHERE attempt_id = ?1 AND {allowed_from}"
+            ),
+            params![attempt_id, state, failure_class, next_retry_at],
+        )
+        .map(|changed| changed == 1)
     }
 
     /// 记录一次续跑事件
@@ -742,8 +1226,8 @@ impl Storage {
 
     /// 分页、搜索、按结果与提示词类型筛选续跑记录
     ///
-    /// `outcome` 认 `all` 和四个核验态（`landed` / `silent` / `failed` /
-    /// `unverifiable`）；`prompt_type` 认 `all` / `goal` / `generic`。
+    /// `outcome` 认 `all` 和五个投递/核验态（`deferred` / `landed` / `silent` /
+    /// `failed` / `unverifiable`）；`prompt_type` 认 `all` / `goal` / `generic`。
     /// 认不出的值一律当 `all`——筛选条件拼错时应该多给几条，而不是给一个
     /// 空列表让人以为「真的没有记录」。
     pub fn get_resume_page(
@@ -758,7 +1242,7 @@ impl Storage {
         let query = query.trim();
         let like = format!("%{query}%");
         let outcome_filter = match outcome {
-            "landed" | "silent" | "failed" | "unverifiable" => outcome,
+            "deferred" | "landed" | "silent" | "failed" | "unverifiable" => outcome,
             _ => "all",
         };
         let type_filter = match prompt_type {
@@ -1372,9 +1856,23 @@ impl Storage {
     /// 单独走一条 SQL 而不是在前端数当前那一页——那样翻到第二页，
     /// 「共 40 个会话」会变成「共 20 个」。
     pub fn session_history_summary(&self, query: &str) -> SessionHistorySummary {
+        self.session_history_summary_filtered(query, "all")
+    }
+
+    /// 会话历史汇总跟随列表的状态筛选，避免用户筛选 ended/live 后仍看到全量数字。
+    pub fn session_history_summary_filtered(
+        &self,
+        query: &str,
+        status: &str,
+    ) -> SessionHistorySummary {
         let conn = self.conn.lock().unwrap();
         let query = query.trim();
         let like = format!("%{query}%");
+        let live_clause = match status {
+            "live" => " AND ended_at = ''",
+            "ended" => " AND ended_at <> ''",
+            _ => "",
+        };
         conn.query_row(
             &format!(
                 "SELECT COUNT(*), \
@@ -1382,7 +1880,7 @@ impl Storage {
                         COALESCE(SUM(resume_count), 0), \
                         COALESCE(SUM(cost_usd), 0), \
                         COALESCE(SUM(total_tokens), 0) \
-                 FROM session_history WHERE {HISTORY_FILTER}"
+                 FROM session_history WHERE {HISTORY_FILTER}{live_clause}"
             ),
             params![query, like],
             |row| {
@@ -1527,6 +2025,32 @@ mod tests {
         storage.get_resume_page(50, 0, "", outcome, prompt_type)
     }
 
+    fn attempt_input<'a>(
+        decision_id: &'a str,
+        generation: &'a str,
+        evidence_hash: &'a str,
+        prompt_hash: &'a str,
+    ) -> ResumeAttemptInput<'a> {
+        ResumeAttemptInput {
+            decision_id,
+            session_generation: generation,
+            session_id: "codex-session",
+            evidence_hash,
+            prompt_hash,
+            baseline_cursor: "cursor:41",
+        }
+    }
+
+    fn read_attempt(storage: &Storage, attempt_id: &str) -> ResumeAttempt {
+        let conn = storage.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT {RESUME_ATTEMPT_COLUMNS} FROM resume_attempts WHERE attempt_id = ?1"),
+            params![attempt_id],
+            row_to_resume_attempt,
+        )
+        .expect("续跑 attempt 不存在")
+    }
+
     /// 问 SQLite 打算怎么执行这条 SQL
     ///
     /// 索引这种东西没法用「结果对不对」来测：加不加索引，返回的行**完全一样**，
@@ -1546,32 +2070,816 @@ mod tests {
     }
 
     #[test]
+    fn persistent_storage_failure_is_fail_closed_instead_of_falling_back_to_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-pulse-ledger-fail-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("创建临时目录失败");
+        let not_a_directory = root.join("blocked-parent");
+        std::fs::write(&not_a_directory, b"file").expect("创建阻断文件失败");
+        let db_path = not_a_directory.join("agentpulse.db");
+
+        let result = std::panic::catch_unwind(|| Storage::open_persistent(db_path));
+        assert!(
+            result.is_err(),
+            "持久 Attempt Ledger 无法打开时必须停止启动，不能静默切到内存库"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_database_is_migrated_with_resume_attempt_ledger() {
+        let conn = Connection::open_in_memory().expect("无法创建旧数据库");
+        conn.execute_batch(
+            "CREATE TABLE resume_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                working_dir TEXT DEFAULT '',
+                prompt_type TEXT DEFAULT 'generic',
+                success INTEGER DEFAULT 1,
+                message TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+             );
+             INSERT INTO resume_records (session_id, agent_name) VALUES ('legacy', 'codex');",
+        )
+        .expect("准备旧数据库失败");
+        let storage = Storage {
+            conn: Mutex::new(conn),
+        };
+
+        storage.init_tables().expect("迁移旧数据库失败");
+
+        let conn = storage.conn.lock().unwrap();
+        let legacy_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM resume_records WHERE session_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 1, "迁移不能丢旧续跑记录");
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('resume_attempts') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for required in [
+            "attempt_id",
+            "decision_id",
+            "session_generation",
+            "session_id",
+            "evidence_hash",
+            "prompt_hash",
+            "state",
+            "failure_class",
+            "baseline_cursor",
+            "created_at",
+            "delivery_started_at",
+            "transport_acked_at",
+            "verified_at",
+            "next_retry_at",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == required),
+                "迁移后缺少 {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn begin_attempt_is_idempotent_for_the_stable_delivery_key() {
+        let storage = Storage::in_memory();
+        let created = storage
+            .begin_attempt(attempt_input(
+                "decision-a",
+                "generation-a",
+                "evidence-a",
+                "prompt-a",
+            ))
+            .unwrap();
+        assert!(created.was_created());
+        let original = created.attempt().clone();
+
+        let existing = storage
+            .begin_attempt(attempt_input(
+                "decision-b",
+                "generation-a",
+                "evidence-a",
+                "prompt-a",
+            ))
+            .unwrap();
+        assert!(!existing.was_created());
+        assert_eq!(
+            existing.attempt(),
+            &original,
+            "重复 begin 必须读回最初那次 attempt"
+        );
+
+        let conn = storage.conn.lock().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resume_attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "同一幂等键不能生成第二次投递");
+    }
+
+    #[test]
+    fn existing_created_attempt_can_recover_the_pre_claim_crash_window() {
+        let storage = Storage::in_memory();
+        let created = storage
+            .begin_attempt(attempt_input(
+                "decision-before-crash",
+                "generation-recovery",
+                "evidence-recovery",
+                "prompt-recovery",
+            ))
+            .unwrap();
+        let attempt_id = created.attempt().attempt_id.clone();
+
+        let recovered = storage
+            .begin_attempt(attempt_input(
+                "decision-after-restart",
+                "generation-recovery",
+                "evidence-recovery",
+                "prompt-recovery",
+            ))
+            .unwrap();
+        assert!(matches!(recovered, BeginAttemptResult::Existing(_)));
+        assert_eq!(recovered.attempt().state, "created");
+        assert_eq!(recovered.attempt().attempt_id, attempt_id);
+        assert!(
+            storage.mark_attempt_delivery_started(&attempt_id).unwrap(),
+            "begin 已提交但 claim 前崩溃时，重启后的 worker 必须能恢复原 attempt"
+        );
+    }
+
+    #[test]
+    fn begin_attempt_blocks_cross_evidence_replay_for_every_non_verified_state() {
+        for state in [
+            "created",
+            "deferred",
+            "delivering",
+            "transport_acked",
+            "unverifiable",
+            "failed",
+        ] {
+            let storage = Storage::in_memory();
+            let first = storage
+                .begin_attempt(attempt_input(
+                    "decision-original",
+                    "generation-shared",
+                    "evidence-original",
+                    "prompt-shared",
+                ))
+                .unwrap();
+            let original_id = first.attempt().attempt_id.clone();
+
+            match state {
+                "created" => {}
+                "delivering" => {
+                    assert!(storage.mark_attempt_delivery_started(&original_id).unwrap());
+                }
+                "transport_acked" => {
+                    assert!(storage.mark_attempt_delivery_started(&original_id).unwrap());
+                    assert!(storage.mark_attempt_transport_acked(&original_id).unwrap());
+                }
+                "deferred" => {
+                    assert!(storage.mark_attempt_delivery_started(&original_id).unwrap());
+                    assert!(storage
+                        .mark_attempt_deferred(
+                            &original_id,
+                            "no-safe-transport",
+                            Some("2099-01-01T00:00:00.000Z"),
+                        )
+                        .unwrap());
+                }
+                "unverifiable" => {
+                    assert!(storage.mark_attempt_delivery_started(&original_id).unwrap());
+                    assert!(storage
+                        .mark_attempt_unverifiable(&original_id, "unknown-delivery", None)
+                        .unwrap());
+                }
+                "failed" => {
+                    assert!(storage.mark_attempt_delivery_started(&original_id).unwrap());
+                    assert!(storage
+                        .mark_attempt_failed(&original_id, "transport-write", None)
+                        .unwrap());
+                }
+                _ => unreachable!(),
+            }
+
+            let existing = storage
+                .begin_attempt(attempt_input(
+                    "decision-retry",
+                    "generation-shared",
+                    "evidence-changed",
+                    "prompt-shared",
+                ))
+                .unwrap();
+            assert!(
+                matches!(existing, BeginAttemptResult::Existing(_)),
+                "state={state} 必须原子阻断跨 evidence 新 attempt"
+            );
+            assert_eq!(existing.attempt().attempt_id, original_id, "state={state}");
+            assert_eq!(existing.attempt().state, state, "state={state}");
+
+            let rows = storage
+                .get_attempts_for_generation_and_prompt("generation-shared", "prompt-shared")
+                .unwrap();
+            assert_eq!(rows.len(), 1, "state={state} 不能创建第二条投递许可");
+        }
+    }
+
+    #[test]
+    fn dangerous_attempt_blocks_a_different_prompt_in_the_same_generation() {
+        for state in ["delivering", "transport_acked", "unverifiable", "failed"] {
+            let storage = Storage::in_memory();
+            let original = storage
+                .begin_attempt(attempt_input(
+                    "decision-original",
+                    "generation-prompt-guard",
+                    "evidence-original",
+                    "prompt-original",
+                ))
+                .unwrap();
+            let original_id = original.attempt().attempt_id.clone();
+            assert!(storage.mark_attempt_delivery_started(&original_id).unwrap());
+            match state {
+                "delivering" => {}
+                "transport_acked" => {
+                    assert!(storage.mark_attempt_transport_acked(&original_id).unwrap());
+                }
+                "unverifiable" => {
+                    assert!(storage
+                        .mark_attempt_unverifiable(&original_id, "unknown-delivery", None)
+                        .unwrap());
+                }
+                "failed" => {
+                    assert!(storage
+                        .mark_attempt_failed(&original_id, "transport-write", None)
+                        .unwrap());
+                }
+                _ => unreachable!(),
+            }
+
+            let blocked = storage
+                .begin_attempt(attempt_input(
+                    "decision-new-prompt",
+                    "generation-prompt-guard",
+                    "evidence-new",
+                    "prompt-changed",
+                ))
+                .unwrap();
+            assert!(matches!(blocked, BeginAttemptResult::Existing(_)));
+            assert_eq!(blocked.attempt().attempt_id, original_id, "state={state}");
+            assert_eq!(blocked.attempt().state, state, "state={state}");
+            assert_eq!(
+                storage
+                    .get_attempts_for_generation("generation-prompt-guard")
+                    .unwrap()
+                    .len(),
+                1,
+                "state={state} 时 prompt 变化也不能创建第二个 attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_attempt_only_releases_a_different_evidence_key() {
+        let storage = Storage::in_memory();
+        let first = storage
+            .begin_attempt(attempt_input(
+                "decision-first",
+                "generation-verified",
+                "evidence-first",
+                "prompt-verified",
+            ))
+            .unwrap();
+        let first_id = first.attempt().attempt_id.clone();
+        assert!(storage.mark_attempt_delivery_started(&first_id).unwrap());
+        assert!(storage.mark_attempt_transport_acked(&first_id).unwrap());
+        assert!(storage.mark_attempt_verified(&first_id).unwrap());
+
+        let same_evidence = storage
+            .begin_attempt(attempt_input(
+                "decision-same",
+                "generation-verified",
+                "evidence-first",
+                "prompt-verified",
+            ))
+            .unwrap();
+        assert!(matches!(same_evidence, BeginAttemptResult::Existing(_)));
+        assert_eq!(same_evidence.attempt().attempt_id, first_id);
+
+        let next_turn = storage
+            .begin_attempt(attempt_input(
+                "decision-next",
+                "generation-verified",
+                "evidence-next",
+                "prompt-verified",
+            ))
+            .unwrap();
+        assert!(
+            next_turn.was_created(),
+            "已核验回合之后，新的 evidence 应能获得新的 attempt"
+        );
+        assert_ne!(next_turn.attempt().attempt_id, first_id);
+    }
+
+    #[test]
+    fn begin_attempt_allows_new_session_generation() {
+        let storage = Storage::in_memory();
+        let first = storage
+            .begin_attempt(attempt_input(
+                "decision-a",
+                "generation-a",
+                "same-evidence",
+                "same-prompt",
+            ))
+            .unwrap();
+        let second = storage
+            .begin_attempt(attempt_input(
+                "decision-b",
+                "generation-b",
+                "same-evidence",
+                "same-prompt",
+            ))
+            .unwrap();
+
+        assert!(first.was_created());
+        assert!(second.was_created());
+        assert_ne!(first.attempt().attempt_id, second.attempt().attempt_id);
+    }
+
+    #[test]
+    fn attempt_lifecycle_persists_delivery_ack_and_verification() {
+        let storage = Storage::in_memory();
+        let begun = storage
+            .begin_attempt(attempt_input(
+                "decision",
+                "generation",
+                "evidence",
+                "prompt",
+            ))
+            .unwrap();
+        let attempt_id = begun.attempt().attempt_id.clone();
+
+        assert!(storage.mark_attempt_delivery_started(&attempt_id).unwrap());
+        let delivering = read_attempt(&storage, &attempt_id);
+        assert_eq!(delivering.state, "delivering");
+        assert!(delivering.delivery_started_at.is_some());
+        assert!(delivering.transport_acked_at.is_none());
+        assert!(delivering.verified_at.is_none());
+
+        assert!(storage.mark_attempt_transport_acked(&attempt_id).unwrap());
+        assert!(
+            !storage.mark_attempt_delivery_started(&attempt_id).unwrap(),
+            "transport_acked 可能已经产生外部输入，绝不能直接重放"
+        );
+        let acked = read_attempt(&storage, &attempt_id);
+        assert_eq!(acked.state, "transport_acked");
+        assert_eq!(acked.delivery_started_at, delivering.delivery_started_at);
+        assert!(acked.transport_acked_at.is_some());
+
+        assert!(storage.mark_attempt_verified(&attempt_id).unwrap());
+        let verified = read_attempt(&storage, &attempt_id);
+        assert_eq!(verified.state, "verified");
+        assert!(verified.verified_at.is_some());
+        assert!(verified.failure_class.is_empty());
+        assert!(verified.next_retry_at.is_none());
+
+        assert!(!storage
+            .mark_attempt_failed(&attempt_id, "late-timeout", None)
+            .unwrap());
+        assert_eq!(read_attempt(&storage, &attempt_id).state, "verified");
+    }
+
+    #[test]
+    fn delivery_started_is_an_atomic_claim_and_deferred_can_be_reclaimed() {
+        let storage = Storage::in_memory();
+        let begun = storage
+            .begin_attempt(attempt_input(
+                "decision-claim",
+                "generation-claim",
+                "evidence-claim",
+                "prompt-claim",
+            ))
+            .unwrap();
+        let attempt_id = begun.attempt().attempt_id.clone();
+
+        assert!(storage.mark_attempt_delivery_started(&attempt_id).unwrap());
+        assert!(
+            !storage.mark_attempt_delivery_started(&attempt_id).unwrap(),
+            "同一个 created attempt 只能有一个 worker 取得不可逆投递资格"
+        );
+        assert!(storage
+            .mark_attempt_deferred(
+                &attempt_id,
+                "no-safe-transport",
+                Some("2000-01-01T00:00:00.000Z"),
+            )
+            .unwrap());
+        assert!(
+            storage.mark_attempt_delivery_started(&attempt_id).unwrap(),
+            "确认未投递的 deferred 必须允许安全条件恢复后的单次重试"
+        );
+        assert!(
+            !storage.mark_attempt_delivery_started(&attempt_id).unwrap(),
+            "deferred 重试同样必须是原子单赢家"
+        );
+    }
+
+    #[test]
+    fn delivery_claim_is_generation_wide_across_different_prompts() {
+        let storage = Storage::in_memory();
+        let first_id = storage
+            .begin_attempt(attempt_input(
+                "decision-first-claim",
+                "generation-shared-claim",
+                "evidence-first-claim",
+                "prompt-first-claim",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+        let second_id = storage
+            .begin_attempt(attempt_input(
+                "decision-second-claim",
+                "generation-shared-claim",
+                "evidence-second-claim",
+                "prompt-second-claim",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+
+        assert_ne!(first_id, second_id);
+        assert!(storage.mark_attempt_delivery_started(&first_id).unwrap());
+        assert!(
+            !storage.mark_attempt_delivery_started(&second_id).unwrap(),
+            "同一 generation 的第一个 claim 进入 delivering 后，其他 prompt/evidence 必须 fail closed"
+        );
+        assert_eq!(read_attempt(&storage, &first_id).state, "delivering");
+        assert_eq!(read_attempt(&storage, &second_id).state, "created");
+    }
+
+    #[test]
+    fn deferred_claim_requires_a_valid_due_retry_time() {
+        let storage = Storage::in_memory();
+
+        let future_id = storage
+            .begin_attempt(attempt_input(
+                "decision-future",
+                "generation-future",
+                "evidence-future",
+                "prompt-future",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+        assert!(storage.mark_attempt_delivery_started(&future_id).unwrap());
+        assert!(storage
+            .mark_attempt_deferred(
+                &future_id,
+                "pre-transport-backoff",
+                Some("2999-01-01T00:00:00.000Z"),
+            )
+            .unwrap());
+        assert!(
+            !storage.mark_attempt_delivery_started(&future_id).unwrap(),
+            "未到 next_retry_at 的 deferred 不能取得投递资格"
+        );
+        assert_eq!(read_attempt(&storage, &future_id).state, "deferred");
+
+        let due_id = storage
+            .begin_attempt(attempt_input(
+                "decision-due",
+                "generation-due",
+                "evidence-due",
+                "prompt-due",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+        assert!(storage.mark_attempt_delivery_started(&due_id).unwrap());
+        assert!(storage
+            .mark_attempt_deferred(
+                &due_id,
+                "pre-transport-backoff",
+                Some("2000-01-01T00:00:00.000Z"),
+            )
+            .unwrap());
+        assert!(
+            storage.mark_attempt_delivery_started(&due_id).unwrap(),
+            "到期 deferred 必须能被一个 worker 原子 claim"
+        );
+        let delivering = read_attempt(&storage, &due_id);
+        assert_eq!(delivering.state, "delivering");
+        assert!(
+            delivering.next_retry_at.is_none(),
+            "成功 claim 必须消费 next_retry_at"
+        );
+
+        let no_deadline_id = storage
+            .begin_attempt(attempt_input(
+                "decision-no-deadline",
+                "generation-no-deadline",
+                "evidence-no-deadline",
+                "prompt-no-deadline",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+        assert!(storage
+            .mark_attempt_delivery_started(&no_deadline_id)
+            .unwrap());
+        assert!(storage
+            .mark_attempt_deferred(&no_deadline_id, "manual-reconciliation", None)
+            .unwrap());
+        assert!(
+            !storage
+                .mark_attempt_delivery_started(&no_deadline_id)
+                .unwrap(),
+            "没有 retry deadline 的 deferred 必须保持 fail closed"
+        );
+    }
+
+    #[test]
+    fn unverifiable_attempts_keep_their_non_failure_state() {
+        let storage = Storage::in_memory();
+        let begun = storage
+            .begin_attempt(attempt_input(
+                "decision-unverifiable",
+                "generation-unverifiable",
+                "evidence-unverifiable",
+                "prompt-unverifiable",
+            ))
+            .unwrap();
+        let attempt_id = begun.attempt().attempt_id.clone();
+
+        assert!(storage.mark_attempt_delivery_started(&attempt_id).unwrap());
+        assert!(storage
+            .mark_attempt_unverifiable(&attempt_id, "transcript-missing", None)
+            .unwrap());
+        let attempt = read_attempt(&storage, &attempt_id);
+        assert_eq!(attempt.state, "unverifiable");
+        assert_eq!(attempt.failure_class, "transcript-missing");
+        assert!(
+            !storage.mark_attempt_delivery_started(&attempt_id).unwrap(),
+            "unverifiable 代表可能已投递，不能直接重放"
+        );
+    }
+
+    #[test]
+    fn deferred_and_failed_attempts_keep_failure_class_and_retry_time() {
+        let storage = Storage::in_memory();
+        let deferred_id = storage
+            .begin_attempt(attempt_input(
+                "decision-deferred",
+                "generation-deferred",
+                "evidence-deferred",
+                "prompt-deferred",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+        assert!(storage.mark_attempt_delivery_started(&deferred_id).unwrap());
+        assert!(storage
+            .mark_attempt_deferred(
+                &deferred_id,
+                "no-safe-transport",
+                Some("2026-08-07T10:30:00.000Z"),
+            )
+            .unwrap());
+        let deferred = read_attempt(&storage, &deferred_id);
+        assert_eq!(deferred.state, "deferred");
+        assert_eq!(deferred.failure_class, "no-safe-transport");
+        assert_eq!(
+            deferred.next_retry_at.as_deref(),
+            Some("2026-08-07T10:30:00.000Z")
+        );
+
+        let failed_id = storage
+            .begin_attempt(attempt_input(
+                "decision-failed",
+                "generation-failed",
+                "evidence-failed",
+                "prompt-failed",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+        assert!(storage.mark_attempt_delivery_started(&failed_id).unwrap());
+        assert!(storage
+            .mark_attempt_failed(&failed_id, "transport-write", None)
+            .unwrap());
+        let failed = read_attempt(&storage, &failed_id);
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.failure_class, "transport-write");
+        assert!(failed.next_retry_at.is_none());
+        assert!(
+            !storage.mark_attempt_delivery_started(&failed_id).unwrap(),
+            "failed 是终态；可安全重试的 pre-transport 失败必须使用 deferred"
+        );
+    }
+
+    #[test]
+    fn restart_reconciles_inflight_attempts_without_replaying_them() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-pulse-ledger-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("创建临时目录失败");
+        let db_path = root.join("agentpulse.db");
+
+        let (delivering_id, acked_id, created_id) = {
+            let storage = Storage::open_persistent(db_path.clone());
+            let delivering_id = storage
+                .begin_attempt(attempt_input(
+                    "decision-delivering",
+                    "generation-restart-delivering",
+                    "evidence-delivering",
+                    "prompt-restart",
+                ))
+                .unwrap()
+                .attempt()
+                .attempt_id
+                .clone();
+            let acked_id = storage
+                .begin_attempt(attempt_input(
+                    "decision-acked",
+                    "generation-restart-acked",
+                    "evidence-acked",
+                    "prompt-restart",
+                ))
+                .unwrap()
+                .attempt()
+                .attempt_id
+                .clone();
+            let created_id = storage
+                .begin_attempt(attempt_input(
+                    "decision-created",
+                    "generation-restart-created",
+                    "evidence-created",
+                    "prompt-restart",
+                ))
+                .unwrap()
+                .attempt()
+                .attempt_id
+                .clone();
+
+            assert!(storage
+                .mark_attempt_delivery_started(&delivering_id)
+                .unwrap());
+            assert!(storage.mark_attempt_delivery_started(&acked_id).unwrap());
+            assert!(storage.mark_attempt_transport_acked(&acked_id).unwrap());
+            (delivering_id, acked_id, created_id)
+        };
+
+        {
+            let storage = Storage::open_persistent(db_path.clone());
+            let pending = storage.get_non_terminal_attempts().unwrap();
+            assert_eq!(pending.len(), 3, "重启后必须读回所有待处理状态");
+
+            for generation in [
+                "generation-restart-delivering",
+                "generation-restart-acked",
+                "generation-restart-created",
+            ] {
+                let attempts = storage
+                    .get_attempts_for_generation_and_prompt(generation, "prompt-restart")
+                    .unwrap();
+                assert_eq!(attempts.len(), 1, "每个运行时代际必须保留独立恢复记录");
+            }
+
+            let reconciled = storage
+                .reconcile_inflight_attempts_as_unverifiable("startup-inflight-recovery")
+                .unwrap();
+            assert_eq!(reconciled.len(), 2);
+            assert!(reconciled
+                .iter()
+                .all(|attempt| attempt.state == "unverifiable"));
+
+            for attempt_id in [&delivering_id, &acked_id] {
+                let attempt = read_attempt(&storage, attempt_id);
+                assert_eq!(attempt.state, "unverifiable");
+                assert_eq!(attempt.failure_class, "startup-inflight-recovery");
+                assert!(attempt.next_retry_at.is_none());
+                assert!(
+                    !storage.mark_attempt_delivery_started(attempt_id).unwrap(),
+                    "启动遗留状态收敛后绝不能直接重放"
+                );
+            }
+
+            assert_eq!(read_attempt(&storage, &created_id).state, "created");
+            assert!(storage
+                .reconcile_inflight_attempts_as_unverifiable("second-pass")
+                .unwrap()
+                .is_empty());
+
+            let pending_after = storage.get_non_terminal_attempts().unwrap();
+            assert_eq!(pending_after.len(), 1);
+            assert_eq!(pending_after[0].attempt_id, created_id);
+
+            assert_eq!(read_attempt(&storage, &delivering_id).state, "unverifiable");
+            assert_eq!(read_attempt(&storage, &acked_id).state, "unverifiable");
+            assert_eq!(read_attempt(&storage, &created_id).state, "created");
+        }
+
+        std::fs::remove_dir_all(root).expect("清理临时数据库失败");
+    }
+
+    #[test]
+    fn attempt_ledger_rejects_out_of_order_and_terminal_rewrites() {
+        let storage = Storage::in_memory();
+        let attempt_id = storage
+            .begin_attempt(attempt_input(
+                "decision-order",
+                "generation-order",
+                "evidence-order",
+                "prompt-order",
+            ))
+            .unwrap()
+            .attempt()
+            .attempt_id
+            .clone();
+
+        assert!(!storage.mark_attempt_transport_acked(&attempt_id).unwrap());
+        assert!(!storage.mark_attempt_verified(&attempt_id).unwrap());
+        assert!(!storage
+            .mark_attempt_deferred(&attempt_id, "premature", None)
+            .unwrap());
+        assert!(!storage
+            .mark_attempt_failed(&attempt_id, "premature", None)
+            .unwrap());
+        assert_eq!(read_attempt(&storage, &attempt_id).state, "created");
+
+        assert!(storage.mark_attempt_delivery_started(&attempt_id).unwrap());
+        assert!(storage.mark_attempt_transport_acked(&attempt_id).unwrap());
+        assert!(!storage
+            .mark_attempt_deferred(&attempt_id, "too-late-to-defer", None)
+            .unwrap());
+        assert!(storage.mark_attempt_verified(&attempt_id).unwrap());
+        assert!(!storage.mark_attempt_transport_acked(&attempt_id).unwrap());
+        assert!(!storage
+            .mark_attempt_unverifiable(&attempt_id, "late", None)
+            .unwrap());
+        assert_eq!(read_attempt(&storage, &attempt_id).state, "verified");
+    }
+
+    #[test]
+    fn attempt_updates_report_missing_ids() {
+        let storage = Storage::in_memory();
+        assert!(!storage.mark_attempt_delivery_started("missing").unwrap());
+        assert!(!storage.mark_attempt_transport_acked("missing").unwrap());
+        assert!(!storage.mark_attempt_verified("missing").unwrap());
+        assert!(!storage
+            .mark_attempt_deferred("missing", "no-safe-transport", None)
+            .unwrap());
+        assert!(!storage
+            .mark_attempt_failed("missing", "transport-write", None)
+            .unwrap());
+    }
+
+    #[test]
     fn outcome_survives_a_round_trip() {
         let storage = Storage::in_memory();
         write(&storage, "claude", "goal", false, "silent");
 
         let records = storage.get_recent_resumes(10);
         assert_eq!(records.len(), 1);
-        // 读回来的必须还是那四个键之一，而不是被 success 挤成一个布尔
+        // 读回来的必须还是那五个键之一，而不是被 success 挤成一个布尔
         assert_eq!(records[0].outcome, "silent");
         assert!(!records[0].success);
     }
 
     #[test]
-    fn each_of_the_four_outcomes_is_filterable() {
+    fn each_of_the_five_outcomes_is_filterable() {
         let storage = Storage::in_memory();
-        write(&storage, "a", "generic", true, "landed");
-        write(&storage, "b", "generic", false, "silent");
-        write(&storage, "c", "generic", false, "failed");
-        write(&storage, "d", "generic", true, "unverifiable");
+        write(&storage, "a", "generic", false, "deferred");
+        write(&storage, "b", "generic", true, "landed");
+        write(&storage, "c", "generic", false, "silent");
+        write(&storage, "d", "generic", false, "failed");
+        write(&storage, "e", "generic", false, "unverifiable");
 
-        for key in ["landed", "silent", "failed", "unverifiable"] {
+        for key in ["deferred", "landed", "silent", "failed", "unverifiable"] {
             let got = page(&storage, key, "all");
             assert_eq!(got.total, 1, "{key} 应该只筛出一条");
             assert_eq!(got.records.len(), 1, "{key} 的列表和总数对不上");
             assert_eq!(got.records[0].outcome, key);
         }
-        assert_eq!(page(&storage, "all", "all").total, 4);
+        assert_eq!(page(&storage, "all", "all").total, 5);
     }
 
     /// 总数和列表必须走同一份筛选条件
@@ -2083,6 +3391,13 @@ mod tests {
         assert_eq!(summary.resumes, 10, "5 个会话各续跑 2 次");
         assert!((summary.cost_usd - 2.5).abs() < 1e-9);
         assert_eq!(summary.total_tokens, 500);
+
+        let live_summary = storage.session_history_summary_filtered("", "live");
+        assert_eq!(live_summary.total, 1);
+        assert_eq!(live_summary.live, 1);
+        let ended_summary = storage.session_history_summary_filtered("", "ended");
+        assert_eq!(ended_summary.total, 4);
+        assert_eq!(ended_summary.live, 0);
     }
 
     /// 汇总要跟着搜索条件走
@@ -2205,7 +3520,7 @@ mod tests {
         write_legacy_history(
             &storage,
             "claude-code-68590-2026-07-31 00:08:47",
-            "cc-68590",
+            "cc-68590-1722384000",
             "/tmp/proj",
             "2026-07-31 00:08:47",
             "2026-07-31 00:12:27",
@@ -2216,7 +3531,7 @@ mod tests {
         write_legacy_history(
             &storage,
             "claude-code-68590-2026-07-31 00:12:46",
-            "cc-68590",
+            "cc-68590-1722384000",
             "/tmp/proj",
             "2026-07-31 00:12:46",
             "2026-07-31 00:20:00",
@@ -2227,7 +3542,7 @@ mod tests {
         write_legacy_history(
             &storage,
             "claude-code-68590-2026-07-31 00:21:03",
-            "cc-68590",
+            "cc-68590-1722384000",
             "/tmp/proj",
             "2026-07-31 00:21:03",
             "2026-07-31 00:25:00",
@@ -2259,7 +3574,7 @@ mod tests {
             write_legacy_history(
                 &storage,
                 &format!("claude-code-68590-2026-07-31 {seen}"),
-                "cc-68590",
+                "cc-68590-1722384000",
                 "/tmp/proj",
                 &format!("2026-07-31 {seen}"),
                 &format!("2026-07-31 {seen}"),
@@ -2305,10 +3620,21 @@ mod tests {
             0,
             0.0,
         );
-        // 同一个目录但不同会话
+        // 同一个目录但不同会话：旧版 `adapter-pid` 无法排除 PID 复用，必须保留。
         write_legacy_history(
             &storage,
             "k3",
+            "cc-1",
+            "/tmp/alpha",
+            "2026-07-31 00:00:00",
+            "2026-07-31 00:00:00",
+            0,
+            0,
+            0.0,
+        );
+        write_legacy_history(
+            &storage,
+            "k4",
             "cc-2",
             "/tmp/alpha",
             "2026-07-31 00:00:00",
@@ -2320,7 +3646,11 @@ mod tests {
 
         storage.merge_fragmented_history();
 
-        assert_eq!(storage.session_history(50, "").len(), 3, "这是三个会话");
+        assert_eq!(
+            storage.session_history(50, "").len(),
+            4,
+            "旧版相同 PID + cwd 的不同运行不能被危险合并"
+        );
     }
 
     /// 用记录文件当主键的行从来没有这个毛病，不该被碰
