@@ -40,6 +40,39 @@ const TABLE = {
   "footer.last_scan": ["最近扫描 {time}", "last scan {time}"],
   "footer.never_scanned": ["尚未扫描", "not scanned yet"],
 
+  // ── 首次使用 ──
+  "onboarding.title": ["三步开始守护", "Start monitoring in three steps"],
+  "onboarding.desc": [
+    "Agent 仍由你在项目终端里正常启动，AgentPulse 只负责观察与安全续跑",
+    "You still start agents normally in project terminals; AgentPulse only observes and resumes safely",
+  ],
+  "onboarding.settings": ["前往设置", "Open settings"],
+  "onboarding.monitor.title": ["开始守护", "Start monitoring"],
+  "onboarding.monitor.body": [
+    "开启周期扫描，发现本机正在运行的受支持 Agent",
+    "Enable periodic scans to discover supported agents already running on this machine",
+  ],
+  "onboarding.monitor.action": ["开始守护", "Start monitoring"],
+  "onboarding.monitor.ready": ["守护中", "Monitoring"],
+  "onboarding.agent.title": ["在项目终端运行 Agent", "Run an agent in your project terminal"],
+  "onboarding.agent.body": [
+    "像平时一样自行运行其中一个命令；这里仅作提示，不会替你执行",
+    "Run one of these commands yourself as usual; they are examples only and are never executed here",
+  ],
+  "onboarding.agent.commands": ["可用命令示例", "Example commands"],
+  "onboarding.scan.title": ["立即扫描", "Scan now"],
+  "onboarding.scan.body": [
+    "Agent 启动后手动刷新一次，不必等待下一轮周期扫描",
+    "Refresh once after the agent starts instead of waiting for the next scheduled scan",
+  ],
+  "onboarding.scan.action": ["立即扫描", "Scan now"],
+  "onboarding.scan.ready": ["已扫描", "Scanned"],
+  "onboarding.boundary.title": ["非侵入式守护", "Non-invasive monitoring"],
+  "onboarding.boundary.body": [
+    "不会启动或接管 Agent，只观察进程和会话记录；无法精确定位目标终端时不会盲目输入。",
+    "AgentPulse never starts or takes over agents. It only observes processes and transcripts, and never types when the target terminal cannot be located precisely.",
+  ],
+
   // ── 指标卡 ──
   "metric.sessions": ["会话总数", "Sessions"],
   "metric.active": ["活跃", "Active"],
@@ -54,6 +87,23 @@ const TABLE = {
   "session.empty_hint": [
     "启动 Claude Code / Codex CLI / OpenCode，会话会自动出现在这里",
     "Start Claude Code, Codex CLI or OpenCode — sessions show up here on their own",
+  ],
+  "session.search.placeholder": [
+    "搜索项目、Agent 或终端…",
+    "Search project, agent or terminal…",
+  ],
+  "session.search.label": ["搜索会话", "Search sessions"],
+  "session.scope.label": ["会话范围", "Session scope"],
+  "session.scope.all": ["全部 {count}", "All {count}"],
+  "session.scope.attention": ["等我 {count}", "Needs me {count}"],
+  "session.scope.stalled": ["卡住 {count}", "Stalled {count}"],
+  "session.scope.active": ["活跃 {count}", "Active {count}"],
+  "session.result_count": ["显示 {visible}/{total}", "Showing {visible}/{total}"],
+  "session.clear_filters": ["清除", "Clear"],
+  "session.no_matches": ["没有符合条件的会话", "No matching sessions"],
+  "session.no_matches_hint": [
+    "换个关键词或清除筛选，正在守护的会话没有消失",
+    "Try another query or clear filters — monitored sessions are still here",
   ],
   "session.resumed": ["已续跑 {count} 次", "resumed {count}×"],
   // 这两条是把「静默失败」摆到台面上。自动续跑的价值全在无感，代价是它坏掉的

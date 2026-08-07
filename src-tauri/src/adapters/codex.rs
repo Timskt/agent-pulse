@@ -32,10 +32,11 @@ impl AgentAdapter for CodexAdapter {
             }
 
             sessions.push(AgentSession {
-                id: format!("cx-{}", proc.pid),
+                id: super::process_session_id("cx", proc),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
                 pid: proc.pid,
+                process_started_at: proc.started_at,
                 command: proc.cmd.clone(),
                 working_dir: proc.cwd.clone(),
                 session_file: None,

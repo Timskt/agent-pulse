@@ -1,5 +1,5 @@
 import { useId, useMemo, useState } from "react";
-import { useI18n } from "../i18n";
+import { useI18n, type I18nKey } from "../i18n";
 import {
   ATTENTION_ICON,
   ATTENTION_TONE,
@@ -10,6 +10,11 @@ import {
   statusKey,
   TACTIC_NOTE,
 } from "../lib/display";
+import {
+  selectVisibleSessions,
+  sessionInScope,
+  type SessionScope,
+} from "../lib/sessions";
 import { baseName, cn, formatTokens, formatUsd } from "../lib/utils";
 import { useNotice, type Notice } from "../lib/useNotice";
 import {
@@ -18,13 +23,17 @@ import {
   selectSessions,
   useAppStore,
 } from "../stores/useAppStore";
-import type {
-  AgentSession,
-  AttentionLevel,
-  DetectionEvidence,
-  ResumeProbe,
-} from "../types";
-import { Badge, Button, Card, CardBar, EmptyState, Tooltip } from "./ui";
+import type { AgentSession, DetectionEvidence, ResumeProbe } from "../types";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBar,
+  EmptyState,
+  Segmented,
+  TextInput,
+  Tooltip,
+} from "./ui";
 
 /**
  * 会话列表
@@ -34,40 +43,36 @@ import { Badge, Button, Card, CardBar, EmptyState, Tooltip } from "./ui";
  * 排序也按「谁在等我」而不是发现顺序——需要人介入的永远浮在最上面。
  */
 
-/** 注意力级别的紧急程度，数字越小越靠前 */
-const ATTENTION_WEIGHT: Record<AttentionLevel, number> = {
-  needs_input: 0,
-  error: 1,
-  rate_limited: 2,
-  completed: 3,
-  none: 4,
-};
-
-const STATUS_WEIGHT: Record<AgentSession["status"], number> = {
-  interrupted: 0,
-  suspended: 1,
-  active: 2,
-  completed: 3,
-  exited: 4,
-};
-
 export function SessionList() {
   const { t } = useI18n();
   const sessions = useAppStore(selectSessions);
   const focusedSessionId = useAppStore(selectFocusedSessionId);
   const config = useAppStore(selectConfig);
   const { notice, show } = useNotice();
+  const [query, setQuery] = useState("");
+  const [scope, setScope] = useState<SessionScope>("all");
 
-  const ordered = useMemo(
-    () =>
-      [...sessions].sort(
-        (a, b) =>
-          ATTENTION_WEIGHT[a.attention] - ATTENTION_WEIGHT[b.attention] ||
-          STATUS_WEIGHT[a.status] - STATUS_WEIGHT[b.status] ||
-          b.last_activity.localeCompare(a.last_activity),
-      ),
-    [sessions],
+  const visible = useMemo(
+    () => selectVisibleSessions(sessions, scope, query),
+    [sessions, scope, query],
   );
+
+  const scopeOptions = useMemo(
+    () =>
+      (["all", "attention", "stalled", "active"] as const).map((value) => ({
+        value,
+        label: t(SCOPE_KEY[value], {
+          count: sessions.filter((session) => sessionInScope(session, value)).length,
+        }),
+      })),
+    [sessions, t],
+  );
+
+  const filtersActive = scope !== "all" || query.trim().length > 0;
+  const resetFilters = () => {
+    setScope("all");
+    setQuery("");
+  };
 
   return (
     <Card className="overflow-hidden">
@@ -75,10 +80,43 @@ export function SessionList() {
         <h3 className="text-xs font-semibold text-neutral-800">
           {t("session.title")}
         </h3>
-        <span className="text-[10px] tabular-nums text-neutral-400">
-          {ordered.length}
+        <span
+          className="text-[10px] tabular-nums text-neutral-400"
+          aria-live="polite"
+        >
+          {filtersActive
+            ? t("session.result_count", {
+                visible: visible.length,
+                total: sessions.length,
+              })
+            : sessions.length}
         </span>
       </CardBar>
+
+      {sessions.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-neutral-100 bg-neutral-50/50 px-4 py-2.5">
+          <TextInput
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={t("session.search.placeholder")}
+            aria-label={t("session.search.label")}
+            className="h-8 min-w-44 flex-1 py-1.5 sm:max-w-64"
+          />
+          <Segmented
+            value={scope}
+            options={scopeOptions}
+            onChange={setScope}
+            ariaLabel={t("session.scope.label")}
+            className="max-w-full overflow-x-auto"
+          />
+          {filtersActive && (
+            <Button size="xs" variant="ghost" onClick={resetFilters}>
+              {t("session.clear_filters")}
+            </Button>
+          )}
+        </div>
+      )}
 
       {notice && (
         <p
@@ -91,11 +129,17 @@ export function SessionList() {
         </p>
       )}
 
-      {ordered.length === 0 ? (
+      {sessions.length === 0 ? (
         <EmptyState title={t("session.empty")} hint={t("session.empty_hint")} />
+      ) : visible.length === 0 ? (
+        <EmptyState
+          title={t("session.no_matches")}
+          hint={t("session.no_matches_hint")}
+          className="py-8"
+        />
       ) : (
         <div className="divide-y divide-neutral-100">
-          {ordered.map((session) => (
+          {visible.map((session) => (
             <SessionRow
               key={session.id}
               session={session}
@@ -110,6 +154,13 @@ export function SessionList() {
     </Card>
   );
 }
+
+const SCOPE_KEY: Record<SessionScope, I18nKey> = {
+  all: "session.scope.all",
+  attention: "session.scope.attention",
+  stalled: "session.scope.stalled",
+  active: "session.scope.active",
+};
 
 function SessionRow({
   session,

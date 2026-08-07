@@ -10,6 +10,8 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 #[derive(Debug, Clone)]
 pub struct ProcessSnapshot {
     pub pid: u32,
+    /// 进程启动时刻（Unix 秒）；与 PID 一起组成进程代际身份。
+    pub started_at: u64,
     /// 小写进程名（Windows 含 .exe 后缀）
     pub name: String,
     /// 完整命令行
@@ -18,7 +20,7 @@ pub struct ProcessSnapshot {
     pub cwd: String,
 }
 
-/// 获取当前所有进程的轻量快照（仅 name/cmd/cwd，不刷新 CPU/内存/磁盘）
+/// 获取当前所有进程的轻量快照（PID/启动时刻/name/cmd/cwd；不刷新 CPU/内存/磁盘）
 pub fn take_process_snapshot() -> Vec<ProcessSnapshot> {
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -34,6 +36,7 @@ pub fn take_process_snapshot() -> Vec<ProcessSnapshot> {
         .iter()
         .map(|(pid, process)| ProcessSnapshot {
             pid: pid.as_u32(),
+            started_at: process.start_time(),
             name: process.name().to_string_lossy().to_lowercase(),
             cmd: process
                 .cmd()
@@ -47,6 +50,45 @@ pub fn take_process_snapshot() -> Vec<ProcessSnapshot> {
                 .unwrap_or_default(),
         })
         .collect()
+}
+
+/// 用「PID + 启动时刻」生成进程代际稳定的会话 id。
+///
+/// 只用 PID 会把已经退出的旧 Agent 和随后复用同一 PID 的新进程并成同一个会话，
+/// 连带继承旧会话的冷却、失败退避和自动续跑额度。启动时刻跨 AgentPulse 重启稳定，
+/// 又能在 PID 复用时自然换代，因此比首次发现时间更适合做身份的一部分。
+pub fn process_session_id(prefix: &str, process: &ProcessSnapshot) -> String {
+    format!("{prefix}-{}-{}", process.pid, process.started_at)
+}
+
+/// 续跑前确认「这个 PID 仍然是刚才发现的那一代 Agent 进程」。
+///
+/// 只看 PID 存不存在还不够：进程退出后 PID 可能很快被系统复用。这里直接定向刷新
+/// 目标 PID，而不是为每条排队动作重新枚举整张进程表；启动时刻必须一致，命令行在
+/// 两边都可读时也必须一致。旧版本反序列化出来没有启动时刻时，仍退回 PID + 命令行。
+pub fn process_matches_session(session: &AgentSession) -> bool {
+    let pid = sysinfo::Pid::from_u32(session.pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let Some(current) = system.process(pid) else {
+        return false;
+    };
+
+    if session.process_started_at != 0 && current.start_time() != session.process_started_at {
+        return false;
+    }
+
+    let current_command = current
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    session.command.is_empty() || current_command.is_empty() || current_command == session.command
 }
 
 /// 将路径转为 glob 安全的模式串
@@ -68,6 +110,9 @@ pub struct AgentSession {
     pub agent_name: String,
     /// 关联的进程 PID
     pub pid: u32,
+    /// 进程启动时刻（Unix 秒）。只在 Rust 内参与进程代际识别，不暴露给界面。
+    #[serde(default, skip_serializing)]
+    pub process_started_at: u64,
     /// 进程命令行
     pub command: String,
     /// 工作目录
@@ -186,7 +231,8 @@ impl AgentSession {
     /// 优先用会话文件路径：进程重启换了 PID，但只要还是同一份记录，
     /// 时间线就该接上同一条，而不是多出一行。
     ///
-    /// 没有记录文件的适配器（Codex / OpenCode）退回 `adapter-pid-工作目录`。
+    /// 没有记录文件的适配器（Codex / OpenCode）退回
+    /// `adapter-pid-进程启动时刻-工作目录`。旧数据缺少启动时刻时兼容旧键形状。
     ///
     /// **这里刻意不含 `discovered_at`。** 含过，结果是这样的：`discovered_at`
     /// 只在进程内靠上一轮的会话表续着，AgentPulse 自己一重启那张表就空了，
@@ -194,17 +240,23 @@ impl AgentSession {
     /// 真实库里因此出现过同一个会话摊成 16 行的情况——历史页看着像噪音，
     /// 是因为它那时列的其实是「重启记录」，不是会话。
     ///
-    /// 代价是 PID 被系统回收、且新进程恰好在同一个工作目录跑同一种 agent 时，
-    /// 两个会话会并成一行。那是小概率且只丢一行历史；而含时间戳的版本是
-    /// **每次重启都必然**多出一堆重复行。
+    /// 进程启动时刻来自操作系统，跨 AgentPulse 重启保持不变，但 PID 被复用时会变化；
+    /// 因而既不会像 `discovered_at` 那样每次应用重启都裂出新行，也不会把两代进程并在一起。
     ///
     /// **必须跟收尾那一步用同一个定义**，否则「本轮还活着的键」跟表里的键对不上，
     /// [`crate::storage::Storage::close_missing_sessions`] 会把活着的会话
     /// 判成已结束——一个字面量抄两遍就够犯这个错，所以收成一个方法。
     pub fn history_key(&self) -> String {
-        self.session_file
-            .clone()
-            .unwrap_or_else(|| format!("{}-{}-{}", self.adapter_id, self.pid, self.working_dir))
+        self.session_file.clone().unwrap_or_else(|| {
+            if self.process_started_at == 0 {
+                format!("{}-{}-{}", self.adapter_id, self.pid, self.working_dir)
+            } else {
+                format!(
+                    "{}-{}-{}-{}",
+                    self.adapter_id, self.pid, self.process_started_at, self.working_dir
+                )
+            }
+        })
     }
 }
 
@@ -215,6 +267,7 @@ impl Default for AgentSession {
             adapter_id: String::new(),
             agent_name: String::new(),
             pid: 0,
+            process_started_at: 0,
             command: String::new(),
             working_dir: String::new(),
             session_file: None,
@@ -354,6 +407,67 @@ pub fn all_adapters() -> Vec<Box<dyn AgentAdapter>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn current_process_matches_its_own_snapshot() {
+        let snapshot = take_process_snapshot()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("测试进程应该在系统快照里");
+        let session = AgentSession {
+            pid: snapshot.pid,
+            process_started_at: snapshot.started_at,
+            command: snapshot.cmd,
+            ..Default::default()
+        };
+        assert!(process_matches_session(&session));
+    }
+
+    #[test]
+    fn missing_process_never_matches_a_session() {
+        let session = AgentSession {
+            pid: u32::MAX,
+            ..Default::default()
+        };
+        assert!(!process_matches_session(&session));
+    }
+    #[test]
+    fn a_reused_pid_with_a_different_start_time_is_rejected() {
+        let snapshot = take_process_snapshot()
+            .into_iter()
+            .find(|process| process.pid == std::process::id())
+            .expect("测试进程应该在系统快照里");
+        let session = AgentSession {
+            pid: snapshot.pid,
+            process_started_at: snapshot.started_at.saturating_add(1),
+            command: snapshot.cmd,
+            ..Default::default()
+        };
+        assert!(
+            !process_matches_session(&session),
+            "PID 相同但启动代际不同，必须视为另一进程"
+        );
+    }
+
+    #[test]
+    fn process_generation_is_part_of_the_session_id() {
+        let base = ProcessSnapshot {
+            pid: 42,
+            started_at: 100,
+            name: "codex".into(),
+            cmd: "codex".into(),
+            cwd: "/tmp/project".into(),
+        };
+        let mut replacement = base.clone();
+        replacement.started_at = 200;
+
+        assert_eq!(process_session_id("cx", &base), "cx-42-100");
+        assert_ne!(
+            process_session_id("cx", &base),
+            process_session_id("cx", &replacement),
+            "PID 被复用后必须生成新会话 id，不能继承旧冷却与额度"
+        );
+    }
+
     /// 造一个会话：`file` 决定它有没有可读记录
     fn session(last_activity: &str, file: Option<&str>) -> AgentSession {
         AgentSession {
@@ -458,6 +572,21 @@ mod tests {
         assert_ne!(a.history_key(), b.history_key());
     }
 
+    /// 没有记录文件时，PID 被复用也不能把两代进程并成一条历史。
+    #[test]
+    fn a_reused_pid_gets_a_new_history_key() {
+        let mut old = session(&ago(0), None);
+        old.adapter_id = "codex".into();
+        old.pid = 111;
+        old.process_started_at = 1_000;
+        old.working_dir = "/tmp/proj".into();
+        let mut replacement = old.clone();
+        replacement.process_started_at = 2_000;
+
+        assert_eq!(old.history_key(), "codex-111-1000-/tmp/proj");
+        assert_ne!(old.history_key(), replacement.history_key());
+    }
+
     /// 同一个工作目录下跑着两种不同的 agent，不能并成一行
     #[test]
     fn different_adapters_in_one_directory_stay_apart() {
@@ -480,6 +609,7 @@ mod tests {
         let mut before = session(&ago(0), None);
         before.adapter_id = "codex".into();
         before.pid = 111;
+        before.process_started_at = 1_000;
         before.working_dir = "/tmp/proj".into();
         before.discovered_at = "2026-08-04 10:00:00".into();
 

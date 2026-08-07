@@ -132,60 +132,10 @@ async fn manual_resume(
     session_id: String,
     use_goal_prompt: Option<bool>,
 ) -> Result<String, String> {
-    let i18n = state.i18n();
-    let session = {
-        let s = state.engine.state.lock().await;
-        s.sessions
-            .iter()
-            .find(|sess| sess.id == session_id)
-            .cloned()
-            .ok_or_else(|| i18n.t("err.session_not_found").to_string())?
-    };
-
-    let use_goal = use_goal_prompt.unwrap_or(false);
-    let resumer = resumer::Resumer::new(state.config_manager.get());
-    // 核验要等几秒，等完再问「卡了多久」就把这几秒也算进去了
-    let stuck_secs = session.stuck_secs();
-    // 走带核验的入口：手动续跑最需要说实话——用户点完就盯着看结果，
-    // 只报「脚本没报错」的话，敲进了隔壁标签页的那一次也会显示成功
-    let (outcome, detail) = resumer.resume_verified(&session, use_goal).await;
-    let ok = outcome.counts_as_nudge();
-    let text = format!("{} · {}", i18n.t(outcome.i18n_key()), detail);
-
-    // 手动续跑也要进统计，否则「成功率」只反映自动续跑
-    let prompt_type = if use_goal { "goal" } else { "generic" };
-    state.storage.record_resume(storage::ResumeEvent {
-        session_id: &session.id,
-        agent_name: &session.agent_name,
-        working_dir: &session.working_dir,
-        prompt_type,
-        success: ok,
-        outcome: outcome.storage_key(),
-        stuck_secs,
-        message: &detail,
-    });
-    // 冷却计时器也要跟着走：不写的话，下一轮自动续跑会以为这个会话从没被催过，
-    // 立刻再敲一次，同一个会话吃两条提示词
-    state.engine.note_manual_resume(&session.id, outcome).await;
-
     state
         .engine
-        .push_event(EngineEvent::new(
-            if ok {
-                LogLevel::Success
-            } else {
-                LogLevel::Error
-            },
-            Some(session_id),
-            i18n.tf("log.resume_manual", &[("detail", &text)]),
-        ))
-        .await;
-
-    if ok {
-        Ok(text)
-    } else {
-        Err(text)
-    }
+        .manual_resume(&session_id, use_goal_prompt.unwrap_or(false))
+        .await
 }
 
 /// 跳到会话所在的终端标签页

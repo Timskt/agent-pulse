@@ -21,14 +21,15 @@ use crate::detector::{
 };
 use crate::i18n::{I18n, Lang};
 use crate::notify::Notifier;
-use crate::resumer::{ResumeOutcome, Resumer};
+use crate::resumer::{activity_fingerprint, ActivityFingerprint, ResumeOutcome, Resumer};
 use crate::storage::Storage;
 use crate::webhook::WebhookNotifier;
 use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 /// 连续失败几次就该改成大声说
@@ -151,7 +152,7 @@ impl MonitorState {
 /// 一轮扫描在阻塞线程里攒出来的全部结果
 struct ScanOutcome {
     sessions: Vec<AgentSession>,
-    detections: Vec<(AgentSession, DetectionResult)>,
+    detections: Vec<DetectionSnapshot>,
     /// 判定层明确说「再问一句可能改变结果」的候选；异步侧每轮最多问一个
     to_arbitrate: Vec<ArbitrationRequest>,
     /// 本轮新落库的用量记录条数
@@ -160,6 +161,121 @@ struct ScanOutcome {
     cost_today: f64,
     /// 限流窗口预测；没配 token 预算时为 None
     forecast: Option<RateLimitForecast>,
+}
+
+/// 一次判定连同它读取记录时看到的版本。
+///
+/// 判定和动作之间不能只靠 `session_id` 连接：记录只要又长了一行，刚才那份“卡住”
+/// 结论就已经过期，必须交给下一轮重新判断，不能拿旧结论继续往终端里敲字。
+struct DetectionSnapshot {
+    session: AgentSession,
+    detection: DetectionResult,
+    activity: Option<ActivityFingerprint>,
+}
+
+struct ResumeAction {
+    session: AgentSession,
+    use_goal_prompt: bool,
+    observed_activity: Option<ActivityFingerprint>,
+    /// 绑定生成动作时那一次守护生命周期；停止后即使马上重启，旧动作也不能复活。
+    lifecycle_epoch: u64,
+    /// 检测快照形成时已经停顿了多久；不能把排队与投递后核验的耗时算进去。
+    stuck_secs: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResumeCommit {
+    resume_count: u32,
+    resume_failures: u32,
+}
+
+/// 会话级续跑租约表。
+///
+/// 自动扫描、手动按钮乃至未来的远程入口都必须先从这里拿租约。租约离开作用域时
+/// 自动释放，因此新增早退分支、`?` 返回甚至任务 unwind 都不会把会话永久卡在
+/// “续跑处理中”。真正的投递仍由全局 `delivery_lock` 串行化；这里管的是同会话幂等。
+#[derive(Default)]
+struct ResumeRegistry {
+    sessions: std::sync::Mutex<HashSet<String>>,
+}
+
+impl ResumeRegistry {
+    fn try_acquire(&self, session_id: &str) -> Option<ResumeLease<'_>> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sessions.insert(session_id.to_string()) {
+            return None;
+        }
+        Some(ResumeLease {
+            registry: self,
+            session_id: session_id.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    fn is_active(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+    }
+}
+
+struct ResumeLease<'a> {
+    registry: &'a ResumeRegistry,
+    session_id: String,
+}
+
+impl Drop for ResumeLease<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session_id);
+    }
+}
+
+/// 自动续跑协调队列：同一会话只保留最新动作，不让扫描频率把旧快照堆成长龙。
+///
+/// `order` 保证不同会话先进先出，`actions` 负责按 session id 合并。一个会话正在
+/// 投递时，队列仍可保留一条更新鲜的后继快照：当前动作若因等待全局锁而过期，worker
+/// 可以立刻接上最新动作；若当前动作已经送达，后继动作会被冷却/状态重验安全取消。
+#[derive(Default)]
+struct ResumeQueue {
+    order: VecDeque<String>,
+    actions: HashMap<String, ResumeAction>,
+}
+
+impl ResumeQueue {
+    fn upsert(&mut self, action: ResumeAction) {
+        let session_id = action.session.id.clone();
+        if !self.actions.contains_key(&session_id) {
+            self.order.push_back(session_id.clone());
+        }
+        self.actions.insert(session_id, action);
+    }
+
+    fn pop_front(&mut self) -> Option<ResumeAction> {
+        while let Some(session_id) = self.order.pop_front() {
+            if let Some(action) = self.actions.remove(&session_id) {
+                return Some(action);
+            }
+        }
+        None
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.actions.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.actions.len()
+    }
 }
 
 /// 一次待问的第二意见。指纹把答案绑定到这一版记录，记录一变就重新判断。
@@ -176,6 +292,20 @@ type TerminalCache = HashMap<u32, (Option<String>, Option<String>)>;
 /// 监控引擎 — 核心调度器
 pub struct MonitorEngine {
     pub state: Arc<Mutex<MonitorState>>,
+    /// 扫描不可重入：后台节拍、托盘“立即扫描”和界面按钮可能同时触发。
+    /// 不串行会让两轮都看到同一个中断，再各自投递一遍。
+    scan_lock: Mutex<()>,
+    /// 所有真实键盘/剪贴板投递共用一把锁。前台窗口和剪贴板都是全局单件，
+    /// 手动续跑也必须跟自动续跑走同一条串行通道。
+    delivery_lock: Mutex<()>,
+    /// 同一个会话同一时刻只允许存在一个续跑意图；租约离开作用域时自动释放。
+    resume_registry: ResumeRegistry,
+    /// 自动动作进入专用协调队列；扫描只产出动作，不再等待每个动作的落地核验。
+    resume_queue: std::sync::Mutex<ResumeQueue>,
+    resume_notify: Notify,
+    resume_worker_started: AtomicBool,
+    /// 每次开始/停止都递增。动作绑定生成时的代数，防止“停一下又启动”复活旧队列。
+    lifecycle_epoch: AtomicU64,
     /// 持有管理器而不是快照，配置才能热更新
     config_manager: Arc<ConfigManager>,
     started_at: std::sync::Mutex<Option<std::time::Instant>>,
@@ -199,6 +329,13 @@ impl MonitorEngine {
         let cursors = storage.load_usage_cursors();
         Self {
             state: Arc::new(Mutex::new(MonitorState::default())),
+            scan_lock: Mutex::new(()),
+            delivery_lock: Mutex::new(()),
+            resume_registry: ResumeRegistry::default(),
+            resume_queue: std::sync::Mutex::new(ResumeQueue::default()),
+            resume_notify: Notify::new(),
+            resume_worker_started: AtomicBool::new(false),
+            lifecycle_epoch: AtomicU64::new(0),
             config_manager,
             started_at: std::sync::Mutex::new(None),
             storage,
@@ -271,7 +408,7 @@ impl MonitorEngine {
     }
 
     /// 启动监控循环
-    pub async fn start(&self) {
+    pub async fn start(self: &Arc<Self>) {
         {
             let mut state = self.state.lock().await;
             // 托盘和界面各点一次「开始监控」不该起两条循环
@@ -280,6 +417,7 @@ impl MonitorEngine {
             }
             state.running = true;
             state.status.running = true;
+            self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         }
         *self.started_at.lock().unwrap() = Some(std::time::Instant::now());
 
@@ -336,7 +474,15 @@ impl MonitorEngine {
             }
             state.running = false;
             state.status.running = false;
+            self.lifecycle_epoch.fetch_add(1, Ordering::SeqCst);
         }
+
+        // 尚未拿到投递通道的自动动作全部取消；生命周期代数还会挡住已经出队、
+        // 正在等待手动动作释放全局锁的那一条。手动续跑不在这个队列里，不受影响。
+        self.resume_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
 
         let config = self.config();
         if let Some(notifier) = self.notifier.get() {
@@ -352,20 +498,32 @@ impl MonitorEngine {
     }
 
     /// 执行一次完整扫描
-    pub async fn scan_once(&self) {
+    pub async fn scan_once(self: &Arc<Self>) {
+        // `scan_now`、托盘菜单和后台 ticker 都能走到这里。两轮并发不只是多读一次盘：
+        // 它们会同时基于同一份旧状态安排续跑，最终给同一会话敲两条提示词。
+        let _scan_guard = self.scan_lock.lock().await;
+
         let config = self.config();
         let lang = config.language.clone();
         let i18n = I18n::from_code(&lang);
 
         self.storage.record_scan();
 
-        let existing: HashMap<String, AgentSession> = {
+        let (existing, auto_resume_armed, lifecycle_epoch): (
+            HashMap<String, AgentSession>,
+            bool,
+            u64,
+        ) = {
             let state = self.state.lock().await;
-            state
-                .sessions
-                .iter()
-                .map(|s| (s.id.clone(), s.clone()))
-                .collect()
+            (
+                state
+                    .sessions
+                    .iter()
+                    .map(|s| (s.id.clone(), s.clone()))
+                    .collect(),
+                state.running,
+                self.lifecycle_epoch.load(Ordering::SeqCst),
+            )
         };
 
         let Some(outcome) = self.collect(config.clone(), existing).await else {
@@ -389,7 +547,7 @@ impl MonitorEngine {
         } else {
             None
         };
-        let mut resume_actions: Vec<(AgentSession, bool)> = Vec::new();
+        let mut resume_actions: Vec<ResumeAction> = Vec::new();
         // 本轮**新**确认中断的会话数
         //
         // 一个会话可以连着几十轮都是「确认中断」（用户关了自动续跑，或者已经
@@ -397,7 +555,9 @@ impl MonitorEngine {
         // 界面上的检测数就会跟 `detection_records` 里的行数越差越远。
         let mut newly_confirmed: u32 = 0;
 
-        for (session, detection) in &detections {
+        for snapshot in &detections {
+            let session = &snapshot.session;
+            let detection = &snapshot.detection;
             match detection.verdict {
                 Verdict::ConfirmInterrupt => {
                     let signals = detection
@@ -501,8 +661,14 @@ impl MonitorEngine {
                         effective_cooldown(config.resume_cooldown_secs, session.resume_failures);
                     let cooled = check_cooldown(session, cooldown);
                     let has_budget = has_nudges_left(session, config.max_resume_count);
-                    if cooled && has_budget && config.auto_resume_enabled {
-                        resume_actions.push((session.clone(), detection.has_active_goal));
+                    if cooled && has_budget && config.auto_resume_enabled && auto_resume_armed {
+                        resume_actions.push(ResumeAction {
+                            session: session.clone(),
+                            use_goal_prompt: detection.has_active_goal,
+                            observed_activity: snapshot.activity,
+                            lifecycle_epoch,
+                            stuck_secs: session.stuck_secs(),
+                        });
                     } else if !has_budget {
                         // 说清楚是「催不动了」而不是「还在冷却」：两者的下一步动作
                         // 完全不同——一个等几十秒就好，一个得人去看一眼。
@@ -559,13 +725,22 @@ impl MonitorEngine {
         // ── 把判定结论合并回会话列表 ──
         //
         // **这里不碰 `resume_count` / `last_resume_at`**：字还没敲出去呢。
-        // 计数一律等 `run_resumes` 拿到真实结果之后由 `commit_resume_outcome` 落笔。
+        // 计数一律等 续跑 worker 拿到真实结果之后由 `commit_resume_outcome` 落笔。
         // 旧代码在这儿就把计数加了、失败也不回退，等于把「敲不进去」记成
         // 「已经敲够了」，五次之后自动续跑对这个会话永久沉默——详见
         // `ResumeOutcome::counts_as_nudge` 上的说明。
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let running_session_ids: HashSet<String> = detections
+            .iter()
+            .filter(|snapshot| snapshot.detection.verdict == Verdict::Running)
+            .map(|snapshot| snapshot.session.id.clone())
+            .collect();
         for session in &mut sessions {
-            if let Some((_, detection)) = detections.iter().find(|(s, _)| s.id == session.id) {
+            if let Some(snapshot) = detections
+                .iter()
+                .find(|snapshot| snapshot.session.id == session.id)
+            {
+                let detection = &snapshot.detection;
                 session.attention = detection.attention;
                 session.attention_detail = detection.attention_detail.clone();
                 session.detection_evidence = Some(detection.evidence.clone());
@@ -673,6 +848,10 @@ impl MonitorEngine {
         let confirmed = newly_confirmed;
         {
             let mut state = self.state.lock().await;
+            // 投递核验已从扫描临界区拆出，因此上一轮动作可能在本轮读盘期间完成。
+            // 不能用扫描开始时复制的计数覆盖刚落笔的投递结果；在同一把状态锁内把
+            // 续跑运行态重新合并回来。只有本轮明确看见 `Running` 才清空自动连击。
+            merge_resume_runtime(&mut sessions, &state.sessions, &running_session_ids);
             state.status.sessions_total = total;
             state.status.sessions_active = active;
             state.status.sessions_interrupted = interrupted;
@@ -686,10 +865,6 @@ impl MonitorEngine {
         // 仲裁只加速「弱证据」的结论，不阻塞本轮状态合并。答案缓存到下一轮使用；
         // 每轮最多问一个，避免多个会话同时可疑时突然并发烧额度。
         self.ask_one_arbitration(&config, &i18n, to_arbitrate).await;
-
-        // ── 执行续跑：AppleScript 一次可能要几秒，放最后，别拖着状态更新 ──
-        self.run_resumes(&config, &i18n, &webhook, &resume_actions)
-            .await;
 
         if config.heartbeat_log {
             self.push_event(EngineEvent::new(
@@ -706,6 +881,12 @@ impl MonitorEngine {
             ))
             .await;
         }
+
+        // 从这里开始不再持有扫描锁。投递后的落地核验最长要等数秒，多个会话串行时
+        // 更久；把它留在扫描临界区会让“立即扫描”和下一轮检测一起排队。动作自身有
+        // 会话租约、全局投递锁和出手前失效检查，因此可以安全地与下一轮检测重叠。
+        drop(_scan_guard);
+        self.enqueue_resume_actions(resume_actions);
     }
 
     /// 把本轮的会话状态写进历史表，并给已经消失的会话收尾
@@ -831,7 +1012,7 @@ impl MonitorEngine {
 
             // 5. 逐会话检测（进程存活直接从快照判定，不再额外问系统）
             let detector = Detector::new(config.clone());
-            let mut detections: Vec<(AgentSession, DetectionResult)> = Vec::new();
+            let mut detections: Vec<DetectionSnapshot> = Vec::new();
             let mut to_arbitrate = Vec::new();
             for adapter in &adapter_list {
                 for session in &sessions {
@@ -839,6 +1020,7 @@ impl MonitorEngine {
                         continue;
                     }
                     let alive = live_pids.contains(&session.pid);
+                    let activity_before = activity_fingerprint(session);
                     let output = adapter.recent_output(session);
                     // 故障单独走一条通道：散文里提到「500」不算出错，
                     // 只有记录自己标成故障的行才算
@@ -846,6 +1028,19 @@ impl MonitorEngine {
                     // 回合结构：区分「正在跑工具/压缩上下文」和「真的停下来等人」，
                     // 光看文件 mtime 这两者长得一样
                     let turn = adapter.turn_state(session);
+                    let activity_after = activity_fingerprint(session);
+
+                    // 三次读取（正文、错误、回合结构）期间记录变了，说明会话此刻正在
+                    // 推进。这一轮任何“卡住”结论都建立在混合版本上，既不合并进状态，
+                    // 更不能拿去续跑；等下一轮对稳定快照重新判定。
+                    if activity_before != activity_after {
+                        tracing::debug!(
+                            "[AgentPulse] 会话 {} 在判定期间仍有活动，本轮跳过旧快照",
+                            session.id
+                        );
+                        continue;
+                    }
+
                     let fingerprint = output.as_deref().map(transcript_fingerprint);
                     let second_opinion = fingerprint.and_then(|fingerprint| {
                         arbitrations_in
@@ -870,7 +1065,11 @@ impl MonitorEngine {
                             });
                         }
                     }
-                    detections.push((session.clone(), result));
+                    detections.push(DetectionSnapshot {
+                        session: session.clone(),
+                        detection: result,
+                        activity: activity_after,
+                    });
                 }
             }
 
@@ -975,98 +1174,208 @@ impl MonitorEngine {
         }
     }
 
-    /// 逐个执行续跑动作
+    /// 将本轮动作交给专用续跑协调器。
     ///
-    /// **必须串行**：剪贴板是全局单件，前台窗口也只有一个。两个续跑并发跑
-    /// AppleScript，就会互相抢剪贴板和焦点，两边都可能敲到对方的窗口里去。
-    async fn run_resumes(
-        &self,
-        config: &AppConfig,
-        i18n: &I18n,
-        webhook: &Option<WebhookNotifier>,
-        actions: &[(AgentSession, bool)],
-    ) {
+    /// 扫描到这里就结束，不等待 AppleScript 与最长数秒的落地核验。同一会话的后续
+    /// 扫描只会替换队列里的旧快照，不会无限堆积；不同会话由 worker 公平串行消费。
+    fn enqueue_resume_actions(self: &Arc<Self>, actions: Vec<ResumeAction>) {
         if actions.is_empty() {
             return;
         }
-        let resumer = Resumer::new(config.clone());
+        self.ensure_resume_worker();
 
-        for (session, use_goal_prompt) in actions {
-            let prompt_type = if *use_goal_prompt { "goal" } else { "generic" };
-            let mode = i18n.t(if *use_goal_prompt {
-                "log.mode_goal"
+        let mut queued = false;
+        let mut queue = self
+            .resume_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for action in actions {
+            // 不因同会话已有 in-flight 就丢掉新证据。全局投递锁可能被另一个会话的
+            // 6 秒核验占住；这期间旧动作会过期，而最新动作应作为唯一后继留在队列。
+            // 若 in-flight 已经成功，后继动作出队时会被冷却与状态重验取消，不会双投。
+            queue.upsert(action);
+            queued = true;
+        }
+        drop(queue);
+        if queued {
+            self.resume_notify.notify_one();
+        }
+    }
+
+    /// worker 全进程只启动一次；所有自动动作都从这里经过。
+    fn ensure_resume_worker(self: &Arc<Self>) {
+        if self
+            .resume_worker_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            engine.resume_worker().await;
+        });
+    }
+
+    async fn resume_worker(self: Arc<Self>) {
+        loop {
+            while let Some(action) = self.dequeue_resume_action() {
+                self.run_auto_resume(action).await;
+            }
+            self.resume_notify.notified().await;
+        }
+    }
+
+    fn dequeue_resume_action(&self) -> Option<ResumeAction> {
+        self.resume_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+    }
+
+    /// 执行一条自动动作。
+    ///
+    /// **必须串行**：剪贴板是全局单件，前台窗口也只有一个。worker 自身保证自动动作
+    /// 串行，`delivery_lock` 再把手动动作纳入同一条通道。拿到锁后仍要重验生命周期、
+    /// 配置、状态、冷却、记录版本和进程身份，排队绝不等于获得投递许可。
+    async fn run_auto_resume(&self, action: ResumeAction) {
+        let session = &action.session;
+        let Some(_lease) = self.resume_registry.try_acquire(&session.id) else {
+            return;
+        };
+
+        let attempt = {
+            let _delivery_guard = self.delivery_lock.lock().await;
+            let latest_config = self.config();
+            if !self.auto_action_is_current(&action, &latest_config).await {
+                None
             } else {
-                "log.mode_generic"
-            });
+                let resumer = Resumer::new(latest_config);
+                Some(
+                    resumer
+                        .resume_verified(session, action.use_goal_prompt)
+                        .await,
+                )
+            }
+        };
 
-            // 先问「它卡了多久」再出手。`resume_verified` 里要盯着记录文件等上
-            // 几秒，等完再读这个数，读到的就是「卡的时长 + 我们核验用掉的时间」——
-            // 那是把自己的开销记到了会话的账上。
-            let stuck_secs = session.stuck_secs();
-
-            // 投递 + 核验：会话记录有没有长出新内容，才是「敲进去了」的证据
-            let (outcome, detail) = resumer.resume_verified(session, *use_goal_prompt).await;
-            let landed = outcome.counts_as_nudge();
-            let failures = self.commit_resume_outcome(&session.id, outcome).await;
-
-            self.storage.record_resume(crate::storage::ResumeEvent {
-                session_id: &session.id,
-                agent_name: &session.agent_name,
-                working_dir: &session.working_dir,
-                prompt_type,
-                success: landed,
-                outcome: outcome.storage_key(),
-                stuck_secs,
-                message: &detail,
-            });
-
-            if landed {
-                self.push_event(EngineEvent::new(
-                    LogLevel::Success,
+        let latest_config = self.config();
+        let i18n = I18n::from_code(&latest_config.language);
+        let Some((outcome, detail)) = attempt else {
+            self.push_event_on_change(
+                format!("resume_stale:{}", session.id),
+                &format!("{}:{:?}", action.lifecycle_epoch, action.observed_activity),
+                EngineEvent::new(
+                    LogLevel::Info,
                     Some(session.id.clone()),
-                    i18n.tf(
-                        "log.resume_sent",
-                        &[
-                            ("mode", mode),
-                            ("count", &(session.resume_count + 1).to_string()),
-                            (
-                                "detail",
-                                &format!("{} · {}", i18n.t(outcome.i18n_key()), detail),
-                            ),
-                        ],
-                    ),
-                ))
-                .await;
+                    i18n.t("log.resume_stale_skip"),
+                ),
+            )
+            .await;
+            return;
+        };
 
-                if let Some(hook) = webhook {
-                    hook.notify_resume(&session.agent_name, &session.id, &detail)
-                        .await;
-                }
-                if let Some(notifier) = self.notifier.get() {
-                    notifier.notify_resumed(
-                        &config.notification,
-                        &config.language,
-                        &session.id,
-                        &detail,
-                    );
-                }
-            } else {
-                self.push_event(EngineEvent::new(
-                    LogLevel::Error,
-                    Some(session.id.clone()),
-                    i18n.tf(
-                        "log.resume_failed",
-                        &[(
+        let prompt_type = if action.use_goal_prompt {
+            "goal"
+        } else {
+            "generic"
+        };
+        let mode = i18n.t(if action.use_goal_prompt {
+            "log.mode_goal"
+        } else {
+            "log.mode_generic"
+        });
+
+        let landed = outcome.counts_as_nudge();
+        let commit = self.commit_resume_outcome(&session.id, outcome).await;
+
+        self.storage.record_resume(crate::storage::ResumeEvent {
+            session_id: &session.id,
+            agent_name: &session.agent_name,
+            working_dir: &session.working_dir,
+            prompt_type,
+            success: landed,
+            outcome: outcome.storage_key(),
+            stuck_secs: action.stuck_secs,
+            message: &detail,
+        });
+
+        if landed {
+            self.push_event(EngineEvent::new(
+                LogLevel::Success,
+                Some(session.id.clone()),
+                i18n.tf(
+                    "log.resume_sent",
+                    &[
+                        ("mode", mode),
+                        ("count", &commit.resume_count.to_string()),
+                        (
                             "detail",
                             &format!("{} · {}", i18n.t(outcome.i18n_key()), detail),
-                        )],
-                    ),
-                ))
+                        ),
+                    ],
+                ),
+            ))
+            .await;
+
+            if latest_config.webhook.enabled {
+                WebhookNotifier::new(
+                    latest_config.webhook.clone(),
+                    Lang::from_code(&latest_config.language),
+                )
+                .notify_resume(&session.agent_name, &session.id, &detail)
                 .await;
-                self.escalate_resume_failure(config, i18n, session, failures, &detail)
-                    .await;
             }
+            if let Some(notifier) = self.notifier.get() {
+                notifier.notify_resumed(
+                    &latest_config.notification,
+                    &latest_config.language,
+                    &session.id,
+                    &detail,
+                );
+            }
+        } else {
+            self.push_event(EngineEvent::new(
+                LogLevel::Error,
+                Some(session.id.clone()),
+                i18n.tf(
+                    "log.resume_failed",
+                    &[(
+                        "detail",
+                        &format!("{} · {}", i18n.t(outcome.i18n_key()), detail),
+                    )],
+                ),
+            ))
+            .await;
+            self.escalate_resume_failure(
+                &latest_config,
+                &i18n,
+                session,
+                commit.resume_failures,
+                &detail,
+            )
+            .await;
         }
+    }
+
+    /// 动作排队后重新确认它仍然成立。
+    async fn auto_action_is_current(&self, action: &ResumeAction, config: &AppConfig) -> bool {
+        if !same_lifecycle(
+            action.lifecycle_epoch,
+            self.lifecycle_epoch.load(Ordering::SeqCst),
+        ) {
+            return false;
+        }
+
+        // 有记录文件时，必须还是检测那一版；任何增长都说明旧判定已经过期。
+        if action.session.session_file.is_some()
+            && activity_fingerprint(&action.session) != action.observed_activity
+        {
+            return false;
+        }
+
+        let state = self.state.lock().await;
+        auto_resume_state_allows(&state, &action.session.id, config)
     }
 
     /// 把一次投递的真实结果落到会话上，返回落笔后的连续失败次数
@@ -1084,17 +1393,24 @@ impl MonitorEngine {
     ///
     /// `last_resume_at` 两种情况都写：它是冷却计时的起点，失败也得等一会儿再试，
     /// 不然通道坏掉时会变成每轮扫描都去撞一次墙。
-    async fn commit_resume_outcome(&self, session_id: &str, outcome: ResumeOutcome) -> u32 {
+    async fn commit_resume_outcome(
+        &self,
+        session_id: &str,
+        outcome: ResumeOutcome,
+    ) -> ResumeCommit {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let mut state = self.state.lock().await;
         if outcome.counts_as_nudge() {
-            state.status.total_resumes += 1;
+            state.status.total_resumes = state.status.total_resumes.saturating_add(1);
         }
         let Some(session) = state.sessions.iter_mut().find(|s| s.id == session_id) else {
-            return 0;
+            return ResumeCommit::default();
         };
         apply_resume_outcome(session, outcome, now);
-        session.resume_failures
+        ResumeCommit {
+            resume_count: session.resume_count,
+            resume_failures: session.resume_failures,
+        }
     }
 
     /// 连续失败到一定次数就**别再静默了**
@@ -1157,27 +1473,94 @@ impl MonitorEngine {
         }
     }
 
-    /// 手动续跑之后同步会话上的续跑状态
+    /// 手动续跑也走引擎的全局投递协调器。
     ///
-    /// **故意不动 `resume_count`**：那个计数对着 `max_resume_count` 那道上限，
-    /// 上限管的是「别没完没了地自动催」——用户自己点的那一次不该消耗它。
-    ///
-    /// 但 `last_resume_at` 必须写：不写的话，下一轮扫描的自动续跑会看到一个
-    /// 空的冷却计时器，立刻再敲一遍，同一个会话吃两条提示词。
-    /// `resume_failures` 也跟着走：手动敲成了就证明通道是好的，自动那边的退避
-    /// 该马上松开。
-    pub async fn note_manual_resume(&self, session_id: &str, outcome: ResumeOutcome) {
+    /// 旧入口在 Tauri 命令里直接 new 一个 `Resumer`，因此能和后台自动续跑同时抢
+    /// 剪贴板、抢前台窗口；双击按钮也会排出两次动作。现在同会话先占位，所有会话
+    /// 再共用串行投递锁，成功后统一落库、更新冷却与累计计数。
+    pub async fn manual_resume(
+        &self,
+        session_id: &str,
+        use_goal_prompt: bool,
+    ) -> Result<String, String> {
+        let config = self.config();
+        let i18n = I18n::from_code(&config.language);
+        let Some(_lease) = self.resume_registry.try_acquire(session_id) else {
+            return Err(i18n.t("err.resume_in_progress").to_string());
+        };
+
+        self.manual_resume_inner(session_id, use_goal_prompt, config, &i18n)
+            .await
+    }
+
+    async fn manual_resume_inner(
+        &self,
+        session_id: &str,
+        use_goal_prompt: bool,
+        config: AppConfig,
+        i18n: &I18n,
+    ) -> Result<String, String> {
+        let _delivery_guard = self.delivery_lock.lock().await;
+
+        // 排队期间会话可能退出，所以拿到全局投递锁之后才取最终快照。
+        let session = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+                .ok_or_else(|| i18n.t("err.session_not_found").to_string())?
+        };
+
+        let stuck_secs = session.stuck_secs();
+        let resumer = Resumer::new(config);
+        let (outcome, detail) = resumer.resume_verified(&session, use_goal_prompt).await;
+        let ok = outcome.counts_as_nudge();
+        let text = format!("{} · {}", i18n.t(outcome.i18n_key()), detail);
+
+        let prompt_type = if use_goal_prompt { "goal" } else { "generic" };
+        self.storage.record_resume(crate::storage::ResumeEvent {
+            session_id: &session.id,
+            agent_name: &session.agent_name,
+            working_dir: &session.working_dir,
+            prompt_type,
+            success: ok,
+            outcome: outcome.storage_key(),
+            stuck_secs,
+            message: &detail,
+        });
+        self.commit_manual_resume_outcome(&session.id, outcome)
+            .await;
+
+        self.push_event(EngineEvent::new(
+            if ok {
+                LogLevel::Success
+            } else {
+                LogLevel::Error
+            },
+            Some(session.id),
+            i18n.tf("log.resume_manual", &[("detail", &text)]),
+        ))
+        .await;
+
+        if ok {
+            Ok(text)
+        } else {
+            Err(text)
+        }
+    }
+
+    async fn commit_manual_resume_outcome(&self, session_id: &str, outcome: ResumeOutcome) {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let mut state = self.state.lock().await;
+        if outcome.counts_as_nudge() {
+            state.status.total_resumes = state.status.total_resumes.saturating_add(1);
+        }
         let Some(session) = state.sessions.iter_mut().find(|s| s.id == session_id) else {
             return;
         };
-        session.last_resume_at = Some(now);
-        if outcome.is_failure() {
-            session.resume_failures = session.resume_failures.saturating_add(1);
-        } else {
-            session.resume_failures = 0;
-        }
+        apply_manual_resume_outcome(session, outcome, now);
     }
 
     /// 成本与限流告警
@@ -1359,6 +1742,60 @@ fn has_nudges_left(session: &AgentSession, max: u32) -> bool {
 ///
 /// 抽成自由函数是为了能测——`MonitorEngine` 要 `ConfigManager::new()`，
 /// 那玩意儿读真实配置目录，单元测试里碰不得。
+/// 生命周期代数必须完全一致；“停止 → 立即启动”也不能让旧队列重新合法。
+fn same_lifecycle(action_epoch: u64, current_epoch: u64) -> bool {
+    action_epoch == current_epoch
+}
+
+/// 自动动作拿到全局投递锁后仍需满足的运行态策略。
+///
+/// 单独抽出来让停止语义可直接测试：`scan_now` 可以在停止状态刷新检测，但绝不能
+/// 顺手触发自动输入；停止后再启动时，生命周期代数还会在外层挡住旧动作复活。
+fn auto_resume_state_allows(state: &MonitorState, session_id: &str, config: &AppConfig) -> bool {
+    if !state.running || !config.auto_resume_enabled {
+        return false;
+    }
+    let Some(current) = state.sessions.iter().find(|s| s.id == session_id) else {
+        return false;
+    };
+    current.status == SessionStatus::Interrupted
+        && current.resume_tactic == ResumeTactic::Nudge
+        && has_nudges_left(current, config.max_resume_count)
+        && check_cooldown(
+            current,
+            effective_cooldown(config.resume_cooldown_secs, current.resume_failures),
+        )
+}
+
+/// 将扫描期间可能由投递任务更新的运行态重新合并回来。
+///
+/// 检测和投递现在允许重叠：否则每个会话最长 6 秒的落地核验会把整个扫描入口锁住。
+/// 代价是扫描开始时复制的旧计数不能再整份覆盖当前状态。累计次数、失败退避和冷却
+/// 时间始终以当前状态为准；只有本轮明确观察到会话在推进，才清空自动续跑连击。
+fn merge_resume_runtime(
+    scanned: &mut [AgentSession],
+    current: &[AgentSession],
+    running_session_ids: &HashSet<String>,
+) {
+    let current_by_id: HashMap<&str, &AgentSession> = current
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect();
+    for session in scanned {
+        let Some(latest) = current_by_id.get(session.id.as_str()) else {
+            continue;
+        };
+        session.resume_count = latest.resume_count;
+        session.resume_failures = latest.resume_failures;
+        session.last_resume_at = latest.last_resume_at.clone();
+        session.resume_streak = if running_session_ids.contains(&session.id) {
+            0
+        } else {
+            latest.resume_streak
+        };
+    }
+}
+
 fn should_reconcile_history(config: &AppConfig) -> bool {
     !config.enabled_adapters.is_empty()
 }
@@ -1392,9 +1829,157 @@ fn apply_resume_outcome(session: &mut AgentSession, outcome: ResumeOutcome, now:
     }
 }
 
+/// 手动续跑成功要进入累计统计，但不消耗自动续跑的连击额度。
+///
+/// 用户主动点一次，说明他明确希望这次动作发生；`max_resume_count` 管的是守护器
+/// 自动空转，不该拿用户动作去挤占。但界面上的“已续跑 N 次”和总统计必须包含它，
+/// 否则记录中心有一行、会话卡片和总数却都没变，三处事实互相矛盾。
+fn apply_manual_resume_outcome(session: &mut AgentSession, outcome: ResumeOutcome, now: String) {
+    session.last_resume_at = Some(now);
+    if outcome.is_failure() {
+        session.resume_failures = session.resume_failures.saturating_add(1);
+    } else {
+        session.resume_count = session.resume_count.saturating_add(1);
+        session.resume_failures = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_lease_is_exclusive_and_released_by_drop() {
+        let registry = ResumeRegistry::default();
+        {
+            let _lease = registry.try_acquire("session-1").expect("首次应拿到租约");
+            assert!(registry.is_active("session-1"));
+            assert!(
+                registry.try_acquire("session-1").is_none(),
+                "同一会话不能同时存在两个续跑意图"
+            );
+            assert!(
+                registry.try_acquire("session-2").is_some(),
+                "不同会话可以各自占位，真实投递再由全局锁串行"
+            );
+        }
+        assert!(!registry.is_active("session-1"), "离开作用域必须自动释放");
+        assert!(registry.try_acquire("session-1").is_some());
+    }
+
+    #[test]
+    fn resume_queue_coalesces_each_session_to_the_latest_snapshot() {
+        fn action(id: &str, epoch: u64) -> ResumeAction {
+            let mut session = session_with("/tmp", None);
+            session.id = id.to_string();
+            ResumeAction {
+                session,
+                use_goal_prompt: false,
+                observed_activity: None,
+                lifecycle_epoch: epoch,
+                stuck_secs: None,
+            }
+        }
+
+        let mut queue = ResumeQueue::default();
+        queue.upsert(action("session-1", 1));
+        queue.upsert(action("session-2", 1));
+
+        // 即使 session-1 已有在途租约，新扫描也应保留一条最新后继，而不是丢掉
+        // 更鲜的证据。真正出手仍由租约、冷却和出队重验控制。
+        let registry = ResumeRegistry::default();
+        let _lease = registry.try_acquire("session-1").expect("模拟在途动作");
+        queue.upsert(action("session-1", 2));
+
+        assert_eq!(queue.len(), 2, "同会话只保留一条，队列不会随扫描次数膨胀");
+        let first = queue.pop_front().expect("第一条");
+        assert_eq!(first.session.id, "session-1");
+        assert_eq!(first.lifecycle_epoch, 2, "应消费最新快照而不是旧动作");
+        assert_eq!(queue.pop_front().expect("第二条").session.id, "session-2");
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn stopped_monitor_rejects_queued_auto_resume() {
+        let config = AppConfig {
+            auto_resume_enabled: true,
+            max_resume_count: 3,
+            resume_cooldown_secs: 0,
+            ..Default::default()
+        };
+
+        let mut session = session_with("/tmp", None);
+        session.id = "session-1".to_string();
+        session.status = SessionStatus::Interrupted;
+        session.resume_tactic = ResumeTactic::Nudge;
+
+        let mut state = MonitorState {
+            running: true,
+            sessions: vec![session],
+            ..Default::default()
+        };
+        assert!(auto_resume_state_allows(&state, "session-1", &config));
+
+        state.running = false;
+        assert!(
+            !auto_resume_state_allows(&state, "session-1", &config),
+            "停止守护后，已经排队但尚未投递的自动动作必须失效"
+        );
+    }
+
+    #[test]
+    fn stop_then_restart_does_not_revive_an_old_action() {
+        let action_epoch = 7;
+        assert!(same_lifecycle(action_epoch, 7));
+        assert!(
+            !same_lifecycle(action_epoch, 9),
+            "停止和重新启动各推进一次代数，旧动作不能因 running 再次为 true 而复活"
+        );
+    }
+
+    #[test]
+    fn overlapping_scan_preserves_a_completed_resume_commit() {
+        let mut stale_scan = session_with("/tmp", None);
+        stale_scan.id = "session-1".to_string();
+        stale_scan.resume_count = 1;
+        stale_scan.resume_streak = 1;
+
+        let mut current = stale_scan.clone();
+        current.resume_count = 7;
+        current.resume_streak = 3;
+        current.resume_failures = 2;
+        current.last_resume_at = Some("2026-08-07 12:00:00".to_string());
+
+        let mut scanned = vec![stale_scan];
+        merge_resume_runtime(&mut scanned, &[current], &HashSet::new());
+        assert_eq!(scanned[0].resume_count, 7);
+        assert_eq!(scanned[0].resume_streak, 3);
+        assert_eq!(scanned[0].resume_failures, 2);
+        assert_eq!(
+            scanned[0].last_resume_at.as_deref(),
+            Some("2026-08-07 12:00:00")
+        );
+    }
+
+    #[test]
+    fn observed_progress_resets_only_the_auto_streak() {
+        let mut scanned_session = session_with("/tmp", None);
+        scanned_session.id = "session-1".to_string();
+        let mut current = scanned_session.clone();
+        current.resume_count = 7;
+        current.resume_streak = 3;
+        current.resume_failures = 2;
+
+        let mut scanned = vec![scanned_session];
+        merge_resume_runtime(
+            &mut scanned,
+            &[current],
+            &HashSet::from(["session-1".to_string()]),
+        );
+        assert_eq!(scanned[0].resume_count, 7);
+        assert_eq!(scanned[0].resume_streak, 0);
+        assert_eq!(scanned[0].resume_failures, 2);
+    }
 
     /// 攒够 500 条之后还认得出新事件
     ///
@@ -1593,6 +2178,28 @@ mod tests {
         assert_eq!(s.resume_count, 1);
         assert_eq!(s.resume_streak, 1);
         assert_eq!(s.resume_failures, 0);
+    }
+
+    #[test]
+    fn manual_delivery_counts_in_history_but_not_the_auto_streak() {
+        let mut s = session_with("/tmp", None);
+        s.resume_streak = 2;
+        apply_manual_resume_outcome(&mut s, ResumeOutcome::Landed, stamp());
+        assert_eq!(s.resume_count, 1, "手动成功也是真实的一次续跑");
+        assert_eq!(s.resume_streak, 2, "用户点的动作不能消耗自动续跑的连击额度");
+        assert_eq!(s.resume_failures, 0);
+        assert!(s.last_resume_at.is_some(), "仍要启动冷却，防止自动立刻补敲");
+    }
+
+    #[test]
+    fn failed_manual_delivery_only_advances_channel_failures() {
+        let mut s = session_with("/tmp", None);
+        s.resume_count = 4;
+        s.resume_streak = 2;
+        apply_manual_resume_outcome(&mut s, ResumeOutcome::Silent, stamp());
+        assert_eq!(s.resume_count, 4);
+        assert_eq!(s.resume_streak, 2);
+        assert_eq!(s.resume_failures, 1);
     }
 
     #[test]

@@ -517,7 +517,7 @@ impl Storage {
         let conn = self.conn.lock().unwrap();
         // 同一个 `session_id` + 同一个工作目录 = 同一个会话。
         // 不用重算新键，因为老行里没存 `adapter_id`；而 `session_id`
-        // 本身就带着 adapter 前缀和 pid（`cc-68590` / `cx-99215`）。
+        // 本身就带着 adapter 前缀和进程代际（旧形状如 `cc-68590`，新形状还含启动时刻）。
         let groups: Vec<(String, String, i64)> = {
             let mut stmt = match conn.prepare(
                 "SELECT session_id, working_dir, COUNT(*) FROM session_history \

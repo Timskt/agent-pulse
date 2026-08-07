@@ -34,10 +34,11 @@ impl AgentAdapter for OpenCodeAdapter {
             }
 
             sessions.push(AgentSession {
-                id: format!("oc-{}", proc.pid),
+                id: super::process_session_id("oc", proc),
                 adapter_id: self.id().to_string(),
                 agent_name: self.name().to_string(),
                 pid: proc.pid,
+                process_started_at: proc.started_at,
                 command: proc.cmd.clone(),
                 working_dir: proc.cwd.clone(),
                 session_file: None,

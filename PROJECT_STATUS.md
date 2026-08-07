@@ -4,9 +4,9 @@
 
 # AgentPulse 项目现状与规划
 
-> 对应提交：`4b200f6`（`main` == `origin/main`）
-> CI：run `30700566408` 全绿（Frontend Test + Build / Rust macOS / Rust Ubuntu / Rust Windows）
-> 文档日期：2026-08-01
+> 对应版本：`v1.9.0` 源码状态（尚未打 tag，尚未发布 Release）
+> 验证口径：本地门禁见 § 11 / § 14；提交级结果以 GitHub Actions 为准
+> 文档日期：2026-08-07
 
 这份文档写给三种人看：接手这个仓库的人、半年后忘了细节的我自己、以及想知道"到底做完了没有"的你。
 所以它有两条约定：
@@ -40,16 +40,16 @@
 
 | 维度 | 现状 |
 |---|---|
-| 版本 | `1.8.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死；**标签未推，尚未发 Release**） |
-| 后端 | Rust，19 个文件，约 16.3k 行 |
-| 前端 | TypeScript + React 19，44 个文件，约 7.4k 行 |
-| 单元测试 | Rust **246 个**（`cargo test`）+ 前端 **93 个**（`pnpm test`，vitest，7 个文件）；两者都在三个平台的 CI 里跑 |
+| 版本 | `1.9.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死；**标签未推，尚未发 Release**） |
+| 后端 | Rust，19 个文件；续跑协调器集中在 `monitor/mod.rs` |
+| 前端 | TypeScript + React 19，49 个文件 |
+| 单元测试 | Rust **259 个**（`cargo test`）+ 前端 **99 个**（`pnpm test`，vitest，8 个文件） |
 | Tauri 命令 | 38 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
 | 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
 | i18n 词条 | 后端 200 条（`(key, zh, en)`），前端 349 条（`[zh, en]`） |
 | 持久化 | SQLite 6 张表 |
-| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v1.8 限流保持 ✅ · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
+| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v1.8 限流保持 ✅ · **v1.9 续跑协调器 ✅** · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
 
 **这个版本能做到的事**：在你不改变任何使用习惯的前提下，后台盯着 Claude Code / Codex / OpenCode
 的会话文件与进程，判断它是"还在干活"、"卡住了"、"在等你回话"、"限流了"还是"报错了"；
@@ -103,7 +103,9 @@ AgentPulse 走的是另一条：**附着在你已有的工作方式上**。代�
 | v1.4 | **可信化** | ✅ | tmux/screen 免权限投递通道、续跑演练（`ResumeProbe` 干跑探测）、macOS 辅助功能权限自检与"去开权限"引导、前端 vitest、局域网看板换绑修复 |
 | v1.5 | **闭环化** | ✅ | 投递后核验落地（`ResumeOutcome` + `resume_verified`）、一个计数器拆成三个、上限从判定层挪到动作闸门、静默失败会出声、日志区分事件与状态、版本号单一来源 |
 | v1.6 | **可解释判定** | ✅ | `InterruptReason` 与 `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权、指纹缓存、每轮最多一问）、自定义适配器 UI、跨语言枚举/i18n 门禁、SQLite 形状迁移 |
-| v1.7 | **记录与导出** | ✅ 待发布 | 单实例守护、续跑记录中心（独立分页 + 筛选）、统计趋势真实对比、会话档案抽屉（生命周期 / 中断次数 / 续跑时间线 / 成本时间线 / 路径一键复制）、柱状图时间刻度、CSV 导出（转义与公式注入分开处理）、会话生命周期收拢（修「关了还显示运行中」）、跨夏令时日期分组修复 |
+| v1.7 | **记录与导出** | ✅ | 单实例守护、续跑记录中心（独立分页 + 筛选）、统计趋势真实对比、会话档案抽屉（生命周期 / 中断次数 / 续跑时间线 / 成本时间线 / 路径一键复制）、柱状图时间刻度、CSV 导出（转义与公式注入分开处理）、会话生命周期收拢（修「关了还显示运行中」）、跨夏令时日期分组修复 |
+| v1.8 | **限流保持** | ✅ | 中转站/HTTP 形状兜底、等待时间解析、跨轮保持窗口，证据滚出尾部后仍不误敲 |
+| v1.9 | **续跑协调器** | ✅ 待发布 | 扫描/投递解耦、按会话合并队列、常驻 worker、RAII 会话租约、stop 生命周期代数、出队全量重验、并发状态归约、PID + 启动代际身份；首次三步引导与多会话搜索筛选 |
 | v2.0 | 编排层 | ⏸ | 主动搁置，与非侵入定位冲突，动工前需确认 |
 | v2.1+ | 自治层 | ⏸ | 同上 |
 
@@ -138,110 +140,73 @@ a888d91  feat(icon): regenerate the whole icon set from a vector master
 
 ## 4. 代码地图
 
-### 后端（`src-tauri/src/`，10755 行）
+### 后端（`src-tauri/src/`，19 个 Rust 文件）
 
 | 文件 | 行数 | 职责 | 关键符号 |
 |---|---:|---|---|
-| `resumer/mod.rs` | 3189 | 续跑执行器，**唯一带平台 cfg 的文件** | `Resumer::{resume,probe}`、`ResumeOutcome`、`resume_verified`、`transcript_fingerprint`、`resume_macos/windows/linux`、`macos_script`、`windows_resume_script`、`stage_clipboard`、`focus_session`、`accessibility_granted`、`tmux_send`、`ResumeProbe`、`ToolStatus`、`TERMINAL_PATTERNS`、`WINDOWS_MULTI_TAB_HOSTS` |
-| `monitor/mod.rs` | 1292 | 引擎主循环：一轮扫描的编排、动作闸门、事件流、成本告警 | `MonitorEngine::{start,stop,scan_once,collect,run_resumes,check_cost_alerts,push_event_on_change,forget_topic}`、`apply_resume_outcome`、`effective_cooldown`、`has_nudges_left`、`should_say`、`EngineEvent`、`ScanOutcome` |
-| `detector/mod.rs` | 883 | 判定：现在是什么状态（`Verdict`）+ 要不要叫人（`AttentionLevel`） | `Detector::detect`、`make_verdict`、`grade_attention`、`contains_keyword`、`SignalKind` |
-| `remote/mod.rs` | 870 | 只读手机看板的 HTTP 服务（手写，无框架） | `RemoteService::{new,sync,generate_token}`、`stop_listener`、`bind_with_retry`、`lan_ipv4`、`is_weak_lan_token`、`secret_eq`、`respond_with_nonce`、`page` |
-| `storage/mod.rs` | 651 | SQLite 持久化，6 张表 | `record_resume/record_detection/record_scan/record_usage_batch/…` |
-| `lib.rs` | 627 | Tauri 装配：AppState、托盘、事件泵、25 个命令 | `run()`、`setup_tray`、`engine-events` 泵 |
-| `adapters/claude_code.rs` | 602 | Claude Code 适配器（最完整的那个） | `extract_text_from_jsonl`、`error_output`、`classify_turn`、尾部窗口读取 |
-| `i18n/mod.rs` | 531 | 后端文案表（151 条 `(key, zh, en)`） | `I18n::{t,tf}`、`TABLE` |
-| `cost/mod.rs` | 512 | 价目表、用量归集、按天/项目成本、限流预测 | `PRICE_TABLE`、`price_for`、`CostTracker`、`forecast_rate_limit` |
-| `config/mod.rs` | 357 | 配置结构与持久化 | `AppConfig` + 6 个子配置、`ConfigManager` |
-| `webhook/mod.rs` | 346 | 五种 Webhook 目标的载荷构造 | `WebhookConfig`、`provider` 分派 |
-| `notify/mod.rs` | 309 | 系统通知、节流、托盘角标 | `Notifier::{allow,notify_attention,update_tray_badge}`、`composite_badge` |
-| `adapters/mod.rs` | 269 | 适配器抽象与进程快照 | `AgentAdapter` trait、`AgentSession`、`TurnState`、`take_process_snapshot` |
-| `ai_judge/mod.rs` | 158 | 可选的 LLM 兜底判定（默认关闭，供应商中立） | `AiJudgeConfig` |
-| `adapters/opencode.rs` | 78 | OpenCode 适配器 | |
-| `adapters/codex.rs` | 75 | Codex CLI 适配器 | |
-| `main.rs` | 6 | 入口 | |
+| `monitor/mod.rs` | 2299 | 扫描调度、动作闸门、自动续跑协调器、并发状态归约 | `ResumeQueue`、`ResumeRegistry`、`ResumeLease`、`enqueue_resume_actions`、`resume_worker`、`run_auto_resume`、`auto_action_is_current`、`merge_resume_runtime` |
+| `resumer/mod.rs` | 3391 | 三平台/tmux/screen 投递、定位演练、落地核验 | `Resumer::{resume_verified,probe}`、`ResumeOutcome`、`activity_fingerprint` |
+| `storage/mod.rs` | 2392 | SQLite 六张表与历史聚合 | `record_resume`、`upsert_session_history` |
+| `detector/mod.rs` | 2098 | 多信号融合、注意力、动作策略、限流保持 | `Detector::detect`、`DetectionResult`、`ResumeTactic` |
+| `lib.rs` | 884 | Tauri IPC、托盘、事件泵、单实例装配 | `manual_resume`（下沉到 engine） |
+| `remote/mod.rs` | 873 | 只读 HTTP 看板 | `RemoteService` |
+| `i18n/mod.rs` | 751 | Rust 用户可见文案 | `I18n` |
+| `export/mod.rs` | 684 | CSV 导出与公式注入防护 | `Cell::{Text,Value}` |
+| `cost/mod.rs` | 536 | token 成本与限流预测 | `forecast_rate_limit` |
+| `detector/rate_limit.rs` | 438 | 限流形状与等待时间纯函数 | `upstream_rejection` |
+| `adapters/mod.rs` | 626 | 进程快照、会话模型、进程代际身份 | `process_session_id`、`process_matches_session` |
 
-`resumer/mod.rs` 从 1775 行长到 3189 行，多出来的一千四百行是三件事：v1.4 的 tmux/screen 投递通道
-与**演练探测**（`probe`，把"按下去才知道对不对"变成"随时可查"），以及 v1.5 的**落地核验**
-（`resume_verified`，把"脚本没报错"变成"字真的进去了"）。`monitor/mod.rs` 从 890 长到 1292，
-多出来的几乎全是**动作闸门**——判定层退回只说事实之后，"该不该动手"这个问题需要一个明确的家。
-
-### 前端（`src/`，4511 行 + 71 行 CSS）
+### 前端（`src/`，49 个文件）
 
 | 文件 | 行数 | 职责 |
 |---|---:|---|
-| `components/ConfigPanel.tsx` | 610 | 设置页主编排；通知、成本、AI 分区已拆到 `components/config/` |
-| `i18n/index.ts` | 520 | 前端文案表（220 条 `[zh, en]`） |
-| `components/SessionList.tsx` | 406 | 会话卡片：状态、注意力标记、续跑按钮、演练结果、失败与停手标签 |
-| `stores/useAppStore.ts` | 361 | Zustand store：状态、事件、命令封装 |
-| `types.ts` | 298 | 与 Rust 侧结构一一对应的类型 |
-| `components/CostPanel.tsx` | 208 | 成本页：按天柱状图、按项目、限流预测 |
-| `stores/useAppStore.test.ts` | 171 | store 归约的单测 |
-| `components/StatsPanel.tsx` | 168 | 统计页 |
-| `App.tsx` | 167 | 5 个 Tab 的外壳、页头徽标、页脚、`APP_VERSION` |
-| `components/ui/Field.tsx` | 157 | 表单字段的统一封装 |
-| `components/HistoryPanel.tsx` | 141 | 会话历史 |
-| `components/ui/BarChart.tsx` | 113 | 纯 SVG 柱状图（不引图表库） |
-| `components/ui/Card.tsx` | 103 | 卡片 |
-| `lib/utils.test.ts` | 84 | `cn()` 的单测 |
-| `components/ui/Switch.tsx` | 84 | Radix Switch 封装 |
-| `components/LogPanel.tsx` | 79 | 活动日志流 |
-| `lib/display.ts` | 65 | 展示层格式化（时间、金额、截断） |
-| `components/ui/Select.tsx` | 63 | Radix Select 封装 |
-| `lib/chime.ts` | 60 | WebAudio 提示音（不带音频文件） |
-| `lib/display.test.ts` | 58 | 格式化函数的单测 |
-| `components/ui/Button.tsx` | 54 | |
-| `components/StatusCards.tsx` | 48 | 顶部四张状态卡 |
-| `components/ui/Tooltip.tsx` | 43 | |
-| `lib/utils.ts` | 41 | `cn()` 等工具 |
-| `components/ui/Tabs.tsx` | 37 | |
-| `lib/useNotice.ts` | 36 | 轻量 toast |
-| `components/ui/index.ts` | 33 | 组件桶导出 |
-| `version.test.ts` | 32 | **版本号一致性守卫**：见 11.6 |
-| `main.tsx` | 10 | 挂载 |
-| `vite-env.d.ts` | 4 | 环境类型 |
+| `i18n/index.ts` | 800 | 前端中英双语词典 |
+| `components/ConfigPanel.tsx` | 610 | 设置页编排 |
+| `components/SessionList.tsx` | 549 | 会话卡片、搜索、筛选与动作入口 |
+| `components/OnboardingPanel.tsx` | 140 | 首次三步引导；明确不启动/接管 Agent |
+| `lib/sessions.ts` | 90 | 搜索、筛选、注意力优先排序纯函数 |
+| `components/DashboardPanel.tsx` | 18 | Dashboard 编排边界 |
 
----
+前端只对 Rust 返回的会话快照做展示、搜索、筛选和排序；不重新推导 `status`、
+`attention`、`interrupt_reason` 或 `resume_tactic`，避免同一策略出现两个事实来源。
 
 ## 5. 运行时架构与数据流
 
-### 一轮扫描（`MonitorEngine::scan_once`）
+### 一轮扫描与续跑协调（`MonitorEngine::scan_once`）
 
 ```
-                        ┌─────────────────── 每 poll_interval_secs 一轮 ───────────────────┐
-                        │                                                                 │
-take_process_snapshot() │  ① 发现            ② 取证            ③ 判定          ④ 执行     │
-  一次 System::new()    │                                                                 │
-  只刷 cmd + cwd  ──────┼─► discover_sessions ─► session_files  ─► Detector  ─► resume_    │
-  （整轮共用一份快照，  │   Claude Code         recent_output      ::detect      actions   │
-    避免 N 次进程枚举） │   Codex               error_output     ┌──────────┐   ─► Resumer │
-                        │   OpenCode            turn_state       │ Verdict  │      ::resume│
-                        │                                        │ Attention│              │
-                        │                                        └──────────┘              │
-                        │  ⑤ 落库 + 事件：storage.record_* / EngineEvent / Webhook / 通知  │
-                        └─────────────────────────────────────────────────────────────────┘
+进程快照（整轮一次） → 适配器发现 → 记录版本一致取证 → Detector 判定
+                                               │
+                                               ▼
+                         状态合并 + ResumeAction（不执行投递）
+                                               │
+                               释放 scan_lock，扫描立即结束
+                                               │
+                                               ▼
+                         ResumeQueue 按 session 合并最新动作
+                                               │
+                                               ▼
+                           resume_worker FIFO 串行消费
+                                               │
+                   ResumeLease → delivery_lock → 出队重验
+                                               │
+                                               ▼
+              PID + 启动代际复核 → 定位/投递 → 落地核验 → 记账
 ```
 
-五个阶段各自的要点：
+v1.9 最重要的结构变化是：**扫描不再等待 AppleScript、PowerShell、xdotool 或最长 6 秒的
+落地核验。** 旧结构中 N 个会话会把检测节拍拖成约 `6 秒 × N`；现在扫描只生成动作，
+worker 独立执行。`ResumeQueue` 对同一 session 做 upsert，所以扫描越勤也不会堆出旧动作长龙；
+即使已有一个在途动作，也只保留一条最新后继，旧动作过期后无需再等下一轮扫描。
 
-**① 发现** — `adapters::all_adapters()` 里三个适配器各自扫进程快照。这里有个刻意的性能约束：
-整轮扫描只做**一次** `take_process_snapshot()`，且只刷新 `cmd` 与 `cwd` 两个字段；早期版本每个适配器
-各枚举一遍进程，在进程多的机器上一轮要几百毫秒。
+`scan_lock` 只防后台 ticker、托盘和前端“立即扫描”并发取证；自动与手动真实投递共享
+`delivery_lock`。动作出队后重验 lifecycle、running、开关、状态、策略、额度、冷却和记录指纹，
+`Resumer` 再验证 PID、进程启动时刻和命令行。停止守护会清队列并推进生命周期代数，
+所以 stop/start 也不能复活旧动作。
 
-**② 取证** — 每个会话最多取四份证据，各自可缺：
-`session_files`（会话文件路径 + mtime）、`recent_output`（尾部文本，含 assistant 散文）、
-`error_output`（**只含被运行时标成故障的行**，不含散文）、`turn_state`（最后一条记录属于谁的回合）。
-
-**③ 判定** — `Detector::detect` 产出 `DetectionResult`，里面同时装着两条独立结论（第 6 节）。
-
-**④ 执行** — 判定为 `Verdict::ConfirmInterrupt` 之后还要过**三道各管一件事的闸门**，
-全部放行才进 `resume_actions`：冷却（`effective_cooldown` + `check_cooldown`，太频繁）、
-额度（`has_nudges_left`，催也没用）、总开关（`auto_resume_enabled`，用户不让）。
-拦下来的那一轮会说清是哪一道拦的——"等几十秒就好"和"得人去看一眼"对你的要求完全不同。
-随后 `run_resumes` 串行调 `Resumer::resume`，**并核验那句话有没有真的落地**（见 7.8）。
-
-**⑤ 落库与广播** — 检测、续跑、扫描、用量分别落到 SQLite；`EngineEvent` 进内存环形队列；
-达到条件时触发系统通知与 Webhook。这一步有一条容易踩的纪律：**事件按跃迁发，状态按变化发**，
-见 [7.11](#711-事件与状态日志不能自我复述)。
+检测与投递现在可以重叠，`merge_resume_runtime` 因而成为必要的归约边界：扫描写回会话表时
+保留状态锁内最新的累计次数、失败退避和冷却；只有本轮明确看到 `Running` 才清空自动连击。
+否则旧扫描快照会把刚完成的续跑提交覆盖回去。
 
 ### 进程内的装配（`lib.rs`）
 
@@ -698,6 +663,24 @@ pub struct ResumeProbe {
 它同时是最省事的支持工具：用户报"续跑没反应"时，第一句话就是"点一下演练，把那一栏
 念给我听"，因为它一次回答了 7.2 的确定性、7.4 的通道、以及依赖是否就位。
 
+### 7.14 v1.9：续跑协调器的并发不变式
+
+| 不变式 | 实现 |
+|---|---|
+| 同一会话最多一个在途续跑 | `ResumeRegistry::try_acquire` + RAII `ResumeLease` |
+| 同会话排队只保留最新快照 | `ResumeQueue::upsert`（`VecDeque + HashMap`），在途时最多一条最新后继 |
+| 跨会话真实投递串行 | 常驻 `resume_worker` + 全局 `delivery_lock` |
+| 手动/自动不能抢剪贴板或窗口 | 两条入口共享 lease 与 `delivery_lock` |
+| 停止后待处理自动动作失效 | queue clear + `lifecycle_epoch` |
+| 停止后立即重启也不复活旧动作 | 动作代数必须与当前代数完全一致 |
+| 会话自己恢复后旧动作取消 | 出队重验状态、策略与活动指纹 |
+| PID 复用不能继承旧会话或误投 | 会话 id 与投递复核都包含进程启动时刻 |
+| 扫描/投递重叠不丢计数 | `merge_resume_runtime` |
+| 日志不猜次数 | `commit_resume_outcome -> ResumeCommit` |
+
+这次重构的目标不是“多线程更快”，而是把安全边界显式化：检测可以持续刷新，真实输入仍严格
+串行；排队只是意图，不是许可；任何旧事实到动手前都必须重新证明自己仍然成立。
+
 ---
 
 ## 8. 洞察层：成本、限流预测、统计
@@ -800,11 +783,13 @@ pub struct ResumeProbe {
 ### 10.1 结构
 
 Radix 组件 + Tailwind，5 个 Tab：`dashboard` / `stats` / `cost` / `history` / `config`。
-`ui/` 下自建了 7 个封装组件（Button / Card / Field / Select / Switch / Tabs / Tooltip + BarChart），
-业务组件只用封装层，不直接碰 Radix——这是为了让样式改动只落在一个地方。
+`App.tsx` 只保留应用壳与导航，Dashboard 编排下沉到 `DashboardPanel`。首次无会话时由
+`OnboardingPanel` 给出“开始守护 → 用户自行运行 Agent → 立即扫描”三步，并明确 AgentPulse
+不启动、不接管 Agent，定位不确定时不会输入。
 
+`SessionList` 支持按项目、Agent、终端元数据搜索，以及“全部 / 等我 / 卡住 / 活跃”筛选；
+策略集中在 `lib/sessions.ts` 的纯函数中并有 6 个测试。它只筛选 Rust 快照，不重算检测结论。
 状态走 Zustand（`stores/useAppStore.ts`），事件靠后端 `emit("engine-events")` 推送而非前端轮询。
-页脚显示会话数、**真实的**轮询间隔（读配置而不是写死）、上次扫描时间。
 
 ### 10.2 i18n 边界：谁渲染，谁持有文案
 
@@ -949,8 +934,8 @@ git push origin main
 gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 
 # 3. 打标签并推标签（标签必须以 v 开头，且和 package.json 的版本一致）
-git tag v1.8.0
-git push origin v1.8.0
+git tag v1.9.0
+git push origin v1.9.0
 
 # 4. 盯打包
 gh run list --limit 3
@@ -1046,6 +1031,7 @@ push tag v*
 | **tmux / screen 通道** | ⚠️ 代码完整、`send-keys` 走 argv 数组不拼 shell，但**从没对着真实 pane 跑过** | `tmux new -s t`，在里面起一个 Claude Code，等它停下看会不会被续上 |
 | **Windows 续跑** | ⚠️ 只有 CI 编译 + 纯字符串单测 | 在 cmd、Windows Terminal、VS Code 各验一次；重点看多标签宿主的标题匹配 |
 | **Linux 续跑** | ⚠️ 同上，且 X11 / Wayland 两条路都没实测 | 各验一次；`ydotool` 需要 uinput 权限，估计会有坑 |
+| **v1.9 多会话协调器** | ⚠️ 队列/epoch/归约有单测，真实桌面并发未验 | 按 `docs/manual-test.md` §13 验证扫描不阻塞、stop/start 取消、手动/自动幂等和并发扫描不丢账 |
 | **手机看板** | ⚠️ 没有用真实浏览器打开过 | 手机连同一 WLAN，开 `bind_all`，扫码进页面 |
 | **打包路径** | ⚠️ 4 个目标的 `build-tauri` 自这些改动以来**没有跑过**（它只在 `v*` 标签上触发，见 11.4） | 打一个 `v1.5.0`，或先推 `v1.5.0-rc.1` 只验链路 |
 
@@ -1057,18 +1043,19 @@ push tag v*
 
 | 项 | 状态 |
 |---|---|
-| `docs/architecture.md` | ✅ 已重写，覆盖到 v1.6（证据快照、AI 仲裁、形状驱动迁移） |
+| `docs/architecture.md` | ✅ 已重写并对齐到 v1.9（续跑协调器、并发归约、进程代际身份） |
 | `src-tauri/tauri.conf.json` 的 `icon` 数组 | ✅ 已补 `icons/icon.png`（512px） |
 | 四处版本号漂移 | ✅ 已收成单一来源 + 测试锁死，见 11.6 |
-| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.6，配置表指向本文档 10.3） |
-| 本文档自身的计数 | ⚠️ 代码已变更，发布前再由脚本重数 |
+| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.9，配置表指向本文档 10.3） |
+| 本文档自身的计数 | ✅ 2026-08-07 已按当前工作区重数 |
 
 ### 12.3 结构性欠账
 
 - **ConfigPanel 已完成第一轮拆分。** 主文件约 610 行，通用骨架、通知、成本、AI 分区已移到
   `src/components/config/`；Webhook、远程和适配器仍在主文件，下一轮可继续按相同边界拆出。
-- **前端测试覆盖纯函数、store、版本一致性和跨语言枚举/i18n 门禁，共 38 个。**
-  组件渲染层仍缺 `@testing-library/react` 覆盖，`SessionList` 的排序、标签显隐值得补。
+- **前端测试覆盖纯函数、store、版本一致性和跨语言枚举/i18n 门禁，共 99 个。**
+  `SessionList` 的搜索、筛选和排序策略已下沉为纯函数并覆盖；组件渲染层仍缺
+  `@testing-library/react` 覆盖。
 - **自动更新缺失**。`045e571` 移除了 updater 插件（没配签名公钥会导致启动即崩），
   现在只能手动下载新版本。
 
@@ -1160,7 +1147,7 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 | P0 续跑演练（dry-run）按钮 | ✅ v1.4 | `Resumer::probe` + `ResumeProbe`，见 7.13 |
 | P0 三平台实机验证清单 | ✅ 清单已写 / ⚠️ **还没走完** | `docs/manual-test.md`，见 12.1 |
 | P1 拆 `ConfigPanel.tsx` | ✅ v1.6（第一轮） | 通用骨架、通知、成本、AI 分区已拆，主文件降到约 610 行 |
-| P1 前端 vitest | ✅ v1.4 | 落地时 38 个，现已 93 个，见 14.2 |
+| P1 前端 vitest | ✅ v1.4 | 落地时 38 个，现已 99 个，见 14.2 |
 | P2 重写 `docs/architecture.md` / README / `icons/icon.png` | ✅ | 见 12.2 |
 | P2 自动更新重做 | ❌ 仍未做 | 见 13.2 |
 | P1 自定义适配器 UI | ✅ v1.6 | 设置页可增删改名称、进程匹配和会话文件模式 |
@@ -1172,7 +1159,7 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 最后一行值得单独说：它不在任何一版的候选清单里，是从"为什么每次都要等用户来报同一类问题"
 这个问题倒推出来的。**清单能列出的都是想得到的功能；想不到的那一层，只能靠追问症状的成因找到。**
 
-### 13.2 v1.6 / v1.7 / v1.8 已交付与下一步候选
+### 13.2 v1.6 / v1.7 / v1.8 / v1.9 已交付与下一步候选
 
 按"先让已交付的东西可信"排序：
 
@@ -1195,7 +1182,11 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 **P1 — 继续拆 `ConfigPanel.tsx`。** 第一轮已把通用骨架、通知、成本、AI 分区拆出，主文件约 610 行；
 Webhook、远程和适配器仍可按同一边界继续拆，但不再是阻塞发布的欠账。
 
-**P2 — 组件层测试。** 现在的 93 个前端测试只覆盖纯函数和 store 归约；`SessionList`
+**已交付（v1.9）— 续跑协调器。** 扫描与真实投递彻底解耦；按会话合并队列、常驻
+worker、RAII 租约、stop 生命周期失效、出队全量重验、进程启动代际身份和并发状态归约共同
+保证“检测持续刷新，但旧动作绝不补敲”。首次引导与会话聚焦是同版本的前端配套。
+
+**P2 — 组件层测试。** 现在的 99 个前端测试只覆盖纯函数和 store 归约；`SessionList`
 的排序、标签显隐这类逻辑值得补 `@testing-library/react`。
 
 **已交付（v1.8）— 限流识别与保持窗口。** 需求原话是「按不同供应商选不同策略」，但代码读
@@ -1360,36 +1351,39 @@ cargo test -- --list                        # 列出全部测试名
 
 ./scripts/gen-icons.sh           # 从 SVG 母版重出整套图标（需要 Chrome/Chromium）
 
-git tag v1.8.0 && git push origin v1.8.0    # 触发 4 目标打包 + 建 Release，见 11.4
+git tag v1.9.0 && git push origin v1.9.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
-### 14.2 测试分布（Rust 246 + 前端 93）
+### 14.2 测试分布（Rust 259 + 前端 99）
+
+Rust（`cargo test -- --list` 的模块级统计）：
 
 | 模块 | 个数 | 守的是什么 |
 |---|---:|---|
-| `resumer` | 47 | 生成脚本的语法、剪贴板通道、拒绝盲敲、终端识别边界、落地核验、演练 |
-| `detector` | 49 | 两条铁律、散文不是证据、词边界、**判定不看任何续跑计数器**、保持窗口的时刻比较与放手条件 |
-| `storage` | 35 | 六张表的读写、去重游标、续跑记录、历史聚合 |
-| `monitor` | 23 | 冷却与线性退避、额度闸门、`ResumeOutcome` 归约、事件去重、标签、保持窗口跨轮存活 |
-| `adapters` | 20 | 回合分类、记账行跳过、错误行提取、尾部读取的多字节边界（其中 10 个在 `claude_code`） |
-| `detector::rate_limit` | 19 | 兜底形状识别、等待时间解析（中英）、每条关键词单独可命中 |
-| `export` | 18 | CSV 转义、上限截断、三个维度的列齐全 |
-| `remote` | 11 | 两种令牌来源、定长比较、弱令牌告警、换绑前先停旧监听、页面渲染 |
-| `cost` | 7 | 最长前缀匹配、引入期价格、聚合 |
+| `detector` | 68 | 双重校验、结构证据、注意力/策略、限流保持与形状识别 |
+| `resumer` | 47 | 三平台脚本、剪贴板、定位拒绝、演练与落地核验 |
+| `storage` | 35 | 六张表、游标去重、续跑记录、历史聚合 |
+| `monitor` | 31 | 动作闸门、计数归约、队列合并、RAII 租约、stop epoch、并发状态合并 |
+| `adapters` | 25 | 记录解析、进程发现、PID 启动代际身份与历史键 |
+| `export` | 18 | CSV 转义、上限与列齐全 |
+| `remote` | 11 | 鉴权、定长比较、换绑与页面渲染 |
+| `cost` | 7 | 价格匹配与聚合 |
+| `i18n` | 6 | 重复 key、占位符和枚举词条门禁 |
 | `webhook` | 6 | 五家载荷格式 |
-| `i18n` | 6 | 无重复 key、占位符有出处、**四族枚举 key 都查得到真话** |
+| 其他（`ai_judge` / 顶层） | 5 | 第二意见契约与跨模块不变式 |
 
 前端（vitest，`pnpm test`）：
 
 | 文件 | 个数 | 守的是什么 |
 |---|---:|---|
-| `src/lib/utils.test.ts` | 25 | token / 金额 / 时间格式化、`baseName` 的三平台路径、`cn` 的同族覆盖 |
-| `src/lib/display.test.ts` | 19 | 状态与注意力级别的映射齐全、每个值都是合法 Tailwind 类、i18n key 对得上 |
-| `src/lib/trend.test.ts` | 19 | 「不知道」与 0 不是一回事、时长三档文案、环比：上期为 0 仍可比 / 没上期不拿 0 当基准 / 持平是 0 不是 null、涨跌该红还是该绿 |
-| `src/lib/history.test.ts` | 14 | 按本地时区（不是 UTC）分天、今天/昨天措辞、跨月跨年、**夏令时增减那一小时的当天「昨天」仍然对** |
-| `src/stores/useAppStore.test.ts` | 7 | 命令归约：成功/失败的 `ok` 取值、错误文案原样传递、演练结论不被吞 |
-| `src/components/ui/BarChart.test.ts` | 7 | 最后一根柱子一定有刻度、刻度数不超上限、30 天按 5 格步长从右往左、无数据无刻度 |
-| `src/version.test.ts` | 2 | 四处版本号一致、是三段数字而不是占位符（见 11.6） |
+| `src/lib/utils.test.ts` | 25 | token / 金额 / 时间格式化、路径与 class 合并 |
+| `src/lib/display.test.ts` | 19 | 状态、注意力、策略映射和 i18n key |
+| `src/lib/trend.test.ts` | 19 | 趋势语义、0 与未知、涨跌颜色 |
+| `src/lib/history.test.ts` | 14 | 本地日期分组、跨月跨年与夏令时 |
+| `src/stores/useAppStore.test.ts` | 7 | IPC 结果与演练归约 |
+| `src/components/ui/BarChart.test.ts` | 7 | 时间刻度与空数据 |
+| `src/lib/sessions.test.ts` | 6 | 会话搜索、四种 scope、注意力优先排序 |
+| `src/version.test.ts` | 2 | 四处版本一致与 SemVer 形状 |
 
 值得单独一提的几个测试名（它们本身就是文档）：
 
@@ -1414,6 +1408,10 @@ git tag v1.8.0 && git push origin v1.8.0    # 触发 4 目标打包 + 建 Releas
 - `a_500_is_not_a_rejection_shape` —— 拿最常见的错误码当限流，会让真故障没人叫
 - `every_listed_phrase_is_recognized_on_its_own` —— 逐条钉住，防的是"某条词根本命中不了却没人发现"
 - `every_enum_key_resolves_to_real_wording` —— 漏一条词条不该让用户在日志里看见键名
+- `resume_queue_coalesces_each_session_to_the_latest_snapshot` —— 扫描再快也不能堆旧动作
+- `stop_then_restart_does_not_revive_an_old_action` —— stop/start 不能让旧动作复活
+- `overlapping_scan_preserves_a_completed_resume_commit` —— 扫描和投递重叠不能丢账
+- `a_reused_pid_with_a_different_start_time_is_rejected` —— 裸 PID 相同不代表还是原进程
 
 ### 14.3 技术栈
 
@@ -1433,7 +1431,7 @@ git tag v1.8.0 && git push origin v1.8.0    # 触发 4 目标打包 + 建 Releas
 ```
 agent-pulse/
 ├── PROJECT_STATUS.md          ← 本文档
-├── README.md                  ← 面向使用者（路线图到 v1.5，含打包触发说明）
+├── README.md                  ← 面向使用者（路线图到 v1.9，含打包触发说明）
 ├── docs/architecture.md       ← 分层架构与数据流
 ├── docs/manual-test.md        ← 三平台实机验证清单（还没走完，见 12.1）
 ├── index.html                 ← 首屏底色写死 #fafafa
@@ -1442,10 +1440,10 @@ agent-pulse/
 ├── src/                       ← 前端
 │   ├── App.tsx  main.tsx  types.ts  index.css
 │   ├── version.test.ts        ← 四处版本号一致性（见 11.6）
-│   ├── components/{ConfigPanel,CostPanel,HistoryPanel,LogPanel,SessionList,StatsPanel,StatusCards}.tsx
+│   ├── components/{DashboardPanel,OnboardingPanel,ConfigPanel,CostPanel,HistoryPanel,LogPanel,SessionList,StatsPanel,StatusCards}.tsx
 │   ├── components/ui/         ← Radix 封装（Button/Card/Field/Select/Switch/Tabs/Tooltip）+ 自绘 BarChart
-│   ├── i18n/index.ts          ← 220 条前端文案
-│   ├── lib/{display,chime,useNotice,utils}.ts + display.test.ts / utils.test.ts
+│   ├── i18n/index.ts          ← 前端中英双语文案
+│   ├── lib/{display,chime,useNotice,utils,sessions}.ts + 对应纯函数测试
 │   └── stores/useAppStore.ts + useAppStore.test.ts
 └── src-tauri/
     ├── tauri.conf.json        ← 版本号由 src/version.test.ts 与 package.json 对齐

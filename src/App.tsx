@@ -1,12 +1,10 @@
 import { useEffect } from "react";
 import { ConfigPanel } from "./components/ConfigPanel";
 import { CostPanel } from "./components/CostPanel";
+import { DashboardPanel } from "./components/DashboardPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
-import { LogPanel } from "./components/LogPanel";
 import { ResumeRecordsPanel } from "./components/ResumeRecordsPanel";
-import { SessionList } from "./components/SessionList";
 import { StatsPanel } from "./components/StatsPanel";
-import { StatusCards } from "./components/StatusCards";
 import {
   Badge,
   Button,
@@ -130,10 +128,8 @@ export default function App() {
         </header>
 
         <main className="flex-1 overflow-y-auto p-6">
-          <TabsContent value="dashboard" className="animate-fade-in space-y-5">
-            <StatusCards />
-            <SessionList />
-            <LogPanel />
+          <TabsContent value="dashboard" className="animate-fade-in">
+            <DashboardPanel />
           </TabsContent>
           <TabsContent value="stats" className="animate-fade-in">
             <StatsPanel />

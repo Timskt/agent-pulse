@@ -4,7 +4,7 @@
 > 配置项逐条说明、路线图、开发红线在 [PROJECT_STATUS.md](../PROJECT_STATUS.md)；
 > 三平台手动验收清单在 [manual-test.md](./manual-test.md)。
 >
-> 最后一次与代码对齐：2026-08-05（`v1.8` 开发完成，待发布）。
+> 最后一次与代码对齐：2026-08-07（`v1.9` 开发完成，待发布）。
 
 ## 1. 一条不能越过的线
 
@@ -47,25 +47,33 @@ AgentPulse 是 **AI Agent 的守护神，不是它的容器**。整套架构都�
 
 | 路径 | 行数 | 职责 |
 |------|-----:|------|
-| `src-tauri/src/resumer/mod.rs` | 3382 | 投递层全部：通道选择、三平台脚本、演练、落地核验、聚焦 |
+| `src-tauri/src/resumer/mod.rs` | 3391 | 投递层全部：通道选择、三平台脚本、演练、落地核验、聚焦 |
 | `src-tauri/src/storage/mod.rs` | 2392 | SQLite 六张表：续跑/检测/日聚合/用量/游标/会话历史 |
-| `src-tauri/src/detector/mod.rs` | 1985 | 信号融合、注意力分级、词边界匹配、限流保持窗口 |
-| `src-tauri/src/monitor/mod.rs` | 1692 | 扫描循环、状态合并、**动作闸门**、事件环、生命周期收拢 |
-| `src-tauri/src/adapters/` | 1255 | 进程快照 + Claude Code / Codex / OpenCode / 自定义 |
-| `src-tauri/src/lib.rs` | 934 | Tauri 装配：命令、托盘、事件泵、窗口行为 |
+| `src-tauri/src/monitor/mod.rs` | 2299 | 扫描循环、续跑协调队列、worker、动作闸门、并发状态归约 |
+| `src-tauri/src/detector/mod.rs` | 2098 | 信号融合、注意力分级、词边界匹配、限流保持窗口 |
+| `src-tauri/src/adapters/` | 1388 | 进程快照、进程代际身份、Claude Code / Codex / OpenCode |
+| `src-tauri/src/lib.rs` | 884 | Tauri 装配：命令、托盘、事件泵、窗口行为 |
 | `src-tauri/src/remote/mod.rs` | 873 | 手写 HTTP 服务 + 内嵌看板页 |
-| `src-tauri/src/i18n/mod.rs` | 740 | 后端文案（通知、托盘、日志、报错、CSV 表头） |
+| `src-tauri/src/i18n/mod.rs` | 751 | 后端文案（通知、托盘、日志、报错、CSV 表头） |
 | `src-tauri/src/export/mod.rs` | 684 | CSV 渲染与转义边界（`Cell::Text` 中和公式 / `Cell::Value` 保持可求和） |
 | `src-tauri/src/cost/mod.rs` | 536 | 模型价目表、增量读用量、限流预测 |
 | `src-tauri/src/detector/rate_limit.rs` | 438 | 限流形状识别与等待时间解析（纯函数，不碰时钟/网络/配置） |
-| `src/i18n/index.ts` | 746 | 前端文案（界面上的字） |
-| `src/components/ConfigPanel.tsx` | 610 | 设置页主编排（通知 / 成本 / AI 分区已拆到 `components/config/`） |
+| `src/i18n/index.ts` | 800 | 前端文案（界面上的字） |
+| `src/components/ConfigPanel.tsx` | 610 | 设置页主编排 |
+| `src/components/SessionList.tsx` | 549 | 会话列表、搜索、筛选、状态与动作入口 |
+| `src/components/OnboardingPanel.tsx` | 140 | 首次三步引导与非侵入边界说明 |
+| `src/lib/sessions.ts` | 90 | 会话筛选和排序纯函数；不重算 Rust 判定 |
 
 ## 4. ① 感知层：会话是怎么被认出来的
 
 `adapters::take_process_snapshot()` 每轮扫描**只枚举一次**系统进程，然后把同一份
 快照交给所有适配器 —— 四个适配器各自遍历系统进程表的写法在会话多的机器上是
 可观测的浪费。
+
+进程身份不是裸 PID，而是 **PID + 进程启动时刻**。`process_session_id` 把启动代际写入
+会话 id，防止系统复用 PID 时让新 Agent 继承旧会话的冷却、失败退避和自动续跑额度。
+投递前的 `process_matches_session` 只定向刷新目标 PID（不再为每条动作重扫整张进程表），
+并同时复核启动时刻与可读命令行；同 PID、不同代际一律拒绝投递。
 
 每个适配器实现 `AgentAdapter`，其中三个方法是后面所有判断的原料：
 
@@ -344,51 +352,72 @@ pane 刚被关掉、授权中途失效 —— 每一种都让脚本成功而字�
 2–8 秒），没在守护降到 10 秒，**窗口不可见时整轮跳过**，切回来立刻补一次。
 原来那个无条件 `setInterval(3000)` 在窗口收进托盘时照样每 3 秒敲一次后端。
 
-## 11. 一次自动续跑的完整路径
+## 11. 一次自动续跑的完整路径（v1.9 协调器）
+
+v1.9 把“检测”和“敲字”从同一个长临界区拆开。旧结构中 `scan_once` 会等待每个会话
+最长 6 秒的落地核验；10 个中断会话就可能让下一轮检测、托盘扫描和界面刷新一起等约
+60 秒。现在扫描只产出事实与动作，真实投递交给常驻 worker：
 
 ```
-每轮扫描（tokio interval）
-  take_process_snapshot()                       ← 全局只枚举一次进程
-  ↓
-  各适配器 discover_sessions(&snapshot)
-  ↓
-  与上一轮状态合并（保留三个计数器、首次见到时间）
-  ↓
-  逐会话：recent_output / error_output / turn_state
-  ↓
-  Detector::detect → Verdict + AttentionLevel + 命中的关键词/标记
-  ↓                  （只回答「是什么」，不碰额度也不碰冷却）
-  ├─ AttentionLevel 需要叫人 → Notifier（系统通知 + 声音 + 托盘角标）
-  │                            → Webhook（Slack / Discord / ntfy / Bark）
-  │
-  └─ 动作闸门（monitor，判定层之外）
-       Verdict == ConfirmInterrupt
-       且 auto_resume_enabled
-       且 has_nudges_left：resume_streak < max_resume_count   ← 连续无效次数，不是终身次数
-       且 now - last_resume ≥ effective_cooldown              ← 随 resume_failures 线性退避
-       ↓
-       选提示词（命中 goal 关键词 → 目标恢复提示词，否则通用）
-       ↓
-       Resumer::resume_verified
-         ⓵ 投递前记一次 transcript_fingerprint（长度, mtime）
-         ⓶ Resumer::resume
-              a. 认得出 tmux/screen？→ 复用器投递（最高确定性）
-              b. 否则 GUI 定位：TTY → 终端应用 → 窗口/标签
-                   定位不到 且 未开 auto_follow_latest → 放弃，写 blind_refused
-                   macOS 先查辅助功能授权，没有就**不跳窗口**，直接说去哪儿点
-              c. 非 ASCII → 剪贴板 + 一个 ASCII 粘贴键
-         ⓷ 每 300ms 复查指纹，最多 6 秒 → ResumeOutcome
-              Failed / Silent → resume_failures += 1，退避加长，连续失败升级告警
-              Landed          → resume_streak = 0，resume_failures = 0
-              Unverifiable    → 只累加 resume_count，不判成失败
-       ↓
-       storage.record_resume(...)  → success 存核验结果，不是脚本退出码
-       push_event(...)             → 活动日志（前端 800ms 内看到）
+后台节拍 / 托盘 / 前端扫描
+             │
+             ▼
+       scan_lock（只保护发现、取证、判定、状态合并）
+             │
+    DetectionSnapshot
+  （记录 len + mtime）
+             │
+             ▼
+ ResumeAction（会话快照 + 活动指纹 + stuck_secs + lifecycle_epoch）
+             │
+             ▼
+ ResumeQueue：同 session upsert 最新动作，不堆旧快照
+             │ notify
+             ▼
+ resume_worker：不同 session FIFO、全局串行消费
+             │
+      ResumeLease（同会话 RAII 幂等）
+             │
+      delivery_lock（自动 + 手动共享）
+             │
+             ▼
+ 出手前重验：lifecycle / running / 总开关 / 状态 / tactic
+             / 额度 / 冷却 / 记录指纹
+             │
+             ▼
+ Resumer 再验 PID + 进程启动代际 + 命令行
+             │
+             ▼
+ 定位 → 剪贴板投递 → 回车 → 最长 6 秒落地核验
+             │
+             ▼
+ commit_resume_outcome → SQLite / 日志 / 通知 / 计数器
 ```
 
-**这张图里唯一不能挪的一段是「判定 → 闸门」那条横线。** 判定只说状态，
-额度、冷却、总开关全在闸门里；把任何一条塞回 `make_verdict`，催满的会话就会被
-钉在 `Suspicious`，于是既不敲也不叫人（见 §5）。
+关键不变式：
+
+1. **扫描不等投递。** `scan_lock` 在 `enqueue_resume_actions` 前释放；一个会话核验慢，不会拖住
+   后续发现、状态刷新和“立即扫描”。
+2. **同会话队列有界。** `ResumeQueue` 用 `VecDeque + HashMap`：第一次入队决定 FIFO 位置，
+   后续扫描只替换动作快照，因此队列大小最多等于待处理会话数；在途会话也最多保留一条
+   最新后继，避免旧动作等待全局锁时把更新鲜的证据直接丢掉。
+3. **同会话最多一个在途动作。** `ResumeRegistry::try_acquire` 返回 `ResumeLease`，`Drop` 自动
+   释放；任何早退、`?` 返回或 unwind 都不会留下永久“处理中”标记。
+4. **真实投递全局串行。** worker 本身串行自动动作，手动入口也共享 `delivery_lock`，因为
+   剪贴板与前台窗口都是全局单件。
+5. **停止是取消边界。** `stop()` 清空尚未消费的自动队列，并推进 `lifecycle_epoch`；动作绑定
+   生成时的代数，所以“停止后立即重启”也不能让旧动作复活。停止不禁用明确的手动续跑。
+6. **排队不等于许可。** `auto_action_is_current` 在拿到投递锁后重新读取最新配置和状态，
+   记录活动指纹也必须仍与检测时一致；会话自己恢复、额度用光或策略变化都会取消旧动作。
+7. **进程身份按代际而非裸 PID。** 新进程即使命令行一样，只要启动时刻不同就不是原会话。
+8. **扫描与投递可以重叠但不能丢账。** `merge_resume_runtime` 在状态锁内保留最新的
+   `resume_count`、`resume_failures`、`last_resume_at`；只有本轮明确观察到 `Running` 才清空
+   `resume_streak`。因此旧扫描快照不会覆盖刚完成的续跑提交。
+9. **日志只读提交后的事实。** `commit_resume_outcome` 返回 `ResumeCommit`，日志显示的是状态锁
+   内真正落笔后的计数，不再拿动作快照做 `+1` 猜测。
+
+手动续跑不经过自动队列，因为用户希望立即得到结果；但它与自动路径共享会话租约、投递锁、
+`Resumer::resume_verified`、进程身份复核和记账归约，所以不会长出第二套安全语义。
 
 ## 12. 八个花了很大代价才弄明白的事实
 
@@ -610,8 +639,8 @@ if total == last_len { continue; }   // 满环之后恒真
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 246 passed |
-| 前端单测 | `pnpm test`（vitest） | 93 passed |
+| Rust 单测 | `cargo test` | 259 passed |
+| 前端单测 | `pnpm test`（vitest） | 99 passed（8 files） |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |
 
@@ -710,9 +739,12 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 
 ## 14. 已知边界（不要当成已验证）
 
-- 剪贴板粘贴那条续跑路径只在 **macOS + Terminal.app** 上真机验证过；Windows 和
-  Linux 依赖 CI 编译 + 不带 cfg 的单元测试，**没有真机跑过**。
+- 三平台真实续跑仍没有本轮可引用的正式真机验收记录；代码、脚本语法与单元测试通过
+  不等于字符一定落进了正确终端。所有平台继续按 `docs/manual-test.md` 保持未勾选。
 - tmux/screen 通道编译通过、有 4 个单元测试，**没有对着真实 tmux pane 试过**。
+- v1.9 的队列合并、生命周期失效、RAII 租约、进程代际复核和并发状态归约都有单测，
+  但**真实多会话排队投递**仍需手工验收：特别是“6 秒 × N 不阻塞扫描”、stop/start 取消、
+  手动与自动同刻触发、PID 复用这几条只能在真实桌面环境确认端到端行为。
 - 落地核验的 6 秒窗口是**推理出来的，不是测出来的**：它假设 agent 收到输入后 6 秒内
   会往记录里写点什么。真机上如果某个 agent 反应更慢，核验会把 `Landed` 误判成
   `Silent` —— 后果是冷却变长、多一条失败日志，不会误伤额度（`Silent` 也不算「催过了」），
@@ -727,7 +759,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 - 导出的 CSV 有 18 个单元测试盯着转义边界，但**没有真的用 Excel / Numbers /
   pandas 各打开过一次**。BOM 和 `\r\n` 这两条是照标准写的，不是实测出来的。
 - 前端测试只到纯函数层（工具函数、显示映射、store 归约、历史分组、趋势、
-  图表刻度、版本一致性，共 93 个），**组件渲染层没有任何测试**。
+  图表刻度、会话搜索筛选、版本一致性，共 99 个），**组件渲染层没有任何测试**。
 - **供应商身份在代码里不存在**，是刻意的：读运行中进程的 environ 能拿到 `base_url`，
   但同一个 block 里就是 `ANTHROPIC_AUTH_TOKEN`，等于让本应用具备读密钥的能力。
   v1.8 改成不靠身份也能兜住：关键词全落空时看 HTTP 形状和中转站说法
@@ -743,7 +775,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
   一年只有两次切换，撞上的前提是窗口正好跨过那一刻；后果最多是多按一小时或早放一次，
   都不会往限流窗口里敲字。真要修就得把存储和展示拆成两个值，而这个功能刚落地，
   为 0.02% 的场景动它的形状不划算。12.5 那条夏令时的账已经付过一次，这里是明知故犯。
-- 保持窗口的时刻比较和形状识别有 65 个单元测试（`detector` 46 + `detector::rate_limit` 19）
+- 保持窗口、判定与限流形状合计有 68 个 `detector` 模块单元测试
   盯着，**但「证据被顶出 40 行之后它还按着」这条只有实机能验**，见 `docs/manual-test.md`
   第 12 节；那一节还没走过。
 
@@ -760,6 +792,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 | v1.6 可解释判定 ✅ | `InterruptReason` / `ResumeTactic` 单一策略源、`DetectionEvidence` 判据面板、结构化 AI 第二意见（单向授权）、自定义适配器 UI、跨语言枚举与 i18n 门禁 |
 | v1.7 记录与导出 ✅ | 会话生命周期收拢（关掉的会话不再显示「运行中」）、续跑记录中心、统计趋势对比、会话档案抽屉、图表补时间刻度、**CSV 导出**（`Text` / `Value` 双变体转义）、跨夏令时的日期分组 |
 | v1.8 限流保持 ✅ | 关键词落空后的兜底形状识别、从消息里抠等待时间（中英）、新原因 `UpstreamRejected`、**保持窗口**（证据被顶出 40 行之后仍然不敲字）、四族枚举 i18n 门禁、变异检查脚本 |
+| v1.9 续跑协调器 ✅ | 扫描/投递解耦、按会话合并队列、常驻 worker、RAII 会话租约、stop 生命周期代数、出队全量重验、并发状态归约、PID + 启动代际身份；首次三步引导与多会话搜索筛选 |
 | v2.0 编排层 ⛔ | **与「非侵入」定位冲突，已搁置** —— 不经确认不动工 |
 | v2.1+ 自治层 ⛔ | 同上 |
 

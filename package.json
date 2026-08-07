@@ -1,7 +1,7 @@
 {
   "name": "agent-pulse",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "AI Coding Agent 守护与自动续跑工具 - 跨平台监控 Claude Code / Codex / Cursor 会话状态，自动检测中断并续跑",
   "type": "module",
   "scripts": {

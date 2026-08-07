@@ -101,6 +101,11 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("log.resume_sent", "已触发续跑（{mode}，第 {count} 次）：{detail}", "Resume sent ({mode}, attempt {count}): {detail}"),
     ("log.resume_failed", "续跑失败：{detail}", "Resume failed: {detail}"),
     ("log.resume_manual", "手动续跑：{detail}", "Manual resume: {detail}"),
+    (
+        "log.resume_stale_skip",
+        "会话在准备续跑期间已经变化，本次旧动作已取消，下一轮会重新判断",
+        "The session changed while the resume was being prepared; the stale action was cancelled and will be reconsidered next scan",
+    ),
     // 开工前那次体检的结论。只写日志不弹窗：tmux / screen / iTerm2 三条通道
     // 不需要辅助功能授权，对用那几条路的人来说弹窗就是误报
     (
@@ -126,6 +131,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     // ── 命令返回的错误（前端直接弹给用户）──
     ("err.already_running", "监控已经在运行了", "Monitoring is already running"),
     ("err.session_not_found", "找不到这个会话，可能已经退出了", "That session is gone — it may have exited"),
+    ("err.resume_in_progress", "这个会话已经有一次续跑正在处理中，没有重复发送", "A resume is already in progress for this session; no duplicate was sent"),
     ("err.push_url_missing", "还没填推送地址或主题", "No endpoint or topic configured yet"),
     ("err.push_request", "请求失败：{detail}", "Request failed: {detail}"),
     ("err.push_status", "服务端返回 HTTP {status}", "The server returned HTTP {status}"),
@@ -189,6 +195,11 @@ const TABLE: &[(&str, &str, &str)] = &[
         "resume.no_terminal",
         "认不出这个会话在哪个终端里，没有动手",
         "Could not tell which terminal this session lives in — nothing was typed",
+    ),
+    (
+        "resume.session_not_running",
+        "这个 Agent 进程已经退出或 PID 已被别的进程复用，为免敲错窗口已放弃续跑",
+        "The agent process has exited or its PID was reused, so nothing was typed into a potentially wrong window",
     ),
     // 定位不到窗口时宁可不做：往错误的窗口里敲一句中文再回车，比不续跑糟糕得多
     (

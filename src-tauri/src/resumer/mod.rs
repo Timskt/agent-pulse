@@ -111,7 +111,9 @@ const VERIFY_POLL_MS: u64 = 300;
 /// 落盘的 agent 都成立，不需要每接一个新 agent 就重新实现一遍。没有记录文件的
 /// agent 自然拿不到指纹，那种情况是「核验不可用」（[`ResumeOutcome::Unverifiable`]），
 /// 不是失败——宁可少管，也不要给一个本来好使的通道判死刑。
-fn activity_fingerprint(session: &AgentSession) -> Option<(u64, std::time::SystemTime)> {
+pub(crate) type ActivityFingerprint = (u64, std::time::SystemTime);
+
+pub(crate) fn activity_fingerprint(session: &AgentSession) -> Option<ActivityFingerprint> {
     let path = session.session_file.as_ref()?;
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.len(), meta.modified().ok()?))
@@ -1379,6 +1381,13 @@ impl Resumer {
         session: &AgentSession,
         use_goal_prompt: bool,
     ) -> Result<String, String> {
+        // 检测和真正投递之间可能隔着通知、AI 仲裁以及前一个会话的 6 秒核验。
+        // 这期间进程完全可能已经退出；若还按旧 PID 去找终端，开启盲跟随后尤其危险，
+        // 提示词会落进当前前台窗口。PID 还可能被复用，所以连命令行也一起核对。
+        if !crate::adapters::process_matches_session(session) {
+            return Err(self.i18n.t("resume.session_not_running").to_string());
+        }
+
         let prompt = if use_goal_prompt {
             &self.config.goal_resume_prompt
         } else {
