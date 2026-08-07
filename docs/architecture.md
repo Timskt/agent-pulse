@@ -210,7 +210,7 @@ AwaitingUser 回合收尾了，确实停在等人
 | **tmux** | `send-keys -t %3 -l --`（pane id） | 否 | 否 | 否 |
 | iTerm2 | `write text` 直接写 pty | 是 | 否 | 否 |
 | Terminal / VS Code / Cursor / Warp | AppleScript + TTY 匹配 | 是 | **辅助功能** | 是 |
-| Windows 控制台 / Terminal | PowerShell + `SetForegroundWindow` + SendKeys | 是 | 否 | 是 |
+| Windows 控制台 / Terminal | 隐藏 PowerShell 定位器 + `SetForegroundWindow` + Unicode `SendInput` | 是 | 否 | **否** |
 | Linux X11 / Wayland | `xdotool` / `ydotool` | 是 | 否 | 是 |
 | screen | `-X stuff`（只到 session 当前选中的 window） | 否 | 否 | 否 |
 
@@ -645,7 +645,7 @@ if total == last_len { continue; }   // 满环之后恒真
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 262 passed |
+| Rust 单测 | `cargo test` | 263 passed（macOS / Linux）；Windows 另有 1 个 PowerShell helper 运行时编译测试 |
 | 前端单测 | `pnpm test`（vitest） | 99 passed（8 files） |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |

@@ -2,7 +2,7 @@
 
 > 日期：2026-08-07
 > 状态：仅记录计划，**尚未开工**
-> 当前暂停点：`v1.10.0` 两阶段续跑流水线完成并推送 `main` 后暂停；未打 tag、未发布 Release
+> 当前收尾点：`v1.10.0` 两阶段流水线已实现；Windows cmd/Codex 的 `Ctrl+V` 图片粘贴误触与 PowerShell 闪窗已完成代码修复，仍需 Windows 真机复测；未打 tag、未发布 Release
 
 这份计划只围绕 AgentPulse 的核心竞争力：**在不接管 Agent 的前提下，尽可能准确、及时、可证明地完成续跑。**
 前端扩展、编排层和自治层不进入核心优先级。
@@ -28,6 +28,7 @@
 - stop 能取消尚未输入的自动动作，但不会抹掉已经真实回车的动作记账；
 - 页脚 `pending / verifying` 与真实阶段一致，早退、失败和停止后都归零；
 - macOS / Windows / Linux 与 tmux / screen 的原有定位安全边界不退化。
+- Windows cmd.exe + Codex CLI：续跑不弹 PowerShell 窗口，不触发图片粘贴快捷键，Unicode 提示词与 Enter 正确落到原会话。
 
 验收必须记录实际机器、系统版本、终端、Agent、通道、结果和失败日志；没有执行的项目继续保持未勾选，不能用单元测试代替实机结论。
 

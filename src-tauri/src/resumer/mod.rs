@@ -18,7 +18,7 @@ use std::process::Command;
 ///
 /// 平台支持：
 /// - macOS: AppleScript + TTY 匹配（v0.1.0）
-/// - Windows: SendInput API / PowerShell SendKeys (v0.2.0)
+/// - Windows: hidden PowerShell locator + Win32 Unicode `SendInput`
 /// - Linux: xdotool / ydotool (v0.2.0)
 pub struct Resumer {
     config: AppConfig,
@@ -146,18 +146,26 @@ async fn run_with_timeout(
     timeout_secs: u64,
     i18n: &I18n,
 ) -> Result<std::process::Output, String> {
-    let child = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            i18n.tf(
-                "cmd.spawn_failed",
-                &[("program", program), ("detail", &e.to_string())],
-            )
-        })?;
+        .kill_on_drop(true);
+
+    // GUI 应用启动 console 子进程时，Windows 默认会给 powershell.exe / cmd.exe
+    // 分配一个可见控制台，用户看到的就是一次续跑闪出一扇 PowerShell 窗口。
+    // 所有 helper 都只靠 stdout/stderr 通信，不需要自己的控制台；在 Windows 上统一
+    // 使用 CREATE_NO_WINDOW，既消除闪窗，也避免新窗口在定位完成后反抢前台焦点。
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    let child = command.spawn().map_err(|e| {
+        i18n.tf(
+            "cmd.spawn_failed",
+            &[("program", program), ("detail", &e.to_string())],
+        )
+    })?;
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -2052,18 +2060,19 @@ return "refused""#
         String::new()
     }
 
-    /// Windows: 通过 PowerShell + Win32 API 定位终端窗口并发送续跑指令
+    /// Windows: 通过隐藏的 PowerShell helper 定位终端窗口，再用 Win32 `SendInput`
+    /// 投递 UTF-16 文本。
     ///
     /// 策略：
-    /// 1. 通过 PID 获取进程所属的控制台窗口句柄
-    /// 2. 使用 SetForegroundWindow 激活目标窗口
-    /// 3. 把提示词放进剪贴板，用 `Ctrl+V` 粘贴 + 回车，最后还原剪贴板
+    /// 1. 通过 PID 沿父进程链找到会话所属窗口；
+    /// 2. 多标签宿主继续核对项目标题，定位不确定仍然拒绝；
+    /// 3. 前台窗口二次核验通过后，用 `KEYEVENTF_UNICODE` 逐 UTF-16 code unit 输入，
+    ///    最后单独发送 Enter。
     ///
-    /// 第 3 步以前是 `SendKeys::SendWait("整段提示词")`。SendKeys 是按当前键盘
-    /// 布局逐字合成按键的，中文（以及任何非 ASCII）根本没有对应的键，中文输入法
-    /// 开着时还会把按键重新解释一遍——macOS 上就是这么把
-    /// 「你之前有一个活跃的 goal 目标」敲成「啊啊啊啊啊啊啊啊啊goal啊啊啊啊啊啊」的。
-    /// 剪贴板不过键盘布局也不过输入法，所以这里只合成 `Ctrl+V` 这一个 ASCII 组合键。
+    /// 这里**不能**再用剪贴板 + `Ctrl+V`：Codex CLI 会把没有被 conhost 截获的
+    /// `Ctrl+V` 当成“粘贴图片”快捷键，随后报 `Failed to paste image: no image on
+    /// clipboard`。`SendInput(KEYEVENTF_UNICODE)` 不经过键盘布局和输入法，也不会触发
+    /// CLI 的粘贴快捷键；同时完全不读写用户剪贴板。
     #[cfg(target_os = "windows")]
     async fn resume_windows(&self, session: &AgentSession, prompt: &str) -> Result<String, String> {
         let project_name = project_name_of(&session.working_dir);
@@ -2086,11 +2095,12 @@ return "refused""#
         .await?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // 脚本自己判断出「不知道该敲哪儿」时是正常退出的，所以先看内容再看退出码
+        // 脚本自己判断出“不能安全投递”时是正常退出的，所以先看结果码再看退出码。
         let raw = stdout.lines().last().unwrap_or_default().trim();
         match raw {
             "REFUSED" => return Err(self.i18n.t("resume.blind_refused").to_string()),
             "NO_FOCUS" => return Err(self.i18n.t("resume.focus_failed").to_string()),
+            "INPUT_FAILED" => return Err(self.i18n.t("resume.input_failed").to_string()),
             "NO_WINDOW" => {
                 return Err(self
                     .i18n
@@ -2110,34 +2120,22 @@ return "refused""#
         }
     }
 
-    /// Windows 续跑脚本的生成器
+    /// Windows 续跑脚本的生成器。
     ///
     /// **故意不加 `#[cfg(target_os = "windows")]`**：脚本内容是纯字符串拼接，
-    /// 不依赖任何 Windows API，放开 cfg 之后每个平台的 CI 都会编它、测它。
-    /// 上一版的转义 bug 之所以能活那么久，就是因为只有 Windows 那一个 job 看得见它。
+    /// 不依赖当前平台 API，因此三个平台的 CI 都会编译和测试它。
     ///
-    /// 三件事跟旧版不同，每件都对应一个真会咬人的场景：
-    ///
-    /// 1. **沿父进程链往上找窗口，而不是只看一层。** agent 是控制台程序，
-    ///    自己从来没有窗口；窗口属于宿主。旧版只在「进程根本不存在」时才去看父进程，
-    ///    于是「进程活着但没窗口」——也就是所有正常情况——一律返回 `NO_WINDOW`。
-    ///    cmd.exe 直接开的会有 conhost 窗口，Windows Terminal / VS Code 里开的
-    ///    要往上走三四层才碰得到窗口。
-    /// 2. **多标签宿主要核标题。** conhost 一个窗口就是一个控制台，认到窗口就等于认到会话；
-    ///    Windows Terminal / VS Code / JetBrains 一个窗口下面挂着好几个标签，
-    ///    认到窗口只能保证「应用对了」。所以这类宿主要求窗口标题里出现项目名，
-    ///    对不上就按 [`Self::allow_blind`] 定夺。
-    /// 3. **粘贴前确认目标窗口真的到了前台。** `SetForegroundWindow` 在后台进程里
-    ///    经常被系统直接拒掉（返回 false 也不报错），而 `SendKeys` 打的是**当时的**
-    ///    前台窗口。不核一下就等于把提示词敲进用户正在看的任何一个窗口。
+    /// 定位安全边界保持不变：沿父进程链找宿主，多标签宿主必须核标题，真正输入前
+    /// 必须确认目标窗口仍是前台。变化只发生在输入算法：不再借剪贴板并发送 `Ctrl+V`，
+    /// 而是调用 Win32 `SendInput` 的 Unicode 模式。这样 cmd/conhost 不需要替应用拦截
+    /// 粘贴快捷键，Codex 也不会把续跑误判为“粘贴图片”。
     pub fn windows_resume_script(
         pid: u32,
         prompt: &str,
         project_name: &str,
         allow_blind: bool,
     ) -> String {
-        // PowerShell 单引号字符串：不做任何变量展开，只需把单引号翻倍。
-        // 双引号字符串会把提示词里的 `$` 当变量展开，那是另一种「敲出乱码」。
+        // PowerShell 单引号字符串不做变量展开，只需把单引号翻倍。
         let ps_literal = prompt.replace('\'', "''");
         let ps_project = project_name.replace('\'', "''");
         let ps_blind = if allow_blind { "$true" } else { "$false" };
@@ -2156,11 +2154,82 @@ public class WinAPI {{
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT {{
+        public uint type;
+        public InputUnion U;
+    }}
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct InputUnion {{
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+        [FieldOffset(0)] public HARDWAREINPUT hi;
+    }}
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MOUSEINPUT {{
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }}
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {{
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }}
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct HARDWAREINPUT {{
+        public uint uMsg;
+        public ushort wParamL;
+        public ushort wParamH;
+    }}
+
+    private const uint INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint KEYEVENTF_UNICODE = 0x0004;
+    private const ushort VK_RETURN = 0x0D;
+
+    private static INPUT Key(ushort virtualKey, ushort scanCode, uint flags) {{
+        INPUT input = new INPUT();
+        input.type = INPUT_KEYBOARD;
+        input.U.ki.wVk = virtualKey;
+        input.U.ki.wScan = scanCode;
+        input.U.ki.dwFlags = flags;
+        return input;
+    }}
+
+    public static bool SendUnicodeText(string text) {{
+        // .NET string 本来就是 UTF-16；逐 code unit 发送也覆盖代理项对（emoji 等）。
+        INPUT[] inputs = new INPUT[(text.Length * 2) + 2];
+        int index = 0;
+        foreach (char ch in text) {{
+            inputs[index++] = Key(0, ch, KEYEVENTF_UNICODE);
+            inputs[index++] = Key(0, ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
+        }}
+        inputs[index++] = Key(VK_RETURN, 0, 0);
+        inputs[index] = Key(VK_RETURN, 0, KEYEVENTF_KEYUP);
+
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        return sent == inputs.Length;
+    }}
 }}
 "@
 
 $target = {pid}
 $project = '{ps_project}'
+$prompt = '{ps_literal}'
 $allowBlind = {ps_blind}
 
 # 沿父进程链往上找第一个带窗口的祖先：agent 自己是控制台程序，窗口属于宿主
@@ -2204,26 +2273,16 @@ Start-Sleep -Milliseconds 300
 [void][WinAPI]::SetForegroundWindow($hwnd)
 Start-Sleep -Milliseconds 500
 
-# SendKeys 打的是「当时的前台窗口」，而 SetForegroundWindow 在后台进程里经常被拒。
-# 没切过去就别敲——否则这段提示词会落进用户正在看的那个窗口
+# SendInput 仍然投给当前前台窗口；切不过去就拒绝，不能把提示词发给别的应用。
 if ([WinAPI]::GetForegroundWindow() -ne $hwnd) {{
     Write-Output "NO_FOCUS"
     exit 0
 }}
 
-# 借一下剪贴板：粘贴不过键盘布局，中文才能原样落地
-$saved = $null
-try {{ $saved = Get-Clipboard -Raw }} catch {{}}
-Set-Clipboard -Value '{ps_literal}'
-
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.SendKeys]::SendWait("^v")
-Start-Sleep -Milliseconds 300
-[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-
-# 还给用户；粘贴是异步的，等一下再改回去
-Start-Sleep -Milliseconds 500
-if ($null -ne $saved) {{ try {{ Set-Clipboard -Value $saved }} catch {{}} }}
+if (-not [WinAPI]::SendUnicodeText($prompt)) {{
+    Write-Output "INPUT_FAILED"
+    exit 0
+}}
 
 if ($located -eq "unlocated") {{ Write-Output "fallback" }} else {{ Write-Output "matched" }}
 "#
@@ -2739,17 +2798,16 @@ mod tests {
 
     #[test]
     fn windows_confirms_the_window_actually_came_forward() {
-        // SendKeys 打的是「当时的前台窗口」，SetForegroundWindow 在后台进程里经常被拒。
-        // 不核一下，这段提示词就会落进用户正在看的窗口
+        // SendInput 打的是“当时的前台窗口”，SetForegroundWindow 在后台进程里经常被拒。
+        // 不核一下，这段提示词就会落进用户正在看的窗口。
         let script = win_script("agent-pulse", true);
         let focus_at = script
             .find("GetForegroundWindow() -ne $hwnd")
             .expect("要核前台窗口");
-        let paste_at = script.find("SendWait(\"^v\")").unwrap();
-        assert!(focus_at < paste_at, "确认前台必须在按键之前");
-        // 剪贴板也一样：切不过去就别动用户的剪贴板
-        let stage_at = script.find("Set-Clipboard -Value").unwrap();
-        assert!(focus_at < stage_at, "确认前台之前不要碰剪贴板");
+        let input_at = script
+            .find("[WinAPI]::SendUnicodeText($prompt)")
+            .expect("要走 Unicode SendInput");
+        assert!(focus_at < input_at, "确认前台必须在按键之前");
     }
 
     #[test]
@@ -2771,8 +2829,10 @@ mod tests {
         let refuse_at = script
             .find(r#"Write-Output "REFUSED""#)
             .expect("默认要能拒绝");
-        let stage_at = script.find("Set-Clipboard -Value").unwrap();
-        assert!(refuse_at < stage_at, "拒绝之前不要碰剪贴板");
+        let input_at = script
+            .find("[WinAPI]::SendUnicodeText($prompt)")
+            .expect("要有最终输入动作");
+        assert!(refuse_at < input_at, "拒绝分支必须发生在输入之前");
     }
 
     #[test]
@@ -2782,23 +2842,68 @@ mod tests {
     }
 
     #[test]
-    fn windows_prompts_go_through_the_clipboard_not_sendkeys() {
-        // SendKeys 逐字合成按键，中文没有对应键位——这正是「啊啊啊啊」的来源
+    fn windows_prompts_use_unicode_sendinput_without_clipboard_shortcuts() {
+        // Ctrl+V 如果没有被 conhost 截获，会直接交给 Codex 并触发“粘贴图片”。
+        // Unicode SendInput 既不经过键盘布局，也不借用户剪贴板。
         let script = win_script("agent-pulse", true);
-        assert!(script.contains("Set-Clipboard -Value '继续完成刚才的任务'"));
-        assert!(!script.contains("SendWait(\"继续完成刚才的任务\")"));
-        // 借了就要还
-        let paste_at = script.find("SendWait(\"^v\")").unwrap();
-        let restore_at = script.find("Set-Clipboard -Value $saved").unwrap();
-        assert!(paste_at < restore_at);
+        assert!(script.contains("$prompt = '继续完成刚才的任务'"));
+        assert!(script.contains("KEYEVENTF_UNICODE"));
+        assert!(script.contains("[WinAPI]::SendUnicodeText($prompt)"));
+        for forbidden in [
+            "SendKeys",
+            "SendWait",
+            "^v",
+            "Set-Clipboard",
+            "Get-Clipboard",
+            "System.Windows.Forms",
+        ] {
+            assert!(!script.contains(forbidden), "不得再依赖 {forbidden}");
+        }
+    }
+
+    #[test]
+    fn windows_unicode_input_sends_enter_separately_and_checks_the_result() {
+        let script = win_script("agent-pulse", true);
+        assert!(script.contains("Key(VK_RETURN, 0, 0)"));
+        assert!(script.contains("Key(VK_RETURN, 0, KEYEVENTF_KEYUP)"));
+        assert!(script.contains("sent == inputs.Length"));
+        assert!(script.contains(r#"Write-Output "INPUT_FAILED""#));
     }
 
     #[test]
     fn windows_prompt_quotes_cannot_break_out_of_the_literal() {
         // PowerShell 单引号串不做变量展开，只需把单引号翻倍。
-        // 双引号串会把 `$` 当变量，那是另一种「敲出乱码」
+        // 双引号串会把 `$` 当变量，那是另一种“敲出乱码”。
         let script = Resumer::windows_resume_script(1, "别用 $HOME，用 'pwd' 的结果", "p", false);
-        assert!(script.contains("Set-Clipboard -Value '别用 $HOME，用 ''pwd'' 的结果'"));
+        assert!(script.contains("$prompt = '别用 $HOME，用 ''pwd'' 的结果'"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_resume_helper_compiles_before_window_lookup() {
+        // PID 0 不可能定位到用户窗口，因此不会产生键盘输入；但 Add-Type 会先执行，
+        // 可在 Windows CI 上真实验证 PowerShell 语法和 SendInput P/Invoke 声明。
+        let script = Resumer::windows_resume_script(0, "继续", "agent-pulse", false);
+        let i18n = I18n::default();
+        let output = run_with_timeout(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            20,
+            &i18n,
+        )
+        .await
+        .expect("PowerShell helper should start");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.lines().any(|line| line.trim() == "NO_WINDOW"),
+            "stdout={stdout:?}, stderr={stderr:?}"
+        );
+        assert!(
+            stderr.trim().is_empty(),
+            "PowerShell should compile the helper without errors: {stderr:?}"
+        );
     }
 
     #[test]

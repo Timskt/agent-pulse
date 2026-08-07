@@ -242,6 +242,11 @@ const TABLE: &[(&str, &str, &str)] = &[
         "Non-ASCII prompts are delivered via the clipboard, but none of wl-copy / xclip / xsel is installed — try: sudo apt install wl-clipboard",
     ),
     ("resume.no_window", "找不到 PID {pid} 对应的终端窗口", "No terminal window found for PID {pid}"),
+    (
+        "resume.input_failed",
+        "Windows 没有接受完整的 Unicode 键盘输入，本次投递未记为成功",
+        "Windows did not accept the complete Unicode keyboard input; this delivery was not recorded as successful",
+    ),
     // ── tmux / screen 通道 ──
     //
     // 这是确定性最高的一条路：按 pane id 寻址，不需要窗口在前台，

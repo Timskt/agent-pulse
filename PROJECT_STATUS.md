@@ -43,7 +43,7 @@
 | 版本 | `1.10.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死；**标签未推，尚未发 Release**） |
 | 后端 | Rust，19 个文件；续跑协调器集中在 `monitor/mod.rs` |
 | 前端 | TypeScript + React 19，49 个文件 |
-| 单元测试 | Rust **262 个**（`cargo test`）+ 前端 **99 个**（`pnpm test`，vitest，8 个文件） |
+| 单元测试 | Rust **263 个**（macOS / Linux；Windows 另有 1 个 PowerShell 运行时测试）+ 前端 **99 个**（`pnpm test`，vitest，8 个文件） |
 | Tauri 命令 | 38 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
 | 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
@@ -389,7 +389,7 @@ struct DetectionResult {
 以及 v1.5 补上的第三个——**投完之后怎么知道成没成**（7.8–7.12）。
 外加一件横跨三者的事：**在真敲之前先看一遍会敲到哪**（7.13）。
 
-### 7.1 难题一：投递什么——提示词走剪贴板，不走合成按键
+### 7.1 难题一：投递什么——按平台选择不会被输入法或 CLI 快捷键误解的通道
 
 **症状**：点"带目标续跑"后，终端里出现的是
 `啊啊啊啊啊啊啊啊啊goal啊啊啊啊啊啊，aaaaaaaaaa.aaaaaa，aaaaaaaaaaaa。`
@@ -398,22 +398,21 @@ struct DetectionResult {
 会**经过输入法**。中文输入法把 ASCII 字母当拼音吃掉，于是 `goal` 之外的中文字符被重新组词，
 拼音残留就变成了一串"啊"。这不是转义 bug，是通道选错了。
 
-**方案**：非 ASCII 提示词一律**先进系统剪贴板，再发一次纯 ASCII 的粘贴组合键**：
+**方案**：不能把“粘贴组合键是 ASCII”误当成“目标 CLI 一定会把它当粘贴”。各平台按真实输入栈选择通道：
 
-| 平台 | 写剪贴板 | 粘贴键 |
+| 平台 | 文本通道 | 提交方式 |
 |---|---|---|
-| macOS | `stage_clipboard()` 生成的 AppleScript（`set the clipboard to …`） | `⌘V` |
-| Windows | PowerShell `Set-Clipboard`（单引号字面量） | `^v` |
-| Linux | `wl-copy` / `xclip` / `xsel`（**文本从 stdin 进，不拼进命令行**） | `Ctrl+Shift+V` |
+| macOS | `stage_clipboard()` 生成的 AppleScript（`set the clipboard to …`） | `⌘V` 后 Enter |
+| Windows | Win32 `SendInput` + `KEYEVENTF_UNICODE`，逐 UTF-16 code unit 投递 | 独立的 `VK_RETURN`；**不读写剪贴板、不发送 `Ctrl+V`** |
+| Linux | `wl-copy` / `xclip` / `xsel`（**文本从 stdin 进，不拼进命令行**） | `Ctrl+Shift+V` 后 Enter |
 
-粘贴组合键本身全是 ASCII，输入法不会改写它。附带两个细节：
-- **用完把剪贴板还给你**（测试 `the_users_clipboard_is_given_back`）——不能因为续跑吞掉你复制的东西；
-- **iTerm2 是例外**：AppleScript 的 `write text` 直接写进伪终端，根本不经过键盘事件，
-  所以 iTerm2 走原生通道，不动剪贴板（测试 `iterm_writes_straight_to_the_pty`）。
+Windows 曾沿用“剪贴板 + `Ctrl+V`”。在 cmd/conhost 某些组合里，组合键没有被终端宿主截获，而是直接交给 Codex CLI，触发其“粘贴图片”快捷键并报 `Failed to paste image: no image on clipboard`。v1.10 收尾改为 Unicode `SendInput`，同时给 PowerShell helper 加 `CREATE_NO_WINDOW`，避免每次续跑弹出临时 PowerShell 窗口。
 
-**安全约束**：用户可自由编辑的提示词**永不**被拼进 shell 字符串。Linux 侧走 stdin，
-Windows 侧用 PowerShell 单引号字面量并转义内部单引号（测试
-`windows_prompt_quotes_cannot_break_out_of_the_literal`、`prompts_go_through_the_clipboard_not_the_keyboard`）。
+附带两个细节：
+- macOS / Linux 借用剪贴板后必须还原（测试 `the_users_clipboard_is_given_back`）；Windows 已完全不碰剪贴板；
+- **iTerm2 是例外**：AppleScript 的 `write text` 直接写进伪终端，所以不动剪贴板（测试 `iterm_writes_straight_to_the_pty`）。
+
+**安全约束**：用户可自由编辑的提示词不能发生 PowerShell 变量展开或脚本逃逸。Windows 侧仍使用单引号字面量并转义内部单引号，但最终文本由 `SendUnicodeText` 读取（测试 `windows_prompt_quotes_cannot_break_out_of_the_literal`、`windows_prompts_use_unicode_sendinput_without_clipboard_shortcuts`）。
 
 ### 7.2 难题二：投给谁——"定位不到就不敲"
 
@@ -449,7 +448,7 @@ Windows 侧用 PowerShell 单引号字面量并转义内部单引号（测试
 | 平台 | 技术栈 | 定位链路 | 关键实现 |
 |---|---|---|---|
 | **macOS** | AppleScript（`osascript`，8 秒 timeout 兜底） | 进程 → TTY（`session_tty`）→ 终端 App（`session_terminal_app`，按 bundle 名而非可执行名）→ 精确/标题/拒绝 | `macos_script`、`title_matched_script`、`focus_session` |
-| **Windows** | PowerShell + Win32（`tokio::process::Command` 全限定调用） | 进程 → 沿父进程链向上走到宿主窗口（`find_terminal_for_pid`）→ 若在多标签名单里则要求标题含项目名 → 前台化后**确认窗口真的到前台了**再投递 | `windows_resume_script`（测试 `windows_walks_up_to_the_host_window`、`windows_confirms_the_window_actually_came_forward`） |
+| **Windows** | 隐藏 PowerShell helper + Win32 Unicode `SendInput` | 进程 → 沿父进程链向上走到宿主窗口 → 多标签宿主要求标题含项目名 → 前台化并二次核验 → `KEYEVENTF_UNICODE` 文本 + 独立 Enter | `windows_resume_script`（测试 `windows_walks_up_to_the_host_window`、`windows_confirms_the_window_actually_came_forward`、`windows_prompts_use_unicode_sendinput_without_clipboard_shortcuts`） |
 | **Linux** | `xdotool`（X11）/ `ydotool`（Wayland 兜底） | 进程 → `find_x11_window_for_pid` → 窗口激活 → 粘贴 | `resume_linux`、`resume_linux_ydotool`（测试 `ydotool_releases_every_modifier_it_presses`）、`set_clipboard_linux`（覆盖 Wayland + X11 三种工具，测试 `clipboard_tools_cover_wayland_and_x11`） |
 
 ### 7.5 终端识别的数据表
@@ -1385,14 +1384,14 @@ cargo test -- --list                        # 列出全部测试名
 git tag v1.10.0 && git push origin v1.10.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
-### 14.2 测试分布（Rust 262 + 前端 99）
+### 14.2 测试分布（Rust 263 + 前端 99；Windows 另加 1）
 
 Rust（`cargo test -- --list` 的模块级统计）：
 
 | 模块 | 个数 | 守的是什么 |
 |---|---:|---|
 | `detector` | 68 | 双重校验、结构证据、注意力/策略、限流保持与形状识别 |
-| `resumer` | 47 | 三平台脚本、剪贴板、定位拒绝、演练与落地核验 |
+| `resumer` | 48（Windows 49） | 三平台脚本、剪贴板、定位拒绝、演练与落地核验；Windows 额外真实编译 PowerShell helper |
 | `storage` | 35 | 六张表、游标去重、续跑记录、历史聚合 |
 | `monitor` | 34 | 动作闸门、计数归约、队列绕行、RAII 租约/阶段计数、stop epoch、并发状态合并 |
 | `adapters` | 25 | 记录解析、进程发现、PID 启动代际身份与历史键 |
