@@ -374,18 +374,17 @@ impl CodexAdapter {
             })?;
         Some(local.format("%Y-%m-%d %H:%M:%S").to_string())
     }
-}
 
-impl AgentAdapter for CodexAdapter {
-    fn id(&self) -> &str {
-        "codex"
-    }
-
-    fn name(&self) -> &str {
-        "Codex CLI"
-    }
-
-    fn discover_sessions(&self, processes: &[ProcessSnapshot]) -> Vec<AgentSession> {
+    /// 发现逻辑与进程代际验证分离：生产路径传入严格的 Windows FILETIME 双重校验，
+    /// 测试则可以只验证会话关联规则，不必伪造一个真实存在且身份完全一致的系统进程。
+    fn discover_sessions_with_generation<F>(
+        &self,
+        processes: &[ProcessSnapshot],
+        mut validated_generation: F,
+    ) -> Vec<AgentSession>
+    where
+        F: FnMut(&ProcessSnapshot) -> Option<u64>,
+    {
         let mut sessions = Vec::new();
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -398,8 +397,7 @@ impl AgentAdapter for CodexAdapter {
                 continue;
             }
 
-            let Some(process_created_at_ticks) = super::validated_process_creation_ticks(proc)
-            else {
+            let Some(process_created_at_ticks) = validated_generation(proc) else {
                 continue;
             };
             let external_session_id = Self::resume_session_id(&proc.cmd);
@@ -445,6 +443,20 @@ impl AgentAdapter for CodexAdapter {
         }
 
         sessions
+    }
+}
+
+impl AgentAdapter for CodexAdapter {
+    fn id(&self) -> &str {
+        "codex"
+    }
+
+    fn name(&self) -> &str {
+        "Codex CLI"
+    }
+
+    fn discover_sessions(&self, processes: &[ProcessSnapshot]) -> Vec<AgentSession> {
+        self.discover_sessions_with_generation(processes, super::validated_process_creation_ticks)
     }
 
     fn session_files(&self) -> Vec<PathBuf> {
@@ -566,10 +578,22 @@ mod tests {
         write_transcript(&root, other_id, &[]);
         let adapter = CodexAdapter::with_sessions_dir(root.clone());
 
-        let sessions = adapter.discover_sessions(&[process(&format!("codex resume {SESSION_ID}"))]);
+        let sessions = adapter.discover_sessions_with_generation(
+            &[process(&format!("codex resume {SESSION_ID}"))],
+            |_| Some(987_654_321),
+        );
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, format!("cx-{SESSION_ID}"));
+        assert!(
+            adapter
+                .discover_sessions_with_generation(
+                    &[process(&format!("codex resume {SESSION_ID}"))],
+                    |_| None,
+                )
+                .is_empty(),
+            "无法证明进程代际时必须拒绝发现，不能为了测试或兼容性退回 PID-only"
+        );
         assert_eq!(
             sessions[0].session_file.as_deref(),
             Some(expected.to_string_lossy().as_ref())
@@ -581,7 +605,8 @@ mod tests {
             .to_string();
         assert_eq!(sessions[0].last_activity, expected_activity);
 
-        let cwd_only = adapter.discover_sessions(&[process("codex")]);
+        let cwd_only =
+            adapter.discover_sessions_with_generation(&[process("codex")], |_| Some(987_654_321));
         assert_eq!(cwd_only.len(), 1);
         assert!(
             cwd_only[0].session_file.is_none(),

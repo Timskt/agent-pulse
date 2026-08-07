@@ -3539,7 +3539,9 @@ mod tests {
                     wants_second_opinion: false,
                     detected_at: "2026-08-07 12:00:00".to_string(),
                 },
-                activity: Some((42, std::time::UNIX_EPOCH + Duration::from_nanos(123))),
+                // Windows SystemTime 只有 100ns 精度；使用可精确表示的毫秒固定向量，
+                // 避免测试夹具在 Windows 被量化、却误报稳定编码发生变化。
+                activity: Some((42, std::time::UNIX_EPOCH + Duration::from_millis(123))),
             }
         }
 
@@ -3553,7 +3555,7 @@ mod tests {
         ]);
         let hash = detection_evidence_hash(&first);
         assert_eq!(hash, detection_evidence_hash(&reordered));
-        assert_eq!(hash, 0x5bf3_b21e_1914_e8a1, "固定向量钉住跨进程/版本编码");
+        assert_eq!(hash, 0x142f_7a9b_ab6a_7c57, "固定向量钉住跨进程/版本编码");
 
         let mut changed = reordered;
         changed.detection.evidence.matched_completion_marker = Some("done".to_string());
