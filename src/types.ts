@@ -132,6 +132,10 @@ export interface EngineStatus {
   pending_attention: number;
   total_resumes: number;
   total_detections: number;
+  /** 已进入协调器、尚未完成真实输入（含等待全局投递锁） */
+  resume_pending: number;
+  /** 已完成输入、正在只读核验会话记录 */
+  resume_verifying: number;
   last_scan_at: string | null;
   uptime_secs: number;
   cost_today: number;

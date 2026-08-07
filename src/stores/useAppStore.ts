@@ -196,6 +196,8 @@ const defaultMonitorState: MonitorState = {
     pending_attention: 0,
     total_resumes: 0,
     total_detections: 0,
+    resume_pending: 0,
+    resume_verifying: 0,
     last_scan_at: null,
     uptime_secs: 0,
     cost_today: 0,

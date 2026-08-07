@@ -25,6 +25,21 @@ pub struct Resumer {
     i18n: I18n,
 }
 
+/// 已经完成不可逆输入、正在等待落地核验的一次投递。
+///
+/// 这个值把续跑拆成两个阶段：
+///
+/// 1. [`Resumer::deliver`] 在全局投递锁内定位窗口、操作剪贴板并输入；
+/// 2. [`Resumer::verify_delivery`] 只读会话记录，可以在锁外与其他会话并行。
+///
+/// `before` 必须在真正输入前取得，不能等释放锁之后再读，否则 Agent 很快写入的
+/// 第一行会被错当成基线，最终把一次真实落地误判成 `Silent`。
+#[derive(Debug)]
+pub(crate) struct ResumeDelivery {
+    before: Option<ActivityFingerprint>,
+    detail: String,
+}
+
 /// 一次续跑投递**在现实里**的结果
 ///
 /// 存在的理由是一个此前从没被问出口的问题：**脚本跑通了，字真的进那个会话了吗？**
@@ -1420,31 +1435,30 @@ impl Resumer {
         }
     }
 
-    /// 投递 **并核验**：这是外面该用的那个入口
+    /// 完成续跑的不可逆投递阶段。
     ///
-    /// [`Self::resume`] 只回答「脚本跑通了没有」，这个方法回答「会话真的动了没有」。
-    /// 差别不是措辞：整条自动续跑链此前是开环的——把按键发出去，从不看世界有没有变，
-    /// 因此把「敲错窗口」「权限掉了」「输入法吃字」一律记成成功，
-    /// 计数照加、上限照撞，最后自己把自己关掉。
-    ///
-    /// 做法很土但正好够用：投递前记下会话记录文件的指纹，投递后盯
-    /// [`VERIFY_WINDOW_SECS`] 秒。文件长了 = 落地；没长 = 没落地；没有文件 = 核验不了。
-    ///
-    /// 返回 `(结论, 给人看的一句话)`。第二个值仍然是脚本自己的说法（命中了哪个窗口 /
-    /// 报了什么错），核验结论不会把它盖掉——排查的时候两个都要。
-    pub async fn resume_verified(
+    /// 调用方必须在全局投递锁内调用：窗口焦点、剪贴板和键盘都是桌面级共享资源。
+    /// 返回以后这些资源已经恢复，后续只剩会话记录核验，不应继续占着全局锁。
+    pub(crate) async fn deliver(
         &self,
         session: &AgentSession,
         use_goal_prompt: bool,
-    ) -> (ResumeOutcome, String) {
+    ) -> Result<ResumeDelivery, String> {
         let before = activity_fingerprint(session);
+        let detail = self.resume(session, use_goal_prompt).await?;
+        Ok(ResumeDelivery { before, detail })
+    }
 
-        let detail = match self.resume(session, use_goal_prompt).await {
-            Ok(msg) => msg,
-            Err(e) => return (ResumeOutcome::Failed, e),
-        };
-
-        // 没有记录文件就别装作核验过了：这一步的价值全在诚实上
+    /// 在锁外核验一次已经完成的投递。
+    ///
+    /// 这里只轮询目标会话自己的记录文件，不碰焦点、剪贴板或键盘，因此不同会话
+    /// 可以并行核验。没有记录文件时如实返回 `Unverifiable`，不伪装成已经验证。
+    pub(crate) async fn verify_delivery(
+        &self,
+        session: &AgentSession,
+        delivery: ResumeDelivery,
+    ) -> (ResumeOutcome, String) {
+        let ResumeDelivery { before, detail } = delivery;
         let Some(before) = before else {
             return (ResumeOutcome::Unverifiable, detail);
         };
@@ -1458,6 +1472,21 @@ impl Resumer {
             }
         }
         (ResumeOutcome::Silent, detail)
+    }
+
+    /// 投递 **并核验** 的便利入口。
+    ///
+    /// 不需要协调多个会话的调用方可以继续使用它；监控引擎使用 [`Self::deliver`] 与
+    /// [`Self::verify_delivery`] 两阶段入口，只在第一阶段持有全局投递锁。
+    pub async fn resume_verified(
+        &self,
+        session: &AgentSession,
+        use_goal_prompt: bool,
+    ) -> (ResumeOutcome, String) {
+        match self.deliver(session, use_goal_prompt).await {
+            Ok(delivery) => self.verify_delivery(session, delivery).await,
+            Err(error) => (ResumeOutcome::Failed, error),
+        }
     }
 
     /// 尝试通过 tmux/screen 投递；`None` = 这个会话不在复用器里，请走别的路

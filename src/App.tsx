@@ -150,6 +150,14 @@ export default function App() {
         <footer className="flex items-center justify-between gap-4 border-t border-neutral-200 bg-white px-6 py-2 text-[10px] text-neutral-400">
           <span className="tabular-nums">AgentPulse v{APP_VERSION}</span>
           <div className="flex items-center gap-4 tabular-nums">
+            {(status.resume_pending > 0 || status.resume_verifying > 0) && (
+              <span className="font-medium text-amber-600">
+                {t("footer.resume_pipeline", {
+                  pending: status.resume_pending,
+                  verifying: status.resume_verifying,
+                })}
+              </span>
+            )}
             <span>{t("footer.sessions", { count: status.sessions_total })}</span>
             {running && config && (
               <span>{t("footer.interval", { secs: config.poll_interval_secs })}</span>

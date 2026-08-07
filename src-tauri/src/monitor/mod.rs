@@ -27,7 +27,7 @@ use crate::webhook::WebhookNotifier;
 use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, Duration, MissedTickBehavior};
@@ -103,6 +103,10 @@ pub struct EngineStatus {
     pub pending_attention: usize,
     pub total_resumes: u32,
     pub total_detections: u32,
+    /// 已经进入协调器、尚未完成真实输入的续跑数（含等待全局投递锁）。
+    pub resume_pending: usize,
+    /// 已完成输入、正在只读核验会话记录的续跑数。
+    pub resume_verifying: usize,
     pub last_scan_at: Option<String>,
     pub uptime_secs: u64,
     /// 今日累计花费（美元）
@@ -197,10 +201,12 @@ struct ResumeCommit {
 #[derive(Default)]
 struct ResumeRegistry {
     sessions: std::sync::Mutex<HashSet<String>>,
+    /// 新动作入队或任一会话租约释放时唤醒协调 worker。
+    wake: Notify,
 }
 
 impl ResumeRegistry {
-    fn try_acquire(&self, session_id: &str) -> Option<ResumeLease<'_>> {
+    fn try_acquire(self: &Arc<Self>, session_id: &str) -> Option<ResumeLease> {
         let mut sessions = self
             .sessions
             .lock()
@@ -209,7 +215,7 @@ impl ResumeRegistry {
             return None;
         }
         Some(ResumeLease {
-            registry: self,
+            registry: Arc::clone(self),
             session_id: session_id.to_string(),
         })
     }
@@ -221,21 +227,67 @@ impl ResumeRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id)
     }
+
+    fn notify_worker(&self) {
+        self.wake.notify_one();
+    }
+
+    async fn wait_for_work(&self) {
+        self.wake.notified().await;
+    }
 }
 
-struct ResumeLease<'a> {
-    registry: &'a ResumeRegistry,
+struct ResumeLease {
+    registry: Arc<ResumeRegistry>,
     session_id: String,
 }
 
-impl Drop for ResumeLease<'_> {
+impl Drop for ResumeLease {
     fn drop(&mut self) {
         self.registry
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.session_id);
+        // 队列里可能正保留着这个 session 的最新后继；释放即唤醒，
+        // 不依赖下一轮扫描，也不怕调用方早退或 unwind 忘记通知。
+        self.registry.notify_worker();
     }
+}
+
+/// 一个并发阶段的 RAII 计数器。
+///
+/// 状态快照会把这两个计数展示给用户；任何早退或 unwind 都必须把数字还回去，
+/// 否则界面会永久显示“仍在投递/核验”。
+struct PhaseCounter<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> PhaseCounter<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for PhaseCounter<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 把协调器内部的三个瞬时数字合并进公开状态。
+///
+/// 排队动作与已经派发、等待桌面锁的动作互斥存在，因此 pending 是两者之和；
+/// 核验阶段已经完成真实输入，必须单列，不能让界面误以为还在等着敲字。
+fn merge_resume_pipeline_status(
+    status: &mut EngineStatus,
+    queued: usize,
+    delivery_pending: usize,
+    verifying: usize,
+) {
+    status.resume_pending = queued.saturating_add(delivery_pending);
+    status.resume_verifying = verifying;
 }
 
 /// 自动续跑协调队列：同一会话只保留最新动作，不让扫描频率把旧快照堆成长龙。
@@ -258,11 +310,30 @@ impl ResumeQueue {
         self.actions.insert(session_id, action);
     }
 
-    fn pop_front(&mut self) -> Option<ResumeAction> {
-        while let Some(session_id) = self.order.pop_front() {
-            if let Some(action) = self.actions.remove(&session_id) {
-                return Some(action);
+    /// 取出第一条当前能拿到会话租约的动作。
+    ///
+    /// 已经有动作在核验的会话不会挡住队列后面的其他会话：它的最新后继快照
+    /// 保留在队尾，等租约释放后再重验。最多检查当前队列一圈，避免所有会话
+    /// 都忙时原地旋转占满 CPU。
+    fn pop_ready<T>(
+        &mut self,
+        mut try_acquire: impl FnMut(&str) -> Option<T>,
+    ) -> Option<(ResumeAction, T)> {
+        let candidates = self.order.len();
+        for _ in 0..candidates {
+            let Some(session_id) = self.order.pop_front() else {
+                break;
+            };
+            let Some(action) = self.actions.remove(&session_id) else {
+                continue;
+            };
+
+            if let Some(token) = try_acquire(&session_id) {
+                return Some((action, token));
             }
+
+            self.order.push_back(session_id.clone());
+            self.actions.insert(session_id, action);
         }
         None
     }
@@ -272,7 +343,6 @@ impl ResumeQueue {
         self.actions.clear();
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.actions.len()
     }
@@ -299,11 +369,14 @@ pub struct MonitorEngine {
     /// 手动续跑也必须跟自动续跑走同一条串行通道。
     delivery_lock: Mutex<()>,
     /// 同一个会话同一时刻只允许存在一个续跑意图；租约离开作用域时自动释放。
-    resume_registry: ResumeRegistry,
+    resume_registry: Arc<ResumeRegistry>,
     /// 自动动作进入专用协调队列；扫描只产出动作，不再等待每个动作的落地核验。
     resume_queue: std::sync::Mutex<ResumeQueue>,
-    resume_notify: Notify,
     resume_worker_started: AtomicBool,
+    /// 已从合并队列派发、正在等全局锁或执行真实输入的动作数。
+    resume_delivery_pending: AtomicUsize,
+    /// 已释放桌面级投递锁、正在观察各自会话记录的动作数。
+    resume_verifying: AtomicUsize,
     /// 每次开始/停止都递增。动作绑定生成时的代数，防止“停一下又启动”复活旧队列。
     lifecycle_epoch: AtomicU64,
     /// 持有管理器而不是快照，配置才能热更新
@@ -331,10 +404,11 @@ impl MonitorEngine {
             state: Arc::new(Mutex::new(MonitorState::default())),
             scan_lock: Mutex::new(()),
             delivery_lock: Mutex::new(()),
-            resume_registry: ResumeRegistry::default(),
+            resume_registry: Arc::new(ResumeRegistry::default()),
             resume_queue: std::sync::Mutex::new(ResumeQueue::default()),
-            resume_notify: Notify::new(),
             resume_worker_started: AtomicBool::new(false),
+            resume_delivery_pending: AtomicUsize::new(0),
+            resume_verifying: AtomicUsize::new(0),
             lifecycle_epoch: AtomicU64::new(0),
             config_manager,
             started_at: std::sync::Mutex::new(None),
@@ -355,6 +429,30 @@ impl MonitorEngine {
     /// 当前配置快照
     pub fn config(&self) -> AppConfig {
         self.config_manager.get()
+    }
+
+    /// 面向界面/API 的一致状态快照。
+    ///
+    /// 会话与检测结果住在 async 状态锁里，协调器的瞬时阶段则用原子计数和有界
+    /// 队列维护。读取时在这里合并，避免每次阶段切换都为两个数字争用整份状态锁。
+    pub async fn snapshot(&self) -> MonitorState {
+        let mut snapshot = self.state.lock().await.clone();
+        let queued = self
+            .resume_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        merge_resume_pipeline_status(
+            &mut snapshot.status,
+            queued,
+            self.resume_delivery_pending.load(Ordering::SeqCst),
+            self.resume_verifying.load(Ordering::SeqCst),
+        );
+        snapshot
+    }
+
+    pub async fn status_snapshot(&self) -> EngineStatus {
+        self.snapshot().await.status
     }
 
     /// 添加事件日志
@@ -1177,7 +1275,8 @@ impl MonitorEngine {
     /// 将本轮动作交给专用续跑协调器。
     ///
     /// 扫描到这里就结束，不等待 AppleScript 与最长数秒的落地核验。同一会话的后续
-    /// 扫描只会替换队列里的旧快照，不会无限堆积；不同会话由 worker 公平串行消费。
+    /// 扫描只会替换队列里的旧快照，不会无限堆积；worker 跳过 leased session，
+    /// 为其他会话派发任务，只有真实桌面投递在全局锁上公平串行。
     fn enqueue_resume_actions(self: &Arc<Self>, actions: Vec<ResumeAction>) {
         if actions.is_empty() {
             return;
@@ -1190,15 +1289,15 @@ impl MonitorEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for action in actions {
-            // 不因同会话已有 in-flight 就丢掉新证据。全局投递锁可能被另一个会话的
-            // 6 秒核验占住；这期间旧动作会过期，而最新动作应作为唯一后继留在队列。
-            // 若 in-flight 已经成功，后继动作出队时会被冷却与状态重验取消，不会双投。
+            // 不因同会话已有 in-flight 就丢掉新证据。它可能仍在核验和记账；这期间
+            // 旧动作会过期，而最新动作应作为唯一后继留在队列。若 in-flight 已经成功，
+            // 后继动作取得 lease 后会被冷却与状态重验取消，不会双投。
             queue.upsert(action);
             queued = true;
         }
         drop(queue);
         if queued {
-            self.resume_notify.notify_one();
+            self.resume_registry.notify_worker();
         }
     }
 
@@ -1219,30 +1318,36 @@ impl MonitorEngine {
 
     async fn resume_worker(self: Arc<Self>) {
         loop {
-            while let Some(action) = self.dequeue_resume_action() {
-                self.run_auto_resume(action).await;
+            // 每个会话的租约一直持有到核验和记账结束，但已经完成真实输入的会话
+            // 不再占住全局投递锁。worker 可以继续派发其他会话；它们只在不可逆
+            // 的窗口/剪贴板/键盘阶段排队，随后各自并行观察自己的记录文件。
+            while let Some((action, lease)) = self.dequeue_ready_resume_action() {
+                let engine = Arc::clone(&self);
+                tokio::spawn(async move {
+                    engine.run_auto_resume(action, lease).await;
+                    // lease 的 Drop 会释放会话并唤醒 worker；早退和 unwind 也走同一路径。
+                });
             }
-            self.resume_notify.notified().await;
+            self.resume_registry.wait_for_work().await;
         }
     }
 
-    fn dequeue_resume_action(&self) -> Option<ResumeAction> {
+    fn dequeue_ready_resume_action(&self) -> Option<(ResumeAction, ResumeLease)> {
         self.resume_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()
+            .pop_ready(|session_id| self.resume_registry.try_acquire(session_id))
     }
 
     /// 执行一条自动动作。
     ///
-    /// **必须串行**：剪贴板是全局单件，前台窗口也只有一个。worker 自身保证自动动作
-    /// 串行，`delivery_lock` 再把手动动作纳入同一条通道。拿到锁后仍要重验生命周期、
-    /// 配置、状态、冷却、记录版本和进程身份，排队绝不等于获得投递许可。
-    async fn run_auto_resume(&self, action: ResumeAction) {
+    /// 只有不可逆的真实输入必须串行：剪贴板和前台窗口是全局单件。输入完成、脚本
+    /// 恢复剪贴板后立即释放 `delivery_lock`；最长 6 秒的记录核验只读目标会话文件，
+    /// 可以与其他会话并行。会话租约仍覆盖到核验、记账和通知全部结束，保证同会话
+    /// 不会在上一条结果尚未落笔时又投递一次。
+    async fn run_auto_resume(self: &Arc<Self>, action: ResumeAction, _lease: ResumeLease) {
         let session = &action.session;
-        let Some(_lease) = self.resume_registry.try_acquire(&session.id) else {
-            return;
-        };
+        let delivery_phase = PhaseCounter::enter(&self.resume_delivery_pending);
 
         let attempt = {
             let _delivery_guard = self.delivery_lock.lock().await;
@@ -1251,17 +1356,17 @@ impl MonitorEngine {
                 None
             } else {
                 let resumer = Resumer::new(latest_config);
-                Some(
-                    resumer
-                        .resume_verified(session, action.use_goal_prompt)
-                        .await,
-                )
+                Some((
+                    resumer.deliver(session, action.use_goal_prompt).await,
+                    resumer,
+                ))
             }
         };
+        drop(delivery_phase);
 
         let latest_config = self.config();
         let i18n = I18n::from_code(&latest_config.language);
-        let Some((outcome, detail)) = attempt else {
+        let Some((delivery, resumer)) = attempt else {
             self.push_event_on_change(
                 format!("resume_stale:{}", session.id),
                 &format!("{}:{:?}", action.lifecycle_epoch, action.observed_activity),
@@ -1273,6 +1378,16 @@ impl MonitorEngine {
             )
             .await;
             return;
+        };
+
+        let (outcome, detail) = match delivery {
+            Ok(delivery) => {
+                let verify_phase = PhaseCounter::enter(&self.resume_verifying);
+                let result = resumer.verify_delivery(session, delivery).await;
+                drop(verify_phase);
+                result
+            }
+            Err(error) => (ResumeOutcome::Failed, error),
         };
 
         let prompt_type = if action.use_goal_prompt {
@@ -1485,12 +1600,16 @@ impl MonitorEngine {
     ) -> Result<String, String> {
         let config = self.config();
         let i18n = I18n::from_code(&config.language);
-        let Some(_lease) = self.resume_registry.try_acquire(session_id) else {
+        let Some(lease) = self.resume_registry.try_acquire(session_id) else {
             return Err(i18n.t("err.resume_in_progress").to_string());
         };
 
-        self.manual_resume_inner(session_id, use_goal_prompt, config, &i18n)
-            .await
+        let result = self
+            .manual_resume_inner(session_id, use_goal_prompt, config, &i18n)
+            .await;
+        // Drop 同时释放会话并唤醒 worker，自动队列里的最新后继可立即重验。
+        drop(lease);
+        result
     }
 
     async fn manual_resume_inner(
@@ -1500,22 +1619,38 @@ impl MonitorEngine {
         config: AppConfig,
         i18n: &I18n,
     ) -> Result<String, String> {
-        let _delivery_guard = self.delivery_lock.lock().await;
+        let delivery_phase = PhaseCounter::enter(&self.resume_delivery_pending);
+        let (session, resumer, delivery) = {
+            let _delivery_guard = self.delivery_lock.lock().await;
 
-        // 排队期间会话可能退出，所以拿到全局投递锁之后才取最终快照。
-        let session = {
-            let state = self.state.lock().await;
-            state
-                .sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .cloned()
-                .ok_or_else(|| i18n.t("err.session_not_found").to_string())?
+            // 排队期间会话可能退出，所以拿到全局投递锁之后才取最终快照。
+            let session = {
+                let state = self.state.lock().await;
+                state
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .cloned()
+                    .ok_or_else(|| i18n.t("err.session_not_found").to_string())?
+            };
+
+            let resumer = Resumer::new(config);
+            let delivery = resumer.deliver(&session, use_goal_prompt).await;
+            (session, resumer, delivery)
         };
+        drop(delivery_phase);
 
+        // 核验只读这一条会话自己的记录文件，不能继续占着桌面级投递锁。
+        let (outcome, detail) = match delivery {
+            Ok(delivery) => {
+                let verify_phase = PhaseCounter::enter(&self.resume_verifying);
+                let result = resumer.verify_delivery(&session, delivery).await;
+                drop(verify_phase);
+                result
+            }
+            Err(error) => (ResumeOutcome::Failed, error),
+        };
         let stuck_secs = session.stuck_secs();
-        let resumer = Resumer::new(config);
-        let (outcome, detail) = resumer.resume_verified(&session, use_goal_prompt).await;
         let ok = outcome.counts_as_nudge();
         let text = format!("{} · {}", i18n.t(outcome.i18n_key()), detail);
 
@@ -1850,7 +1985,7 @@ mod tests {
 
     #[test]
     fn resume_lease_is_exclusive_and_released_by_drop() {
-        let registry = ResumeRegistry::default();
+        let registry = Arc::new(ResumeRegistry::default());
         {
             let _lease = registry.try_acquire("session-1").expect("首次应拿到租约");
             assert!(registry.is_active("session-1"));
@@ -1865,6 +2000,33 @@ mod tests {
         }
         assert!(!registry.is_active("session-1"), "离开作用域必须自动释放");
         assert!(registry.try_acquire("session-1").is_some());
+    }
+
+    #[test]
+    fn phase_counter_returns_to_zero_on_every_scope_exit() {
+        let counter = AtomicUsize::new(0);
+        {
+            let _outer = PhaseCounter::enter(&counter);
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+            {
+                let _inner = PhaseCounter::enter(&counter);
+                assert_eq!(counter.load(Ordering::SeqCst), 2);
+            }
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pipeline_snapshot_separates_pending_delivery_from_verification() {
+        let mut status = EngineStatus::default();
+        merge_resume_pipeline_status(&mut status, 2, 3, 4);
+        assert_eq!(status.resume_pending, 5);
+        assert_eq!(status.resume_verifying, 4);
+
+        merge_resume_pipeline_status(&mut status, usize::MAX, 1, 0);
+        assert_eq!(status.resume_pending, usize::MAX, "快照计数不能溢出回零");
+        assert_eq!(status.resume_verifying, 0);
     }
 
     #[test]
@@ -1885,18 +2047,55 @@ mod tests {
         queue.upsert(action("session-1", 1));
         queue.upsert(action("session-2", 1));
 
-        // 即使 session-1 已有在途租约，新扫描也应保留一条最新后继，而不是丢掉
-        // 更鲜的证据。真正出手仍由租约、冷却和出队重验控制。
-        let registry = ResumeRegistry::default();
-        let _lease = registry.try_acquire("session-1").expect("模拟在途动作");
+        // 即使 session-1 已有动作在核验，新扫描也应保留一条最新后继，而不是丢掉
+        // 更鲜的证据；同时它不能挡住排在后面的 session-2。
+        let registry = Arc::new(ResumeRegistry::default());
+        let lease = registry.try_acquire("session-1").expect("模拟在途核验");
         queue.upsert(action("session-1", 2));
 
         assert_eq!(queue.len(), 2, "同会话只保留一条，队列不会随扫描次数膨胀");
-        let first = queue.pop_front().expect("第一条");
-        assert_eq!(first.session.id, "session-1");
-        assert_eq!(first.lifecycle_epoch, 2, "应消费最新快照而不是旧动作");
-        assert_eq!(queue.pop_front().expect("第二条").session.id, "session-2");
-        assert!(queue.pop_front().is_none());
+        let (first, _first_lease) = queue
+            .pop_ready(|id| registry.try_acquire(id))
+            .expect("应跳过忙会话");
+        assert_eq!(first.session.id, "session-2");
+        assert_eq!(queue.len(), 1, "忙会话的最新动作必须留在队列");
+
+        drop(lease);
+        let (next, _next_lease) = queue
+            .pop_ready(|id| registry.try_acquire(id))
+            .expect("租约释放后应立即接上最新动作");
+        assert_eq!(next.session.id, "session-1");
+        assert_eq!(next.lifecycle_epoch, 2, "应消费最新快照而不是旧动作");
+        assert!(queue.pop_ready(|id| registry.try_acquire(id)).is_none());
+    }
+
+    #[test]
+    fn resume_queue_keeps_all_actions_when_every_session_is_busy() {
+        fn action(id: &str) -> ResumeAction {
+            let mut session = session_with("/tmp", None);
+            session.id = id.to_string();
+            ResumeAction {
+                session,
+                use_goal_prompt: false,
+                observed_activity: None,
+                lifecycle_epoch: 1,
+                stuck_secs: None,
+            }
+        }
+
+        let mut queue = ResumeQueue::default();
+        queue.upsert(action("session-1"));
+        queue.upsert(action("session-2"));
+        let registry = Arc::new(ResumeRegistry::default());
+        let _lease_1 = registry.try_acquire("session-1").expect("占住会话 1");
+        let _lease_2 = registry.try_acquire("session-2").expect("占住会话 2");
+
+        assert!(queue.pop_ready(|id| registry.try_acquire(id)).is_none());
+        assert_eq!(queue.len(), 2, "检查一圈后不能丢动作或复制动作");
+
+        // 再检查一圈也应稳定返回；这钉住“所有会话忙时原地旋转/膨胀”的退化。
+        assert!(queue.pop_ready(|id| registry.try_acquire(id)).is_none());
+        assert_eq!(queue.len(), 2);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 # AgentPulse 项目现状与规划
 
-> 对应版本：`v1.9.0` 源码状态（尚未打 tag，尚未发布 Release）
+> 对应版本：`v1.10.0` 源码状态（尚未打 tag，尚未发布 Release）
 > 验证口径：本地门禁见 § 11 / § 14；提交级结果以 GitHub Actions 为准
 > 文档日期：2026-08-07
 
@@ -40,16 +40,16 @@
 
 | 维度 | 现状 |
 |---|---|
-| 版本 | `1.9.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死；**标签未推，尚未发 Release**） |
+| 版本 | `1.10.0`（`package.json` 是唯一来源，发布前由版本一致性测试锁死；**标签未推，尚未发 Release**） |
 | 后端 | Rust，19 个文件；续跑协调器集中在 `monitor/mod.rs` |
 | 前端 | TypeScript + React 19，49 个文件 |
-| 单元测试 | Rust **259 个**（`cargo test`）+ 前端 **99 个**（`pnpm test`，vitest，8 个文件） |
+| 单元测试 | Rust **262 个**（`cargo test`）+ 前端 **99 个**（`pnpm test`，vitest，8 个文件） |
 | Tauri 命令 | 38 个 `#[tauri::command]` |
 | 支持的 Agent | Claude Code / Codex CLI / OpenCode（`all_adapters()`） |
 | 续跑平台 | macOS / Windows / Linux 三套实现均已落地，另有一条与平台无关的 tmux/screen 通道 |
 | i18n 词条 | 后端 200 条（`(key, zh, en)`），前端 349 条（`[zh, en]`） |
 | 持久化 | SQLite 6 张表 |
-| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v1.8 限流保持 ✅ · **v1.9 续跑协调器 ✅** · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
+| 功能层次 | v1.0 核心 ✅ · v1.1 感知 ✅ · v1.2 洞察 ✅ · v1.3 远程 ✅ · v1.4 可信化 ✅ · v1.5 闭环 ✅ · v1.6 可解释判定 ✅ · v1.7 记录与导出 ✅ · v1.8 限流保持 ✅ · v1.9 续跑协调器 ✅ · **v1.10 两阶段续跑流水线 ✅** · v2.0 编排 ⏸ · v2.1 自治 ⏸ |
 
 **这个版本能做到的事**：在你不改变任何使用习惯的前提下，后台盯着 Claude Code / Codex / OpenCode
 的会话文件与进程，判断它是"还在干活"、"卡住了"、"在等你回话"、"限流了"还是"报错了"；
@@ -106,6 +106,7 @@ AgentPulse 走的是另一条：**附着在你已有的工作方式上**。代�
 | v1.7 | **记录与导出** | ✅ | 单实例守护、续跑记录中心（独立分页 + 筛选）、统计趋势真实对比、会话档案抽屉（生命周期 / 中断次数 / 续跑时间线 / 成本时间线 / 路径一键复制）、柱状图时间刻度、CSV 导出（转义与公式注入分开处理）、会话生命周期收拢（修「关了还显示运行中」）、跨夏令时日期分组修复 |
 | v1.8 | **限流保持** | ✅ | 中转站/HTTP 形状兜底、等待时间解析、跨轮保持窗口，证据滚出尾部后仍不误敲 |
 | v1.9 | **续跑协调器** | ✅ 待发布 | 扫描/投递解耦、按会话合并队列、常驻 worker、RAII 会话租约、stop 生命周期代数、出队全量重验、并发状态归约、PID + 启动代际身份；首次三步引导与多会话搜索筛选 |
+| v1.10 | **两阶段续跑流水线** | ✅ 待发布 | 不可逆桌面投递严格串行、跨会话只读核验并行、忙会话绕行避免队头阻塞、owned RAII 租约覆盖闭环、Rust 单一来源的 pending/verifying 可视化 |
 | v2.0 | 编排层 | ⏸ | 主动搁置，与非侵入定位冲突，动工前需确认 |
 | v2.1+ | 自治层 | ⏸ | 同上 |
 
@@ -144,8 +145,8 @@ a888d91  feat(icon): regenerate the whole icon set from a vector master
 
 | 文件 | 行数 | 职责 | 关键符号 |
 |---|---:|---|---|
-| `monitor/mod.rs` | 2299 | 扫描调度、动作闸门、自动续跑协调器、并发状态归约 | `ResumeQueue`、`ResumeRegistry`、`ResumeLease`、`enqueue_resume_actions`、`resume_worker`、`run_auto_resume`、`auto_action_is_current`、`merge_resume_runtime` |
-| `resumer/mod.rs` | 3391 | 三平台/tmux/screen 投递、定位演练、落地核验 | `Resumer::{resume_verified,probe}`、`ResumeOutcome`、`activity_fingerprint` |
+| `monitor/mod.rs` | 2498 | 扫描调度、两阶段续跑流水线、动作闸门、并发状态归约 | `ResumeQueue::pop_ready`、`ResumeRegistry`、`ResumeLease`、`PhaseCounter`、`resume_worker`、`run_auto_resume`、`snapshot`、`merge_resume_runtime` |
+| `resumer/mod.rs` | 3420 | 三平台/tmux/screen 投递、定位演练、两阶段落地核验 | `Resumer::{deliver,verify_delivery,resume_verified,probe}`、`ResumeDelivery`、`ResumeOutcome` |
 | `storage/mod.rs` | 2392 | SQLite 六张表与历史聚合 | `record_resume`、`upsert_session_history` |
 | `detector/mod.rs` | 2098 | 多信号融合、注意力、动作策略、限流保持 | `Detector::detect`、`DetectionResult`、`ResumeTactic` |
 | `lib.rs` | 884 | Tauri IPC、托盘、事件泵、单实例装配 | `manual_resume`（下沉到 engine） |
@@ -186,23 +187,26 @@ a888d91  feat(icon): regenerate the whole icon set from a vector master
                          ResumeQueue 按 session 合并最新动作
                                                │
                                                ▼
-                           resume_worker FIFO 串行消费
+                 pop_ready 跳过 leased session，派发不同会话任务
                                                │
-                   ResumeLease → delivery_lock → 出队重验
+                   owned ResumeLease（覆盖整个业务闭环）
                                                │
                                                ▼
-              PID + 启动代际复核 → 定位/投递 → 落地核验 → 记账
+       delivery_lock 内重验 → PID 代际复核 → 定位/投递 → 释放全局锁
+                                               │
+                                               ▼
+                 各 session 并行只读核验 → 记账 → 释放 lease
 ```
 
-v1.9 最重要的结构变化是：**扫描不再等待 AppleScript、PowerShell、xdotool 或最长 6 秒的
-落地核验。** 旧结构中 N 个会话会把检测节拍拖成约 `6 秒 × N`；现在扫描只生成动作，
-worker 独立执行。`ResumeQueue` 对同一 session 做 upsert，所以扫描越勤也不会堆出旧动作长龙；
-即使已有一个在途动作，也只保留一条最新后继，旧动作过期后无需再等下一轮扫描。
+v1.9 先做到：**扫描不再等待 AppleScript、PowerShell、xdotool 或最长 6 秒的落地核验。**
+扫描只生成动作，`ResumeQueue` 对同一 session 做 upsert，因此扫描越勤也不会堆出旧动作长龙。
 
-`scan_lock` 只防后台 ticker、托盘和前端“立即扫描”并发取证；自动与手动真实投递共享
-`delivery_lock`。动作出队后重验 lifecycle、running、开关、状态、策略、额度、冷却和记录指纹，
-`Resumer` 再验证 PID、进程启动时刻和命令行。停止守护会清队列并推进生命周期代数，
-所以 stop/start 也不能复活旧动作。
+v1.10 再把续跑自身拆成两个资源阶段。自动与手动只在定位、剪贴板和键盘输入期间共享
+`delivery_lock`；输入完成、剪贴板恢复后立即释放，最长 6 秒的 transcript 指纹核验在锁外按
+session 并行。`pop_ready` 会绕过仍在核验的忙会话，让后面的会话先拿到投递机会；owned
+`ResumeLease` 仍覆盖核验、记账和通知，因此同会话不会重入。动作在锁内重验 lifecycle、running、
+开关、状态、策略、额度、冷却和记录指纹，`Resumer` 再验证 PID、进程启动时刻和命令行。
+停止守护清队列并推进生命周期代数，所以 stop/start 也不能复活尚未输入的旧动作。
 
 检测与投递现在可以重叠，`merge_resume_runtime` 因而成为必要的归约边界：扫描写回会话表时
 保留状态锁内最新的累计次数、失败退避和冷却；只有本轮明确看到 `Running` 才清空自动连击。
@@ -681,6 +685,23 @@ pub struct ResumeProbe {
 这次重构的目标不是“多线程更快”，而是把安全边界显式化：检测可以持续刷新，真实输入仍严格
 串行；排队只是意图，不是许可；任何旧事实到动手前都必须重新证明自己仍然成立。
 
+### 7.15 v1.10：投递与核验按资源边界分离
+
+| 不变式 | 实现 |
+|---|---|
+| 不可逆桌面操作仍全局串行 | 自动/手动只在 `Resumer::deliver` 外持有同一个 `delivery_lock` |
+| 只读核验不占桌面锁 | `Resumer::verify_delivery` 在锁外轮询目标 session transcript |
+| 不同会话可以并行核验 | worker 为取得 lease 的不同 session 派发独立任务 |
+| 同会话核验期间不二次输入 | owned `ResumeLease` 一直持有到核验、记账、日志和通知完成 |
+| 忙会话不挡住后面的会话 | `ResumeQueue::pop_ready` 轮转 leased session，最多检查一圈 |
+| 所有会话忙时不自旋 | 一圈没有 ready 动作就等待 `Notify`；lease 释放后主动唤醒 |
+| 界面阶段数字不靠猜 | Rust `snapshot()` 合并队列、`PhaseCounter` 与状态锁，前端只展示 |
+| stop 不伪造撤销 | 尚未投递的动作被 epoch 重验取消；已经回车的动作仍完成核验与记账 |
+
+如果 N 个会话都进入 6 秒静默核验，旧结构的核验尾延迟约为 `6N` 秒；新结构约为 6 秒加上
+各自不可逆投递耗时。安全收益不是放宽定位，而是把“必须串行”和“没有理由串行”的资源分开。
+完整设计见 `specs/v1.10_resume_pipeline_design.md`。
+
 ---
 
 ## 8. 洞察层：成本、限流预测、统计
@@ -934,8 +955,8 @@ git push origin main
 gh run watch "$(gh run list --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 
 # 3. 打标签并推标签（标签必须以 v 开头，且和 package.json 的版本一致）
-git tag v1.9.0
-git push origin v1.9.0
+git tag v1.10.0
+git push origin v1.10.0
 
 # 4. 盯打包
 gh run list --limit 3
@@ -1031,7 +1052,7 @@ push tag v*
 | **tmux / screen 通道** | ⚠️ 代码完整、`send-keys` 走 argv 数组不拼 shell，但**从没对着真实 pane 跑过** | `tmux new -s t`，在里面起一个 Claude Code，等它停下看会不会被续上 |
 | **Windows 续跑** | ⚠️ 只有 CI 编译 + 纯字符串单测 | 在 cmd、Windows Terminal、VS Code 各验一次；重点看多标签宿主的标题匹配 |
 | **Linux 续跑** | ⚠️ 同上，且 X11 / Wayland 两条路都没实测 | 各验一次；`ydotool` 需要 uinput 权限，估计会有坑 |
-| **v1.9 多会话协调器** | ⚠️ 队列/epoch/归约有单测，真实桌面并发未验 | 按 `docs/manual-test.md` §13 验证扫描不阻塞、stop/start 取消、手动/自动幂等和并发扫描不丢账 |
+| **v1.10 两阶段多会话流水线** | ⚠️ 队列/lease/阶段计数有单测，真实桌面并发未验 | 按 `docs/manual-test.md` §13 验证 A 核验时 B 能投递、手动不被核验阻塞、stop 边界和阶段数字 |
 | **手机看板** | ⚠️ 没有用真实浏览器打开过 | 手机连同一 WLAN，开 `bind_all`，扫码进页面 |
 | **打包路径** | ⚠️ 4 个目标的 `build-tauri` 自这些改动以来**没有跑过**（它只在 `v*` 标签上触发，见 11.4） | 打一个 `v1.5.0`，或先推 `v1.5.0-rc.1` 只验链路 |
 
@@ -1043,10 +1064,10 @@ push tag v*
 
 | 项 | 状态 |
 |---|---|
-| `docs/architecture.md` | ✅ 已重写并对齐到 v1.9（续跑协调器、并发归约、进程代际身份） |
+| `docs/architecture.md` | ✅ 已重写并对齐到 v1.10（两阶段流水线、并行核验、并发归约、进程代际身份） |
 | `src-tauri/tauri.conf.json` 的 `icon` 数组 | ✅ 已补 `icons/icon.png`（512px） |
 | 四处版本号漂移 | ✅ 已收成单一来源 + 测试锁死，见 11.6 |
-| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.9，配置表指向本文档 10.3） |
+| `README.md` 路线图 / 前置要求 / 配置说明 | ✅ 已对齐（Node 22 / pnpm 11，路线图到 v1.10，配置表指向本文档 10.3） |
 | 本文档自身的计数 | ✅ 2026-08-07 已按当前工作区重数 |
 
 ### 12.3 结构性欠账
@@ -1159,7 +1180,7 @@ v1.4 和 v1.5 就是照这条原则做的两版——一版让"动手之前"可�
 最后一行值得单独说：它不在任何一版的候选清单里，是从"为什么每次都要等用户来报同一类问题"
 这个问题倒推出来的。**清单能列出的都是想得到的功能；想不到的那一层，只能靠追问症状的成因找到。**
 
-### 13.2 v1.6 / v1.7 / v1.8 / v1.9 已交付与下一步候选
+### 13.2 v1.6 / v1.7 / v1.8 / v1.9 / v1.10 已交付与下一步候选
 
 按"先让已交付的东西可信"排序：
 
@@ -1185,6 +1206,10 @@ Webhook、远程和适配器仍可按同一边界继续拆，但不再是阻塞�
 **已交付（v1.9）— 续跑协调器。** 扫描与真实投递彻底解耦；按会话合并队列、常驻
 worker、RAII 租约、stop 生命周期失效、出队全量重验、进程启动代际身份和并发状态归约共同
 保证“检测持续刷新，但旧动作绝不补敲”。首次引导与会话聚焦是同版本的前端配套。
+
+**已交付（v1.10）— 两阶段续跑流水线。** v1.9 仍让只读核验占用全局投递锁；现在窗口、
+剪贴板和键盘阶段严格串行，输入完成立即释放，跨会话 transcript 核验并行。队列绕过 leased
+session，owned lease 仍覆盖完整闭环；页脚直接展示 Rust 快照里的待投递与核验数量。
 
 **P2 — 组件层测试。** 现在的 99 个前端测试只覆盖纯函数和 store 归约；`SessionList`
 的排序、标签显隐这类逻辑值得补 `@testing-library/react`。
@@ -1287,7 +1312,13 @@ worker、RAII 租约、stop 生命周期失效、出队全量重验、进程启�
 "这个会话现在什么状态"、"帮我续一下"。AgentPulse 仍然只做它擅长的那件事，
 编排的责任和风险留在调用方。这条路值得在动工 v2.0 之前先讨论。
 
-### 13.5 读了一遍 cc-switch：它对 429 的答案我们抄不了
+### 13.5 v1.10 之后的核心计划
+
+后续工作已单独固化在 [`docs/post-v1.10-plan.md`](docs/post-v1.10-plan.md)。优先级保持为：
+先完成 v1.10 真实桌面验收，再根据实测选择 Attempt 状态机或自适应落地核验作为下一版唯一核心主题；
+定位证据增强与并发故障注入随后推进。编排、自主决策和并发桌面输入继续不做。
+
+### 13.6 读了一遍 cc-switch：它对 429 的答案我们抄不了
 
 需求里让「参考 ccswitch」，所以把 `farion1231/cc-switch` 的代理层读了一遍。结论对
 13.2 那条限流设计有直接影响，记在这里免得下次又从头猜。
@@ -1322,7 +1353,7 @@ AgentPulse 是非侵入的旁观者，只看得见终端**渲染出来的字**�
 不是从零做一套识别；(3) 未识别的供应商落最保守档这条，在它那儿的对应物是「认不出来就当可重试」，
 因为它换一家的代价只是慢一点；我们敲字的代价是号可能被封，所以这里**必须**比它保守。
 
-### 13.6 当前决策记录
+### 13.7 当前决策记录
 
 本轮已完成 v1.6 的可解释判定链路。远程审批、可写网络 API、编排层和自治层仍不实现；
 它们会改变非侵入或只读安全边界，必须单独确认。ConfigPanel 的文件级拆分和组件渲染测试
@@ -1351,10 +1382,10 @@ cargo test -- --list                        # 列出全部测试名
 
 ./scripts/gen-icons.sh           # 从 SVG 母版重出整套图标（需要 Chrome/Chromium）
 
-git tag v1.9.0 && git push origin v1.9.0    # 触发 4 目标打包 + 建 Release，见 11.4
+git tag v1.10.0 && git push origin v1.10.0    # 触发 4 目标打包 + 建 Release，见 11.4
 ```
 
-### 14.2 测试分布（Rust 259 + 前端 99）
+### 14.2 测试分布（Rust 262 + 前端 99）
 
 Rust（`cargo test -- --list` 的模块级统计）：
 
@@ -1363,7 +1394,7 @@ Rust（`cargo test -- --list` 的模块级统计）：
 | `detector` | 68 | 双重校验、结构证据、注意力/策略、限流保持与形状识别 |
 | `resumer` | 47 | 三平台脚本、剪贴板、定位拒绝、演练与落地核验 |
 | `storage` | 35 | 六张表、游标去重、续跑记录、历史聚合 |
-| `monitor` | 31 | 动作闸门、计数归约、队列合并、RAII 租约、stop epoch、并发状态合并 |
+| `monitor` | 34 | 动作闸门、计数归约、队列绕行、RAII 租约/阶段计数、stop epoch、并发状态合并 |
 | `adapters` | 25 | 记录解析、进程发现、PID 启动代际身份与历史键 |
 | `export` | 18 | CSV 转义、上限与列齐全 |
 | `remote` | 11 | 鉴权、定长比较、换绑与页面渲染 |
@@ -1431,9 +1462,10 @@ Rust（`cargo test -- --list` 的模块级统计）：
 ```
 agent-pulse/
 ├── PROJECT_STATUS.md          ← 本文档
-├── README.md                  ← 面向使用者（路线图到 v1.9，含打包触发说明）
+├── README.md                  ← 面向使用者（路线图到 v1.10，含打包触发说明）
 ├── docs/architecture.md       ← 分层架构与数据流
 ├── docs/manual-test.md        ← 三平台实机验证清单（还没走完，见 12.1）
+├── docs/post-v1.10-plan.md     ← v1.10 推送后的续跑核心计划与下一次恢复顺序
 ├── index.html                 ← 首屏底色写死 #fafafa
 ├── public/{icon.svg,favicon.png}
 ├── scripts/{gen-icons.sh,make_ico.py}

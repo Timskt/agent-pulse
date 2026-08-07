@@ -4,7 +4,7 @@
 > 配置项逐条说明、路线图、开发红线在 [PROJECT_STATUS.md](../PROJECT_STATUS.md)；
 > 三平台手动验收清单在 [manual-test.md](./manual-test.md)。
 >
-> 最后一次与代码对齐：2026-08-07（`v1.9` 开发完成，待发布）。
+> 最后一次与代码对齐：2026-08-07（`v1.10` 开发完成，待发布）。
 
 ## 1. 一条不能越过的线
 
@@ -47,9 +47,9 @@ AgentPulse 是 **AI Agent 的守护神，不是它的容器**。整套架构都�
 
 | 路径 | 行数 | 职责 |
 |------|-----:|------|
-| `src-tauri/src/resumer/mod.rs` | 3391 | 投递层全部：通道选择、三平台脚本、演练、落地核验、聚焦 |
+| `src-tauri/src/resumer/mod.rs` | 3420 | 投递层全部：通道选择、三平台脚本、两阶段投递/核验、演练、聚焦 |
 | `src-tauri/src/storage/mod.rs` | 2392 | SQLite 六张表：续跑/检测/日聚合/用量/游标/会话历史 |
-| `src-tauri/src/monitor/mod.rs` | 2299 | 扫描循环、续跑协调队列、worker、动作闸门、并发状态归约 |
+| `src-tauri/src/monitor/mod.rs` | 2498 | 扫描循环、两阶段续跑流水线、动作闸门、并发状态归约 |
 | `src-tauri/src/detector/mod.rs` | 2098 | 信号融合、注意力分级、词边界匹配、限流保持窗口 |
 | `src-tauri/src/adapters/` | 1388 | 进程快照、进程代际身份、Claude Code / Codex / OpenCode |
 | `src-tauri/src/lib.rs` | 884 | Tauri 装配：命令、托盘、事件泵、窗口行为 |
@@ -352,13 +352,16 @@ pane 刚被关掉、授权中途失效 —— 每一种都让脚本成功而字�
 2–8 秒），没在守护降到 10 秒，**窗口不可见时整轮跳过**，切回来立刻补一次。
 原来那个无条件 `setInterval(3000)` 在窗口收进托盘时照样每 3 秒敲一次后端。
 
-## 11. 一次自动续跑的完整路径（v1.9 协调器）
+## 11. 一次自动续跑的完整路径（v1.10 两阶段流水线）
 
-v1.9 把“检测”和“敲字”从同一个长临界区拆开。旧结构中 `scan_once` 会等待每个会话
-最长 6 秒的落地核验；10 个中断会话就可能让下一轮检测、托盘扫描和界面刷新一起等约
-60 秒。现在扫描只产出事实与动作，真实投递交给常驻 worker：
+v1.9 先解决了“扫描不该等待续跑”：`scan_once` 只发现、取证、判定并生成动作，常驻
+worker 在后台消费。因此多个会话各自最长 6 秒的核验不会再冻结下一轮检测和界面刷新。
 
-```
+v1.10 继续缩小临界区。旧协调器仍让最长 6 秒的**只读记录核验**占着全局
+`delivery_lock`；会话 A 已经敲完但 transcript 暂时不增长时，会话 B 的自动续跑和用户手动
+续跑都要白等。现在资源边界按事实拆成两阶段：
+
+```text
 后台节拍 / 托盘 / 前端扫描
              │
              ▼
@@ -374,50 +377,53 @@ v1.9 把“检测”和“敲字”从同一个长临界区拆开。旧结构中
  ResumeQueue：同 session upsert 最新动作，不堆旧快照
              │ notify
              ▼
- resume_worker：不同 session FIFO、全局串行消费
+ pop_ready：跳过仍有 lease 的 session，继续找后面的可执行动作
              │
-      ResumeLease（同会话 RAII 幂等）
+      owned ResumeLease（同会话闭环排他，可移动进任务）
              │
-      delivery_lock（自动 + 手动共享）
+             ├──────── Phase 1：不可逆投递，全局严格串行 ────────┐
+             │     delivery_lock（自动 + 手动共享）                │
+             │     出手前重验 lifecycle / running / 配置 / 状态     │
+             │       / tactic / 额度 / 冷却 / 记录指纹              │
+             │     Resumer 再验 PID + 启动代际 + 命令行             │
+             │     先取 before 指纹 → 定位 → 剪贴板 → 回车 → 恢复   │
+             └────────────────── 立即释放 delivery_lock ───────────┘
              │
-             ▼
- 出手前重验：lifecycle / running / 总开关 / 状态 / tactic
-             / 额度 / 冷却 / 记录指纹
-             │
-             ▼
- Resumer 再验 PID + 进程启动代际 + 命令行
-             │
-             ▼
- 定位 → 剪贴板投递 → 回车 → 最长 6 秒落地核验
+             ├──────── Phase 2：只读核验，跨 session 并行 ─────────┐
+             │     最长 6 秒轮询本 session 的 transcript 指纹       │
+             └──────────────────────────────────────────────────────┘
              │
              ▼
  commit_resume_outcome → SQLite / 日志 / 通知 / 计数器
+             │
+             ▼
+ 释放 ResumeLease；notify worker 接上同 session 的最新后继
 ```
 
 关键不变式：
 
-1. **扫描不等投递。** `scan_lock` 在 `enqueue_resume_actions` 前释放；一个会话核验慢，不会拖住
-   后续发现、状态刷新和“立即扫描”。
-2. **同会话队列有界。** `ResumeQueue` 用 `VecDeque + HashMap`：第一次入队决定 FIFO 位置，
-   后续扫描只替换动作快照，因此队列大小最多等于待处理会话数；在途会话也最多保留一条
-   最新后继，避免旧动作等待全局锁时把更新鲜的证据直接丢掉。
-3. **同会话最多一个在途动作。** `ResumeRegistry::try_acquire` 返回 `ResumeLease`，`Drop` 自动
-   释放；任何早退、`?` 返回或 unwind 都不会留下永久“处理中”标记。
-4. **真实投递全局串行。** worker 本身串行自动动作，手动入口也共享 `delivery_lock`，因为
-   剪贴板与前台窗口都是全局单件。
-5. **停止是取消边界。** `stop()` 清空尚未消费的自动队列，并推进 `lifecycle_epoch`；动作绑定
-   生成时的代数，所以“停止后立即重启”也不能让旧动作复活。停止不禁用明确的手动续跑。
-6. **排队不等于许可。** `auto_action_is_current` 在拿到投递锁后重新读取最新配置和状态，
-   记录活动指纹也必须仍与检测时一致；会话自己恢复、额度用光或策略变化都会取消旧动作。
-7. **进程身份按代际而非裸 PID。** 新进程即使命令行一样，只要启动时刻不同就不是原会话。
-8. **扫描与投递可以重叠但不能丢账。** `merge_resume_runtime` 在状态锁内保留最新的
-   `resume_count`、`resume_failures`、`last_resume_at`；只有本轮明确观察到 `Running` 才清空
-   `resume_streak`。因此旧扫描快照不会覆盖刚完成的续跑提交。
-9. **日志只读提交后的事实。** `commit_resume_outcome` 返回 `ResumeCommit`，日志显示的是状态锁
-   内真正落笔后的计数，不再拿动作快照做 `+1` 猜测。
+1. **扫描不等投递。** `scan_lock` 在 `enqueue_resume_actions` 前释放；桌面脚本和核验都不会
+   拖住后续发现、状态刷新和“立即扫描”。
+2. **只串行共享资源。** 前台窗口、剪贴板、键盘和真实输入仍由 `delivery_lock` 全局串行；
+   输入完成、剪贴板恢复后立即释放锁。核验只读各自 transcript，不占桌面锁。
+3. **同会话仍最多一个在途闭环。** `ResumeLease` 拥有 `Arc<ResumeRegistry>`，可移动进派发任务，
+   一直活到核验、记账和通知结束；同 session 不会因为锁提前释放而二次输入。
+4. **忙会话不产生队头阻塞。** `ResumeQueue::pop_ready` 最多检查当前队列一圈；拿不到 lease 的
+   动作原样轮转到队尾，后面的其他 session 可以先投递。所有 session 都忙时返回并睡眠，不自旋。
+5. **同会话队列有界。** 第一次入队决定 FIFO 位置，后续扫描只替换动作快照；在途 session 也
+   最多保留一个最新后继，内存不会随扫描次数增长。
+6. **停止是不可逆输入的取消边界。** `stop()` 清队列并推进 `lifecycle_epoch`；已经派发但仍等
+   投递锁的任务会在锁内重验失败。若回车已经发生则不能撤销，仍要完成核验和记账。
+7. **排队不等于许可。** `auto_action_is_current` 在拿到投递锁后重新读取最新配置和状态，记录
+   指纹必须仍与检测时一致；会话自己恢复、额度用光或策略变化都会取消旧动作。
+8. **进程身份按代际而非裸 PID。** 新进程即使命令行一样，只要启动时刻不同就不是原会话。
+9. **扫描与投递重叠但不能丢账。** `merge_resume_runtime` 保留最新 `resume_count`、失败退避和
+   `last_resume_at`；只有本轮明确观察到 `Running` 才清空 `resume_streak`。
+10. **状态只有 Rust 一个来源。** `resume_pending` 由队列长度与等待/执行投递的 RAII 计数合成，
+    `resume_verifying` 单列；`MonitorEngine::snapshot` 返回合并快照，前端页脚只展示、不重算。
 
-手动续跑不经过自动队列，因为用户希望立即得到结果；但它与自动路径共享会话租约、投递锁、
-`Resumer::resume_verified`、进程身份复核和记账归约，所以不会长出第二套安全语义。
+更完整的资源模型、复杂度和验收矩阵见
+[`specs/v1.10_resume_pipeline_design.md`](../specs/v1.10_resume_pipeline_design.md)。
 
 ## 12. 八个花了很大代价才弄明白的事实
 
@@ -639,7 +645,7 @@ if total == last_len { continue; }   // 满环之后恒真
 | 门 | 命令 | 现状 |
 |----|------|------|
 | Rust lint | `cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单测 | `cargo test` | 259 passed |
+| Rust 单测 | `cargo test` | 262 passed |
 | 前端单测 | `pnpm test`（vitest） | 99 passed（8 files） |
 | 类型检查 | `npx tsc --noEmit` | 干净 |
 | 前端构建 | `pnpm build` | 通过 |
@@ -793,6 +799,7 @@ macOS arm64 / macOS x64 / Linux x64 / Windows x64。
 | v1.7 记录与导出 ✅ | 会话生命周期收拢（关掉的会话不再显示「运行中」）、续跑记录中心、统计趋势对比、会话档案抽屉、图表补时间刻度、**CSV 导出**（`Text` / `Value` 双变体转义）、跨夏令时的日期分组 |
 | v1.8 限流保持 ✅ | 关键词落空后的兜底形状识别、从消息里抠等待时间（中英）、新原因 `UpstreamRejected`、**保持窗口**（证据被顶出 40 行之后仍然不敲字）、四族枚举 i18n 门禁、变异检查脚本 |
 | v1.9 续跑协调器 ✅ | 扫描/投递解耦、按会话合并队列、常驻 worker、RAII 会话租约、stop 生命周期代数、出队全量重验、并发状态归约、PID + 启动代际身份；首次三步引导与多会话搜索筛选 |
+| v1.10 两阶段续跑流水线 ✅ | 不可逆桌面投递严格串行、跨会话只读核验并行、忙会话绕行避免队头阻塞、owned lease 覆盖完整闭环、Rust pipeline 快照与前端状态可视化 |
 | v2.0 编排层 ⛔ | **与「非侵入」定位冲突，已搁置** —— 不经确认不动工 |
 | v2.1+ 自治层 ⛔ | 同上 |
 

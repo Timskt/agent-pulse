@@ -46,13 +46,13 @@ impl AppState {
 /// 获取当前监控状态
 #[tauri::command]
 async fn get_state(state: State<'_, AppState>) -> Result<MonitorState, String> {
-    Ok(state.engine.state.lock().await.clone())
+    Ok(state.engine.snapshot().await)
 }
 
 /// 获取引擎状态摘要
 #[tauri::command]
 async fn get_status(state: State<'_, AppState>) -> Result<EngineStatus, String> {
-    Ok(state.engine.state.lock().await.status.clone())
+    Ok(state.engine.status_snapshot().await)
 }
 
 /// 启动监控
@@ -87,7 +87,7 @@ async fn stop_monitoring(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 async fn scan_now(state: State<'_, AppState>) -> Result<MonitorState, String> {
     state.engine.scan_once().await;
-    Ok(state.engine.state.lock().await.clone())
+    Ok(state.engine.snapshot().await)
 }
 
 /// 获取配置

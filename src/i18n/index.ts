@@ -39,6 +39,10 @@ const TABLE = {
   "footer.interval": ["每 {secs} 秒扫描", "scanning every {secs}s"],
   "footer.last_scan": ["最近扫描 {time}", "last scan {time}"],
   "footer.never_scanned": ["尚未扫描", "not scanned yet"],
+  "footer.resume_pipeline": [
+    "续跑流水线：待投递 {pending} · 核验 {verifying}",
+    "Resume pipeline: {pending} pending · {verifying} verifying",
+  ],
 
   // ── 首次使用 ──
   "onboarding.title": ["三步开始守护", "Start monitoring in three steps"],
