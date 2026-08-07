@@ -11,9 +11,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# Tauri 的正常 app binary 会由 tauri-build 嵌入 Common Controls v6 manifest，
-# 但 Cargo 的 lib test harness 不会继承那个资源。Windows loader 若看到
-# TaskDialogIndirect 却激活了 comctl32 v5，会在任何测试开始前报 0xc0000139。
+# 将 Tauri 的 Common Controls v6 manifest 链接到所有最终 Windows PE，
+# 包括 Cargo 自动生成、却不属于显式 `[[test]]` target 的 lib unit-test harness。
 embed-resource = "3"
 
 [dependencies]
