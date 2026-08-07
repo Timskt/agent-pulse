@@ -60,6 +60,76 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
+      # 0xc0000139 发生在 Rust harness 启动前，`--no-capture` 看不到任何东西。
+      # 失败时直接保存 PE imports 与嵌入 manifest，下一次不再靠猜缺失入口点。
+      - name: Diagnose Windows loader failure
+        if: failure() && runner.os == 'Windows'
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path (Get-Location) 'target/ci-loader-diagnostics'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $exe = Get-ChildItem 'target/debug/deps/agent_pulse_lib-*.exe' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $exe) {
+            'No agent_pulse_lib test executable was produced.' |
+              Set-Content (Join-Path $out 'missing-test-exe.txt')
+            exit 0
+          }
+
+          $exe.FullName | Set-Content (Join-Path $out 'test-exe.txt')
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = if (Test-Path $vswhere) {
+            & $vswhere -latest -products * -property installationPath
+          }
+          $dumpbin = if ($vs) {
+            Get-ChildItem (Join-Path $vs 'VC/Tools/MSVC') -Recurse -Filter dumpbin.exe |
+              Where-Object FullName -Match 'Hostx64\\x64\\dumpbin\.exe$' |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+          }
+          if ($dumpbin) {
+            & $dumpbin.FullName /imports $exe.FullName 2>&1 |
+              Tee-Object (Join-Path $out 'imports.txt')
+            & $dumpbin.FullName /dependents $exe.FullName 2>&1 |
+              Tee-Object (Join-Path $out 'dependents.txt')
+          } else {
+            'dumpbin.exe not found' | Set-Content (Join-Path $out 'dumpbin-not-found.txt')
+          }
+
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $mt = if (Test-Path $kits) {
+            Get-ChildItem $kits -Recurse -Filter mt.exe |
+              Where-Object FullName -Match '\\x64\\mt\.exe$' |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+          }
+          if ($mt) {
+            $manifest = Join-Path $out 'test-harness.manifest'
+            & $mt.FullName "-inputresource:$($exe.FullName);#1" "-out:$manifest" 2>&1 |
+              Tee-Object (Join-Path $out 'mt.txt')
+            if (Test-Path $manifest) { Get-Content $manifest }
+          } else {
+            'mt.exe not found' | Set-Content (Join-Path $out 'mt-not-found.txt')
+          }
+
+          Get-ChildItem target -Recurse -Filter '*.dll' |
+            Select-Object FullName, Length, LastWriteTimeUtc |
+            Format-Table -AutoSize | Out-String -Width 4096 |
+            Tee-Object (Join-Path $out 'native-dlls.txt')
+
+      - name: Upload Windows loader diagnostics
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: windows-loader-diagnostics
+          path: src-tauri/target/ci-loader-diagnostics
+          if-no-files-found: warn
+
   check-frontend:
     name: Frontend Type Check & Build
     runs-on: ubuntu-latest

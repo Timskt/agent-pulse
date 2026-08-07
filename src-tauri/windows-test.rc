@@ -1,0 +1,6 @@
+#pragma code_page(65001)
+
+// Cargo 为 lib.rs/main.rs 生成的测试 EXE 不会继承 tauri-build 只链接给正常
+// application binary 的资源。这个测试专用 manifest 让静态导入的
+// comctl32!TaskDialogIndirect 始终在 Common Controls v6 activation context 下解析。
+1 24 "windows-test.manifest"
